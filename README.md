@@ -242,19 +242,29 @@ Ejecutar:
 streamlit run src/dashboard/app.py
 ```
 
-**Estado actual: la página "Resumen General" ya es funcional; el resto del
-Dashboard todavía NO está completo.** La Iteración 5.3 convirtió esa
-página en la primera realmente útil: muestra, para cada símbolo
+**Estado actual: Iteración 5.3 completada — la página "Resumen General" ya
+es funcional; el resto del Dashboard todavía NO está completo, y la
+Etapa 5 en general tampoco.** Esa página muestra, para cada símbolo
 configurado (`BTCUSDT`/`ETHUSDT`/`SOLUSDT`), una tarjeta con precio,
 variación 24h, señal más reciente, score, confianza de la señal,
 recomendación de IA, confianza de IA, nivel de riesgo, última
 actualización relativa ("Hace 5 min") y qué tablas tienen datos
-disponibles — todo con valores "N/D" cuando algo todavía no existe, y un
-resumen general (cuántos símbolos están configurados, cuántos tienen
-datos completos, cuándo se actualizó el sistema por última vez). Las
-demás páginas (Precios, Indicadores, Señales, Recomendaciones de IA,
+disponibles (mercado/indicadores/señales/IA) — todo con valores "N/D"
+cuando algo todavía no existe, y un resumen general (cuántos símbolos
+están configurados, cuántos tienen datos completos, cuándo se actualizó
+el sistema por última vez).
+
+La página incluye un selector **"Vista"** (Automática/Amplia/Compacta) en
+la barra lateral para controlar cuántas tarjetas se muestran por fila (3
+en Amplia, 2 en Automática, 1 apilada verticalmente en Compacta, para
+pantallas angostas) — la elección se guarda solo en la sesión del
+navegador (`st.session_state`), nunca en disco ni en `config.yaml`.
+
+Las demás páginas (Precios, Indicadores, Señales, Recomendaciones de IA,
 Estado Técnico) siguen siendo esqueletos mínimos — su contenido completo
-(gráficos históricos, comparaciones) queda para una iteración futura.
+(gráficos históricos, comparaciones) queda para una iteración futura, y
+la identidad visual definitiva de toda la aplicación (más allá de la
+paleta ya centralizada en `theme.py`) también se completará más adelante.
 
 El Dashboard es de **solo lectura**: nunca escribe en
 `data/crypto_data.db`, no recalcula indicadores ni señales, no genera

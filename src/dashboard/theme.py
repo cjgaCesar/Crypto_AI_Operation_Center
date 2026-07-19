@@ -69,3 +69,31 @@ def get_change_color(value: Optional[float]) -> str:
     if value is None or value == 0:
         return COLOR_NEUTRAL
     return COLOR_POSITIVE if value > 0 else COLOR_NEGATIVE
+
+
+# Streamlit (desde ~1.31) soporta colorear texto en markdown de forma
+# nativa, sin HTML: ":color[texto]" / ":color-background[texto]", con una
+# paleta fija de nombres (blue, green, orange, red, violet, gray, rainbow).
+# Este mapeo traduce los hex de esta paleta a esos nombres, para que
+# components.render_status_badge() pueda usar esa sintaxis nativa en vez
+# de un <span> con HTML.
+_STREAMLIT_COLOR_NAMES = {
+    COLOR_POSITIVE: "green",
+    COLOR_NEGATIVE: "red",
+    COLOR_WARNING: "orange",
+    COLOR_INFO: "blue",
+    COLOR_ACCENT: "blue",
+    COLOR_AI: "violet",
+    COLOR_NEUTRAL: "gray",
+}
+
+
+def to_streamlit_color_name(color: Optional[str]) -> str:
+    """Traduce un color hex de esta paleta al nombre de color nativo que
+    entiende la sintaxis de markdown de Streamlit. Cualquier color no
+    reconocido (incluyendo None) devuelve "gray" — el mismo criterio de
+    "valor desconocido -> neutral" que get_signal_color/get_risk_color/
+    get_change_color."""
+    if color is None:
+        return "gray"
+    return _STREAMLIT_COLOR_NAMES.get(color, "gray")

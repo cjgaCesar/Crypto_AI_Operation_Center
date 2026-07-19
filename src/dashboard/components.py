@@ -7,11 +7,10 @@ dependen de Streamlit a propósito), este módulo sí lo hace: es la única
 capa de presentación reutilizada entre páginas.
 
 Usa únicamente componentes nativos de Streamlit (container, columns,
-metric, caption, markdown, info, warning) — sin CSS complejo ni
-animaciones. El único HTML insertado (en render_status_badge) es un
-`<span>` con un color controlado por theme.py sobre texto que siempre
-viene de un Enum ya validado por Pydantic (nunca texto libre externo ni
-entrada de usuario), por lo que no representa un riesgo de inyección.
+metric, caption, markdown, info, warning) — sin CSS complejo, sin HTML
+(ningún `unsafe_allow_html`) ni animaciones. render_status_badge() usa la
+sintaxis nativa de markdown de Streamlit para texto coloreado
+(":color-background[texto]", ver src/dashboard/theme.py) en vez de HTML.
 """
 
 from typing import Optional
@@ -19,6 +18,7 @@ from typing import Optional
 import streamlit as st
 
 from src.dashboard.formatters import (
+    NOT_AVAILABLE,
     format_confidence,
     format_enum,
     format_percent,
@@ -27,8 +27,15 @@ from src.dashboard.formatters import (
     format_risk_level,
     format_score,
 )
+from src.dashboard.layout import render_responsive_metric_group
 from src.dashboard.models import DashboardSummaryView
-from src.dashboard.theme import COLOR_AI, get_change_color, get_risk_color, get_signal_color
+from src.dashboard.theme import (
+    COLOR_AI,
+    get_change_color,
+    get_risk_color,
+    get_signal_color,
+    to_streamlit_color_name,
+)
 
 
 def render_not_available(message: str = "Sin datos disponibles todavía.") -> None:
@@ -51,18 +58,22 @@ def render_section_header(title: str, subtitle: Optional[str] = None) -> None:
         st.caption(subtitle)
 
 
-def render_status_badge(label: str, color: str) -> None:
+def render_status_badge(label: Optional[str], color: Optional[str]) -> None:
     """Insignia de una sola línea con color de fondo (ej. 'Bullish' en
-    verde). 'label' y 'color' siempre vienen de datos ya validados
-    (Enums de dominio, constantes de theme.py), nunca de texto libre
-    externo, por lo que insertarlos en un bloque de markdown controlado
-    es seguro."""
-    st.markdown(
-        f'<span style="background-color:{color}22; color:{color}; '
-        f'padding:2px 10px; border-radius:6px; font-weight:600; font-size:0.85rem;">'
-        f"{label}</span>",
-        unsafe_allow_html=True,
-    )
+    verde), usando la sintaxis nativa de Streamlit para texto coloreado
+    (":color-background[texto]"), sin HTML ni `unsafe_allow_html`.
+
+    'label' y 'color' siempre deberían venir de datos ya validados
+    (Enums de dominio vía formatters, constantes de theme.py), nunca de
+    texto libre externo — pero esta función se protege a sí misma de
+    todas formas: un label vacío/None se muestra como "N/D"
+    (formatters.NOT_AVAILABLE), y un color no reconocido cae en gris
+    neutral (theme.to_streamlit_color_name). Los corchetes se escapan
+    para no romper la sintaxis de markdown si algún valor llegara a
+    contenerlos."""
+    safe_label = (label or NOT_AVAILABLE).replace("[", "(").replace("]", ")")
+    color_name = to_streamlit_color_name(color)
+    st.markdown(f":{color_name}-background[{safe_label}]")
 
 
 def render_data_availability(
@@ -79,44 +90,81 @@ def render_data_availability(
     st.caption(" · ".join(f"{'✅' if ok else '❌'} {name}" for name, ok in parts))
 
 
-def render_summary_card(view: DashboardSummaryView) -> None:
+def _render_market_section(view: DashboardSummaryView, compact: bool) -> None:
+    """Precio + variación 24h. En modo compacto, apilados; si no, en 2
+    columnas. El precio es un st.metric; la variación es una insignia de
+    color (positiva/negativa/neutral vía theme.get_change_color)."""
+    if compact:
+        render_kpi_card("Precio", format_price_compact(view.price))
+        st.caption("Variación 24h")
+        render_status_badge(
+            format_percent(view.price_change_percent_24h),
+            get_change_color(view.price_change_percent_24h),
+        )
+        return
+
+    price_col, change_col = st.columns(2)
+    with price_col:
+        render_kpi_card("Precio", format_price_compact(view.price))
+    with change_col:
+        st.caption("Variación 24h")
+        render_status_badge(
+            format_percent(view.price_change_percent_24h),
+            get_change_color(view.price_change_percent_24h),
+        )
+
+
+def _render_signal_section(view: DashboardSummaryView, compact: bool) -> None:
+    """Señal (insignia, siempre en su propia línea — es lo prioritario)
+    + score/confianza de la señal (grupo de métricas secundarias,
+    columnas o apiladas según 'compact')."""
+    st.caption("Señal")
+    render_status_badge(format_enum(view.signal_type), get_signal_color(view.signal_type))
+    render_responsive_metric_group(
+        [
+            ("Score", format_score(view.signal_score)),
+            ("Confianza señal", format_enum(view.signal_confidence)),
+        ],
+        compact=compact,
+    )
+
+
+def _render_ai_section(view: DashboardSummaryView, compact: bool) -> None:
+    """Recomendación de IA (insignia, propia línea) + confianza de IA
+    (métrica secundaria) + riesgo (insignia, propia línea)."""
+    st.caption("Recomendación IA")
+    render_status_badge(format_enum(view.ai_recommendation), COLOR_AI)
+    render_responsive_metric_group(
+        [("Confianza IA", format_confidence(view.ai_confidence))], compact=compact,
+    )
+    st.caption("Riesgo")
+    render_status_badge(format_risk_level(view.ai_risk_level), get_risk_color(view.ai_risk_level))
+
+
+def _render_update_section(view: DashboardSummaryView) -> None:
+    """Última actualización relativa + disponibilidad de las 4 tablas.
+    Información secundaria: siempre en captions, sin columnas (no hay
+    nada que ganar apilándola distinto según el modo de vista)."""
+    st.caption(f"Última actualización: {format_relative_status(view.latest_update_timestamp)}")
+    render_data_availability(
+        view.has_market_data, view.has_indicator_data, view.has_signal_data, view.has_ai_data,
+    )
+
+
+def render_summary_card(view: DashboardSummaryView, compact: bool = False) -> None:
     """Tarjeta de resumen de un símbolo para la página 'Resumen General':
     precio, variación 24h, señal, score, confianza de señal, recomendación
     de IA, confianza de IA, riesgo, última actualización y disponibilidad
-    de datos. Usa únicamente componentes nativos de Streamlit."""
+    de datos. Usa únicamente componentes nativos de Streamlit
+    (st.container(border=True), sin ancho/alto fijo).
+
+    'compact=True' apila cada sección verticalmente (una métrica/insignia
+    por fila) en vez de usar columnas lado a lado, para pantallas
+    angostas — la información mostrada es exactamente la misma; solo
+    cambia cómo se agrupa visualmente (ver _render_*_section)."""
     with st.container(border=True):
         render_section_header(view.symbol)
-
-        price_col, change_col = st.columns(2)
-        with price_col:
-            render_kpi_card("Precio", format_price_compact(view.price))
-        with change_col:
-            st.caption("Variación 24h")
-            render_status_badge(
-                format_percent(view.price_change_percent_24h),
-                get_change_color(view.price_change_percent_24h),
-            )
-
-        signal_col, score_col, signal_conf_col = st.columns(3)
-        with signal_col:
-            st.caption("Señal")
-            render_status_badge(format_enum(view.signal_type), get_signal_color(view.signal_type))
-        with score_col:
-            render_kpi_card("Score", format_score(view.signal_score))
-        with signal_conf_col:
-            render_kpi_card("Confianza señal", format_enum(view.signal_confidence))
-
-        ai_col, ai_conf_col, risk_col = st.columns(3)
-        with ai_col:
-            st.caption("Recomendación IA")
-            render_status_badge(format_enum(view.ai_recommendation), COLOR_AI)
-        with ai_conf_col:
-            render_kpi_card("Confianza IA", format_confidence(view.ai_confidence))
-        with risk_col:
-            st.caption("Riesgo")
-            render_status_badge(format_risk_level(view.ai_risk_level), get_risk_color(view.ai_risk_level))
-
-        st.caption(f"Última actualización: {format_relative_status(view.latest_update_timestamp)}")
-        render_data_availability(
-            view.has_market_data, view.has_indicator_data, view.has_signal_data, view.has_ai_data,
-        )
+        _render_market_section(view, compact)
+        _render_signal_section(view, compact)
+        _render_ai_section(view, compact)
+        _render_update_section(view)

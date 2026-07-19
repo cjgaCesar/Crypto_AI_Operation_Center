@@ -73,6 +73,51 @@ Se agregaron 2 piezas nuevas, sin romper el principio de diseño:
   `format_relative_status` (esta última acepta un `reference` explícito,
   para que las pruebas sean deterministas sin depender del reloj real).
 
+### Revisión: `render_status_badge()` sin HTML
+
+La primera versión de `render_status_badge()` usaba un `<span>` con
+`unsafe_allow_html=True`. Se revisó y se reemplazó por la sintaxis nativa
+de markdown de Streamlit para texto coloreado
+(`:color[texto]`/`:color-background[texto]`, disponible desde ~1.31, ya
+presente en la versión instalada), eliminando el HTML por completo:
+`theme.to_streamlit_color_name()` traduce cada color hex de la paleta a
+uno de los 7 nombres nativos que Streamlit reconoce (`blue`, `green`,
+`orange`, `red`, `violet`, `gray`, `rainbow`), con `"gray"` como
+respaldo para cualquier color no reconocido. Además, `render_status_badge()`
+se protege a sí misma (no solo confía en que quien la llama ya validó
+todo): un `label` `None`/vacío se muestra como `"N/D"`
+(`formatters.NOT_AVAILABLE`), y los corchetes `[`/`]` se escapan para no
+romper la sintaxis de markdown si algún valor llegara a contenerlos.
+
+### Diseño responsive (layout.py)
+
+Streamlit no expone el ancho real del viewport del navegador (no hay
+breakpoints dinámicos nativos), y este proyecto explícitamente no agrega
+detección de viewport vía JavaScript ni paquetes de terceros para
+lograrlo. La estrategia adoptada es un selector manual en la barra
+lateral de "Resumen General" (`Vista: Automática/Amplia/Compacta`),
+guardado únicamente en `st.session_state` (nunca en disco ni en
+`config.yaml`):
+
+- **`src/dashboard/layout.py`** (nuevo): `get_cards_per_row(view_mode)`
+  (Amplia=3, Automática=2, Compacta=1, cualquier valor desconocido cae en
+  Automática — nunca 0, nunca más de 3), `is_compact(view_mode)`,
+  `render_responsive_grid()` (distribuye tarjetas en filas de N columnas,
+  o de corrido si N<=1) y `render_responsive_metric_group()` (columnas o
+  apilado según el modo).
+- **`render_summary_card(view, compact=False)`** se refactorizó en 4
+  secciones internas (`_render_market_section`,
+  `_render_signal_section`, `_render_ai_section`,
+  `_render_update_section`), cada una con una rama columnas/apilado — el
+  contenido mostrado es exactamente el mismo en ambos modos, solo cambia
+  cómo se agrupa visualmente. Las insignias prioritarias (señal,
+  recomendación de IA, riesgo) siempre ocupan su propia línea completa;
+  las métricas secundarias (score, confianzas) se agrupan con
+  `render_responsive_metric_group()`.
+- Ninguna tarjeta usa ancho/alto fijo, posiciones absolutas ni CSS con
+  coordenadas: solo `st.container(border=True)`, `st.columns()` y
+  `st.metric()`, que ya se adaptan al ancho disponible.
+
 ## Tecnología seleccionada: Streamlit
 
 | Opción | Evaluación |
@@ -91,11 +136,15 @@ futuro sin reescribir la lógica de consulta:
 ```
 SQLite (4 repositorios ya existentes, solo lectura)
     ↓
-src/dashboard/repository.py   (DashboardRepository / SQLiteDashboardRepository)
+Repository    src/dashboard/repository.py   (DashboardRepository / SQLiteDashboardRepository)
     ↓
-src/dashboard/service.py        (DashboardService: arma modelos de presentación)
+Service       src/dashboard/service.py        (DashboardService: arma modelos de presentación)
     ↓
-src/dashboard/pages/*.py          (una página Streamlit por vista)
+View Model    src/dashboard/models.py           (DashboardSummary, DashboardSummaryView, ...)
+    ↓
+Components    src/dashboard/components.py         (render_summary_card, render_status_badge, ...)
+    ↓
+Page          src/dashboard/pages/*.py               (una página Streamlit por vista)
     ↓
 Streamlit (renderiza en el navegador)
 ```
@@ -104,14 +153,22 @@ Streamlit (renderiza en el navegador)
   `SQLiteMarketDataRepository`, `SQLiteIndicatorRepository`,
   `SQLiteSignalRepository` y `SQLiteAIRepository`, y solo llama a sus
   métodos `fetch_latest`/`fetch_history` (nunca `save()`).
-- **`service.py`** llama a `repository.py` y arma los modelos de
-  `models.py` (ej. `DashboardSummary`); no sabe nada de Streamlit.
-- **Las páginas** (`src/dashboard/pages/`) solo llaman a `service.py` y
-  renderizan el resultado. No abren conexiones a SQLite directamente.
+- **`service.py`** llama a `repository.py` y arma los **modelos de
+  vista** de `models.py` (ej. `DashboardSummary`, `DashboardSummaryView`);
+  no sabe nada de Streamlit.
+- **`models.py`** (View Model) son Pydantic puros: sin lógica visual, sin
+  SQL, sin conexión a Streamlit.
+- **`components.py`** consume los modelos de vista y los dibuja
+  (`render_summary_card`, `render_status_badge`, etc.); es la única capa,
+  junto con `layout.py`, que depende de Streamlit además de las páginas.
+- **Las páginas** (`src/dashboard/pages/`) llaman a `service.py` para
+  obtener datos y a `components.py`/`layout.py` para dibujarlos. No abren
+  conexiones a SQLite directamente ni ejecutan SQL.
 - **Migración futura a FastAPI**: si se decide exponer una API, sus
   endpoints llamarían a las mismas funciones de `service.py` que hoy usa
-  Streamlit. Ni los repositorios ni `repository.py`/`service.py`
-  cambiarían.
+  Streamlit. Ni los repositorios ni `repository.py`/`service.py`/
+  `models.py` cambiarían — solo `components.py`/`layout.py` (capa 100%
+  de presentación) dejarían de usarse en ese contexto.
 
 ## Estructura de módulos (base en la Iteración 5.2, ampliada en la 5.3)
 
@@ -129,12 +186,15 @@ src/dashboard/
 │                                        # format_price_compact/confidence/score/
 │                                        # risk_level/relative_status (5.3)
 ├── theme.py                              # Paleta + get_signal_color/get_risk_color/
-│                                         # get_change_color (nuevo, 5.3)
+│                                         # get_change_color/to_streamlit_color_name (5.3)
+├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
+│                                          # render_responsive_metric_group (responsive, 5.3)
 ├── charts.py                             # empty_figure/line_chart (mínimos; gráficos
 │                                         # históricos completos en una iteración futura)
 ├── components.py                           # render_not_available/render_kpi_card +
-│                                           # render_section_header/render_status_badge/
-│                                           # render_data_availability/render_summary_card (5.3)
+│                                           # render_section_header/render_status_badge (sin HTML)/
+│                                           # render_data_availability/render_summary_card
+│                                           # (con modo compact, 5.3)
 └── pages/                                    # Una página por vista
     ├── __init__.py
     ├── resumen.py                             # Funcional desde 5.3 (tarjetas por símbolo)
@@ -171,8 +231,10 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
    `risk_level`), última actualización relativa y disponibilidad de datos
    (mercado/indicadores/señales/IA), además de un resumen general (símbolos
    configurados, símbolos con datos completos, última actualización del
-   sistema) y 4 estados vacíos distintos (base inexistente, sin precios,
-   precios sin señales, señales sin IA).
+   sistema), 4 estados vacíos distintos (base inexistente, sin precios,
+   precios sin señales, señales sin IA), y un selector de vista responsive
+   (`Vista: Automática/Amplia/Compacta`, ver "Diseño responsive" más
+   arriba) que controla cuántas tarjetas se muestran por fila.
 2. **Precios** (`mercado.py`) — esqueleto: hoy solo el último precio. En
    una iteración futura, gráfico de precio histórico (`market_data`)
    superpuesto con SMA/EMA.
@@ -199,14 +261,21 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 ## Componentes reutilizables
 
 - **`render_kpi_card`**: valor principal + etiqueta (envuelve `st.metric`).
-- **`render_status_badge`** (5.3): insignia de una línea con color de
-  fondo controlado por `theme.py` (señal, riesgo, recomendación de IA,
-  variación 24h).
+- **`render_status_badge`** (5.3, sin HTML desde la revisión del Bloque
+  C): insignia de una línea con color de fondo, vía la sintaxis nativa de
+  markdown de Streamlit (señal, riesgo, recomendación de IA, variación
+  24h). Con protección propia: `label` vacío/`None` -> `"N/D"`, color no
+  reconocido -> gris.
 - **`render_data_availability`** (5.3): fila ✅/❌ de las 4 tablas
   (mercado/indicadores/señales/IA) para un símbolo.
 - **`render_section_header`** (5.3): encabezado de sección reutilizable.
-- **`render_summary_card`** (5.3): la tarjeta completa de un símbolo en
-  "Resumen General", combinando los 4 componentes anteriores.
+- **`render_summary_card(view, compact=False)`** (5.3): la tarjeta
+  completa de un símbolo en "Resumen General", combinando los componentes
+  anteriores en 4 secciones internas (mercado/señal/IA/actualización), con
+  layout en columnas o apilado según `compact`.
+- **`layout.render_responsive_grid`/`render_responsive_metric_group`**
+  (5.3): distribución de tarjetas y grupos de métricas según el modo de
+  vista elegido (ver "Diseño responsive" más arriba).
 - **Gráfico de serie temporal** (`charts.line_chart`): envoltura común
   para precio/indicadores/score/confidence a lo largo del tiempo —
   todavía sin usar en ninguna página (pendiente de una iteración futura).
@@ -227,6 +296,20 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 - **Auto-actualización**: intervalo opcional de refresco automático de la
   página (ej. cada 30s), para reflejar nuevos ciclos del bot sin recargar
   manualmente.
+
+## Regla para tablas y gráficos futuros (Precios/Indicadores/Señales/Recomendaciones)
+
+Cuando se implementen los gráficos históricos e indicadores de esas 4
+páginas (todavía esqueletos), seguir esta regla para que sean responsive
+desde el primer commit, sin tener que revisarlos después:
+
+- Usar `st.dataframe(..., use_container_width=True)` para cualquier
+  tabla; evitar tablas estáticas en markdown.
+- Usar gráficos Plotly con `use_container_width=True`; evitar tamaños
+  fijos en píxeles.
+- Limitar columnas visibles en pantallas angostas; ofrecer detalle
+  expandible (`st.expander`) cuando haya demasiada información para
+  mostrar de una vez.
 
 ## Qué NO hace el Dashboard
 
@@ -251,8 +334,11 @@ agregó ninguna dependencia nueva.
 - **5.2** (estructura base): repositorio/servicio/config/helpers/`app.py`
   funcionando, 6 páginas esqueleto.
 - **5.3** (esta): página "Resumen General" funcional
-  (`DashboardSummaryView`, `get_summary_view()`, `theme.py`, tarjetas de
-  resumen). Las otras 4 páginas de símbolo siguen siendo esqueletos.
-- **Pendiente**: gráficos históricos completos, auto-refresh real,
+  (`DashboardSummaryView`, `get_summary_view()`, `theme.py`,
+  `layout.py`/diseño responsive, tarjetas de resumen sin HTML). Las otras
+  4 páginas de símbolo siguen siendo esqueletos.
+- **Pendiente para la Iteración 5.4**: gráficos históricos completos
+  (Precios/Indicadores/Señales/Recomendaciones), auto-refresh real,
   comparación entre símbolos, diseño visual definitivo de toda la
-  aplicación.
+  aplicación (identidad visual más allá de la paleta ya centralizada en
+  `theme.py`).

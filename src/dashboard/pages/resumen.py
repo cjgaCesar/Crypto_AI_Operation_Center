@@ -1,5 +1,5 @@
 """
-Página 'Resumen General' (Etapa 5, Iteración 5.3 — funcional).
+Página 'Resumen General' (Etapa 5, Iteración 5.3 — funcional y responsive).
 
 Primera página completamente funcional del Dashboard: muestra, para cada
 símbolo configurado, una tarjeta con precio, variación 24h, señal, score,
@@ -9,16 +9,19 @@ sistema. Todo lo que se muestra viene de service.get_summary_view() /
 service.get_system_status(): esta página no llama al repositorio, no
 ejecuta SQL, no recalcula nada y no se conecta a Binance ni a ningún
 proveedor de IA.
+
+El layout (cuántas tarjetas por fila, columnas o apiladas) lo decide
+src/dashboard/layout.py según el modo de vista elegido en la barra
+lateral (Automática/Amplia/Compacta), guardado solo en
+st.session_state — nunca en disco ni en config.yaml.
 """
 
 import streamlit as st
 
 from src.dashboard.components import render_not_available, render_summary_card
 from src.dashboard.formatters import format_relative_status
+from src.dashboard.layout import VIEW_MODE_AUTO, VIEW_MODES, get_cards_per_row, is_compact, render_responsive_grid
 from src.dashboard.service import DashboardService
-
-# Máximo de tarjetas por fila (Bloque 9: layout ancho, jerarquía clara).
-_MAX_CARDS_PER_ROW = 3
 
 
 def render(service: DashboardService, exchange: str) -> None:
@@ -67,9 +70,17 @@ def render(service: DashboardService, exchange: str) -> None:
 
     st.divider()
 
-    for row_start in range(0, len(views), _MAX_CARDS_PER_ROW):
-        row_views = views[row_start:row_start + _MAX_CARDS_PER_ROW]
-        columns = st.columns(_MAX_CARDS_PER_ROW)
-        for column, view in zip(columns, row_views):
-            with column:
-                render_summary_card(view)
+    # Selector de vista responsive: se agrega desde esta página (no desde
+    # app.py) para no tocar la navegación general por algo específico de
+    # "Resumen General". Solo vive en st.session_state (vía 'key'), nunca
+    # se escribe a disco ni a config.yaml.
+    view_mode = st.sidebar.selectbox(
+        "Vista", VIEW_MODES, index=VIEW_MODES.index(VIEW_MODE_AUTO), key="resumen_view_mode",
+        help="Automática: 2 tarjetas por fila. Amplia: 3. Compacta: 1 (apilada, ideal para móvil).",
+    )
+    cards_per_row = get_cards_per_row(view_mode)
+    compact = is_compact(view_mode)
+
+    render_responsive_grid(
+        views, lambda view: render_summary_card(view, compact=compact), cards_per_row,
+    )
