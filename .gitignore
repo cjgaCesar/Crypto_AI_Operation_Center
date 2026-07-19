@@ -15,3 +15,9 @@ __pycache__/
 
 # Configuración local del editor
 .vscode/
+
+# Configuración local de Claude Code (permisos, sesiones), no es parte del proyecto
+.claude/
+
+# Archivo de metadatos de carpeta de Windows
+desktop.ini

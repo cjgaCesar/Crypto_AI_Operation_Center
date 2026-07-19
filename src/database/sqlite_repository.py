@@ -12,6 +12,7 @@ MarketDataRepository.
 
 from pathlib import Path
 import sqlite3
+from typing import Optional
 
 from src.database.base import MarketDataRepository
 from src.models.market_data import MarketTicker
@@ -94,6 +95,43 @@ class SQLiteMarketDataRepository(MarketDataRepository):
                 "FROM market_data ORDER BY id"
             )
             rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        return [
+            MarketTicker(
+                exchange=row[0],
+                symbol=row[1],
+                price=row[2],
+                volume_24h=row[3],
+                price_change_percent_24h=row[4],
+                queried_at=row[5],
+            )
+            for row in rows
+        ]
+
+    def fetch_by_symbol(
+        self, exchange: str, symbol: str, limit: Optional[int] = None
+    ) -> list[MarketTicker]:
+        conn = self._get_connection()
+        try:
+            if limit is None:
+                cursor = conn.execute(
+                    "SELECT exchange, symbol, price, volume_24h, price_change_percent_24h, queried_at "
+                    "FROM market_data WHERE exchange = ? AND symbol = ? ORDER BY id ASC",
+                    (exchange, symbol),
+                )
+                rows = cursor.fetchall()
+            else:
+                # Se piden las últimas 'limit' filas (ORDER BY id DESC) y
+                # luego se invierten, para devolver siempre de más antigua
+                # a más reciente.
+                cursor = conn.execute(
+                    "SELECT exchange, symbol, price, volume_24h, price_change_percent_24h, queried_at "
+                    "FROM market_data WHERE exchange = ? AND symbol = ? ORDER BY id DESC LIMIT ?",
+                    (exchange, symbol, limit),
+                )
+                rows = list(reversed(cursor.fetchall()))
         finally:
             conn.close()
 

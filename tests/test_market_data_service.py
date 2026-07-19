@@ -36,6 +36,10 @@ class FakeRepository(MarketDataRepository):
     def fetch_all(self):
         return self.saved
 
+    def fetch_by_symbol(self, exchange, symbol, limit=None):
+        matches = [t for t in self.saved if t.exchange == exchange and t.symbol == symbol]
+        return matches[-limit:] if limit is not None else matches
+
 
 def _ticker(symbol="BTCUSDT") -> MarketTicker:
     return MarketTicker(

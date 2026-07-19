@@ -22,6 +22,8 @@ price_change_percent_24h y queried_at (ver MarketTicker en
 src/models/market_data.py).
 """
 
+from typing import Optional
+
 from src.database.base import MarketDataRepository
 from src.models.market_data import MarketTicker
 
@@ -43,4 +45,9 @@ class PostgresMarketDataRepository(MarketDataRepository):
         raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
 
     def fetch_all(self) -> list[MarketTicker]:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def fetch_by_symbol(
+        self, exchange: str, symbol: str, limit: Optional[int] = None
+    ) -> list[MarketTicker]:
         raise NotImplementedError(_NOT_IMPLEMENTED_MSG)

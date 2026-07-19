@@ -47,3 +47,101 @@ logging:
 binance:
   base_url: https://api.binance.com
   timeout_seconds: 10
+
+# Configuración del motor de indicadores técnicos (Etapa 2).
+# Todos los periodos son configurables aquí: para cambiar uno (ej. RSI de
+# 14 a 21) solo hay que editar este archivo, sin tocar ningún código.
+indicators:
+  sma: 20
+  ema_fast: 20
+  ema_medium: 50
+  ema_slow: 200
+  rsi: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bollinger_period: 20
+  bollinger_stddev: 2
+  vwap: true
+  # Reservados para una etapa futura: ATR y ADX requieren datos de máximo/
+  # mínimo por vela (OHLC), que Binance expone en /api/v3/klines, no en el
+  # endpoint de ticker de 24h que usa este proyecto. El motor de indicadores
+  # valida que estos valores existan, pero todavía no los usa para calcular
+  # nada (ver docs/ARQUITECTURA.md).
+  atr: 14
+  adx: 14
+
+# Configuración del motor de señales (Etapa 3).
+# El motor de señales NO usa inteligencia artificial: combina las salidas de
+# reglas determinísticas (src/signals/rules/) sobre los indicadores ya
+# calculados. Todos los umbrales de todas las reglas son configurables aquí.
+signals:
+  # Umbrales (0-100) para clasificar el SCORE FINAL ya ponderado (ver
+  # 'weights' más abajo) en un veredicto general (SignalType):
+  # score >= bullish -> Bullish; score <= bearish -> Bearish; el resto -> Neutral.
+  # 'neutral' es solo un valor de referencia informativo.
+  score:
+    bullish: 80
+    neutral: 50
+    bearish: 20
+
+  # Peso (aporte relativo) de cada regla en el cálculo del score final.
+  # El agregador combina 'direction' y 'strength' de cada regla, ponderados
+  # por estos 5 valores (no promedia todas las reglas por igual). No es
+  # obligatorio que sumen 100: el agregador normaliza por la suma total.
+  weights:
+    trend: 35
+    ema: 20
+    macd: 20
+    rsi: 15
+    bollinger: 10
+
+  # Umbrales (0-100) para clasificar el nivel de "confidence" de una señal,
+  # calculado según qué tan de acuerdo están las 5 reglas entre sí.
+  confidence:
+    very_high: 90
+    high: 80
+    medium: 60
+    low: 40
+
+  # Umbrales propios de cada regla individual (ver src/signals/rules/).
+  rules:
+    trend:
+      # % de diferencia entre ema_fast y ema_slow por debajo del cual la
+      # tendencia se considera "Neutral".
+      neutral_band_pct: 0.1
+      # % de diferencia (con las 3 EMA alineadas) a partir del cual la
+      # tendencia se considera "Strong Bullish"/"Strong Bearish".
+      strong_diff_pct: 1.0
+    ema:
+      # % de diferencia entre ema_fast y ema_medium por debajo del cual se
+      # considera "Neutral" (sin cruce claro).
+      neutral_band_pct: 0.1
+    rsi:
+      oversold: 30
+      overbought: 70
+    bollinger:
+      # % del ancho de la banda considerado "cerca" de la banda superior/inferior.
+      proximity_pct: 0.5
+
+# Configuración del motor de IA (Etapa 4).
+# La IA NO reemplaza al motor de señales: solo interpreta, explica y prioriza
+# los SignalSnapshot ya generados por la Etapa 3. Ninguna clave de API va
+# aquí (eso vive en .env); esta sección solo controla comportamiento.
+ai:
+  # Si es false, AIService no genera ninguna recomendación en el ciclo.
+  enabled: true
+  # Proveedor activo: "dummy" (implementado, sin IA real), "openai" o
+  # "claude" (estructura preparada, NO conectados todavía).
+  provider: dummy
+  model: dummy-v1
+  # Parámetros que recibirán los proveedores reales cuando se conecten.
+  temperature: 0.2
+  max_tokens: 500
+  system_prompt: >
+    Eres un analista de mercado de criptomonedas. Interpreta la señal
+    estructurada que recibes (no la recalcules) y explica tu recomendación
+    de forma clara y honesta, incluyendo riesgos.
+  # Segundos que DummyProvider espera antes de responder, para simular la
+  # latencia de un proveedor real en pruebas manuales (0 = instantáneo).
+  dummy_delay: 0

@@ -135,3 +135,53 @@ def test_init_migrates_legacy_table_without_exchange_column(tmp_path):
     # La base de datos migrada debe seguir aceptando escrituras normales.
     repo.save([_ticker("ETHUSDT")])
     assert len(repo.fetch_all()) == 2
+
+
+def test_fetch_by_symbol_returns_only_matching_symbol_and_exchange(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    repo = SQLiteMarketDataRepository(db_path)
+    repo.init()
+
+    repo.save([
+        _ticker("BTCUSDT", exchange="Binance"),
+        _ticker("ETHUSDT", exchange="Binance"),
+        _ticker("BTCUSDT", exchange="Bybit"),
+    ])
+
+    rows = repo.fetch_by_symbol("Binance", "BTCUSDT")
+    assert len(rows) == 1
+    assert rows[0].exchange == "Binance"
+    assert rows[0].symbol == "BTCUSDT"
+
+
+def test_fetch_by_symbol_orders_oldest_to_newest(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    repo = SQLiteMarketDataRepository(db_path)
+    repo.init()
+
+    for price in [100.0, 101.0, 102.0]:
+        repo.save([_ticker("BTCUSDT", price=price)])
+
+    rows = repo.fetch_by_symbol("Binance", "BTCUSDT")
+    assert [r.price for r in rows] == [100.0, 101.0, 102.0]
+
+
+def test_fetch_by_symbol_respects_limit(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    repo = SQLiteMarketDataRepository(db_path)
+    repo.init()
+
+    for price in [100.0, 101.0, 102.0, 103.0]:
+        repo.save([_ticker("BTCUSDT", price=price)])
+
+    rows = repo.fetch_by_symbol("Binance", "BTCUSDT", limit=2)
+    # Debe devolver únicamente las 2 lecturas más recientes, en orden.
+    assert [r.price for r in rows] == [102.0, 103.0]
+
+
+def test_fetch_by_symbol_returns_empty_list_when_no_history(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    repo = SQLiteMarketDataRepository(db_path)
+    repo.init()
+
+    assert repo.fetch_by_symbol("Binance", "BTCUSDT") == []

@@ -9,10 +9,14 @@ Combina dos fuentes distintas, a propósito:
 - .env: credenciales y secretos (claves de API, tokens). Nunca se sube a
   git (ver .gitignore). Se basa en .env.example.
 
-En esta etapa (1.5) ninguna credencial se usa todavía para conectarse a un
-servicio real: los campos existen en Settings para que los módulos futuros
-(IA, Telegram, múltiples exchanges) los reciban listos para usar, pero el
-propio proyecto no realiza ninguna llamada autenticada.
+Ninguna credencial se usa todavía para conectarse a un servicio real: los
+campos existen en Settings para que los módulos futuros (IA, Telegram,
+múltiples exchanges) los reciban listos para usar, pero el propio proyecto
+no realiza ninguna llamada autenticada.
+
+Desde la Etapa 2, Settings también incluye 'indicators' (IndicatorSettings),
+con los periodos del motor de indicadores técnicos, igualmente configurables
+desde config.yaml sin tocar código.
 """
 
 from __future__ import annotations
@@ -68,6 +72,18 @@ class TelegramSettings:
 
 @dataclass(frozen=True)
 class AISettings:
+    """SOLO credenciales (secretos) para proveedores de IA reales, leídas
+    desde variables de entorno (.env), nunca desde config.yaml.
+
+    Distinta de 'AIEngineSettings' (más abajo), que configura el
+    COMPORTAMIENTO del motor de IA de la Etapa 4 (qué proveedor usar, qué
+    modelo, temperatura, etc.), leído desde config.yaml -> ai. Existen como
+    dos clases separadas, sin fusionarse, para no romper
+    'settings.ai.openai_api_key' ya usado en pruebas existentes desde la
+    Etapa 1.5 (ver tests/test_utils_config.py) ni mezclar secretos con
+    comportamiento configurable. Hoy ninguno de estos dos campos se usa
+    para conectarse a un servicio real (Etapa 4 usa DummyProvider)."""
+
     # Reservados para la futura integración de inteligencia artificial. Hoy siempre None.
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
@@ -81,6 +97,180 @@ class ExternalDataSettings:
 
 
 @dataclass(frozen=True)
+class IndicatorSettings:
+    """Periodos del motor de indicadores técnicos (Etapa 2).
+
+    Todos se leen desde config.yaml -> indicators; para cambiar un periodo
+    (ej. RSI de 14 a 21) solo hay que editar config.yaml, sin tocar código.
+
+    'atr' y 'adx' existen para completar la configuración solicitada, pero
+    el motor de indicadores (src/services/indicator_engine.py) todavía NO
+    los calcula: ambos requieren datos de máximo/mínimo por vela (OHLC) que
+    el endpoint de Binance usado hoy (ticker/24hr) no provee por intervalo.
+    Ver docs/ARQUITECTURA.md.
+    """
+
+    sma: int
+    ema_fast: int
+    ema_medium: int
+    ema_slow: int
+    rsi: int
+    macd_fast: int
+    macd_slow: int
+    macd_signal: int
+    bollinger_period: int
+    bollinger_stddev: float
+    atr: int
+    adx: int
+    vwap: bool
+
+
+@dataclass(frozen=True)
+class ScoreThresholds:
+    """Umbrales (0-100) para clasificar el SCORE FINAL ya ponderado en un
+    SignalType (Bullish/Neutral/Bearish).
+
+    Si score >= bullish -> SignalType.BULLISH; si score <= bearish ->
+    SignalType.BEARISH; en cualquier otro caso -> SignalType.NEUTRAL.
+    'neutral' se guarda como referencia informativa (punto medio esperado),
+    pero no participa directamente en la clasificación (solo bullish y
+    bearish son los límites que se comparan).
+    """
+
+    bullish: float
+    neutral: float
+    bearish: float
+
+
+@dataclass(frozen=True)
+class SignalWeights:
+    """Peso (aporte relativo) de cada regla en el cálculo del score final.
+
+    El agregador (src/signals/aggregator.py) combina el 'direction' y la
+    'strength' de cada RuleResult, ponderados por estos 5 valores, en vez
+    de promediarlos con el mismo peso. No es necesario que sumen 100
+    exactamente: el agregador siempre normaliza por la suma total.
+    """
+
+    trend: float
+    ema: float
+    macd: float
+    rsi: float
+    bollinger: float
+
+
+@dataclass(frozen=True)
+class ConfidenceThresholds:
+    """Umbrales (0-100) para clasificar el nivel de confianza de una señal.
+
+    'very_high' no fue parte de los valores que se pidieron explícitamente
+    (solo se dieron high/medium/low); se agregó para completar las 5
+    categorías requeridas (Very Low/Low/Medium/High/Very High), como el
+    punto medio entre 'high' y el máximo (100). Es completamente
+    configurable, no está fijo en el código.
+    """
+
+    very_high: float
+    high: float
+    medium: float
+    low: float
+
+
+@dataclass(frozen=True)
+class TrendRuleSettings:
+    # % de diferencia entre ema_fast y ema_slow por debajo del cual se considera "Neutral".
+    neutral_band_pct: float
+    # % de diferencia a partir del cual, con las 3 EMA alineadas, se considera "Strong".
+    strong_diff_pct: float
+
+
+@dataclass(frozen=True)
+class EMARuleSettings:
+    # % de diferencia entre ema_fast y ema_medium por debajo del cual se considera "Neutral".
+    neutral_band_pct: float
+
+
+@dataclass(frozen=True)
+class RSIRuleSettings:
+    oversold: float
+    overbought: float
+
+
+@dataclass(frozen=True)
+class BollingerRuleSettings:
+    # % del ancho de la banda considerado "cerca" de la banda superior/inferior.
+    proximity_pct: float
+
+
+@dataclass(frozen=True)
+class SignalRuleSettings:
+    trend: TrendRuleSettings
+    ema: EMARuleSettings
+    rsi: RSIRuleSettings
+    bollinger: BollingerRuleSettings
+
+
+@dataclass(frozen=True)
+class SignalSettings:
+    """Configuración del motor de señales (Etapa 3).
+
+    Todos los umbrales de todas las reglas son configurables desde
+    config.yaml -> signals; ninguna regla tiene un valor fijo en el código.
+    """
+
+    score: ScoreThresholds
+    weights: SignalWeights
+    confidence: ConfidenceThresholds
+    rules: SignalRuleSettings
+
+
+@dataclass(frozen=True)
+class AIEngineSettings:
+    """Configuración del motor de IA (Etapa 4).
+
+    Distinta de 'AISettings' (más arriba): 'AISettings' SOLO reserva las
+    claves privadas de OpenAI/Anthropic leídas desde .env (secretos);
+    'AIEngineSettings' configura el COMPORTAMIENTO del motor de IA
+    (proveedor activo, modelo, parámetros de generación), leído desde
+    config.yaml -> ai, igual que 'signals' o 'indicators'. Ninguna clave de
+    API vive aquí -- para evitar nombres ambiguos: "credenciales" siempre
+    está en 'Settings.ai'; "comportamiento del motor" siempre está en
+    'Settings.ai_engine'.
+
+    Nota: se evaluó fusionar ambas en una sola estructura (tal como sugiere
+    la Etapa 4), pero se descartó porque 'settings.ai.openai_api_key' ya
+    tiene pruebas dependientes desde la Etapa 1.5
+    (tests/test_utils_config.py) y fusionar habría sido una modificación
+    innecesaria de una funcionalidad ya aprobada, sin ningún beneficio
+    técnico real (ambas clases ya están claramente separadas y
+    documentadas).
+
+    - 'enabled': si es False, AIService no ejecuta ningún ciclo (permite
+      desactivar la Etapa 4 sin quitar código).
+    - 'provider': qué AIProvider usar ("dummy", "openai" o "claude"). Hoy
+      solo "dummy" está realmente conectado; "openai"/"claude" existen como
+      estructura preparada (ver src/ai/providers/), sin conectar APIs reales.
+    - 'model', 'temperature', 'max_tokens', 'system_prompt': parámetros que
+      recibirán los proveedores reales cuando se conecten.
+    - 'dummy_delay': segundos que DummyProvider espera antes de responder,
+      para simular la latencia de un proveedor real en pruebas manuales.
+    - 'future_api_key': reservado para un proveedor futuro que no sea
+      OpenAI/Anthropic (que ya tienen su propio campo en AISettings); nunca
+      se lee desde config.yaml (sería un secreto), sino desde la variable de
+      entorno AI_FUTURE_API_KEY, igual que el resto de credenciales.
+    """
+
+    enabled: bool
+    provider: str
+    model: str
+    temperature: float
+    max_tokens: int
+    system_prompt: str
+    dummy_delay: float
+    future_api_key: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class Settings:
     symbols: list[str]
     interval_minutes: float
@@ -91,6 +281,9 @@ class Settings:
     telegram: TelegramSettings
     ai: AISettings
     external_data: ExternalDataSettings
+    indicators: IndicatorSettings
+    signals: SignalSettings
+    ai_engine: AIEngineSettings
 
 
 def _load_yaml_config(config_path: Path) -> dict:
@@ -106,8 +299,17 @@ def _load_yaml_config(config_path: Path) -> dict:
     return config
 
 
+_INDICATOR_INT_FIELDS = [
+    "sma", "ema_fast", "ema_medium", "ema_slow", "rsi",
+    "macd_fast", "macd_slow", "macd_signal", "bollinger_period", "atr", "adx",
+]
+
+
 def _validate_yaml_config(config: dict) -> None:
-    required_keys = ["symbols", "interval_minutes", "database", "logging", "binance", "alerts"]
+    required_keys = [
+        "symbols", "interval_minutes", "database", "logging", "binance",
+        "alerts", "indicators", "signals", "ai",
+    ]
     missing = [key for key in required_keys if key not in config]
     if missing:
         raise ValueError(
@@ -125,6 +327,112 @@ def _validate_yaml_config(config: dict) -> None:
         raise ValueError("Falta 'database.engine' en config.yaml (ej. 'sqlite').")
     if db_cfg["engine"] == "sqlite" and "sqlite_path" not in db_cfg:
         raise ValueError("Falta 'database.sqlite_path' en config.yaml para el motor sqlite.")
+
+    _validate_indicators_config(config["indicators"])
+    _validate_signals_config(config["signals"])
+    _validate_ai_config(config["ai"])
+
+
+def _validate_indicators_config(indicators_cfg: dict) -> None:
+    required_fields = _INDICATOR_INT_FIELDS + ["bollinger_stddev", "vwap"]
+    missing = [f for f in required_fields if f not in indicators_cfg]
+    if missing:
+        raise ValueError(
+            f"Faltan campos obligatorios en config.yaml -> indicators: {', '.join(missing)}"
+        )
+
+    for field in _INDICATOR_INT_FIELDS:
+        value = indicators_cfg[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"'indicators.{field}' debe ser un número entero mayor a 0.")
+
+    stddev = indicators_cfg["bollinger_stddev"]
+    if isinstance(stddev, bool) or not isinstance(stddev, (int, float)) or stddev <= 0:
+        raise ValueError("'indicators.bollinger_stddev' debe ser un número mayor a 0.")
+
+    if not isinstance(indicators_cfg["vwap"], bool):
+        raise ValueError("'indicators.vwap' debe ser verdadero o falso (true/false).")
+
+
+def _require_numeric(container: dict, field: str, path: str) -> None:
+    value = container.get(field)
+    if field not in container or isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"'{path}.{field}' debe existir y ser un número.")
+
+
+_SIGNAL_WEIGHT_FIELDS = ["trend", "ema", "macd", "rsi", "bollinger"]
+
+
+def _validate_signals_config(signals_cfg: dict) -> None:
+    for section in ["score", "weights", "confidence", "rules"]:
+        if section not in signals_cfg:
+            raise ValueError(f"Falta 'signals.{section}' en config.yaml.")
+
+    score_cfg = signals_cfg["score"]
+    for field in ["bullish", "neutral", "bearish"]:
+        _require_numeric(score_cfg, field, "signals.score")
+
+    weights_cfg = signals_cfg["weights"]
+    for field in _SIGNAL_WEIGHT_FIELDS:
+        _require_numeric(weights_cfg, field, "signals.weights")
+        if weights_cfg[field] < 0:
+            raise ValueError(f"'signals.weights.{field}' no puede ser negativo.")
+    if sum(weights_cfg[field] for field in _SIGNAL_WEIGHT_FIELDS) <= 0:
+        raise ValueError("La suma de 'signals.weights' debe ser mayor a 0.")
+
+    confidence_cfg = signals_cfg["confidence"]
+    for field in ["very_high", "high", "medium", "low"]:
+        _require_numeric(confidence_cfg, field, "signals.confidence")
+
+    rules_cfg = signals_cfg["rules"]
+    for rule_name in ["trend", "ema", "rsi", "bollinger"]:
+        if rule_name not in rules_cfg:
+            raise ValueError(f"Falta 'signals.rules.{rule_name}' en config.yaml.")
+
+    _require_numeric(rules_cfg["trend"], "neutral_band_pct", "signals.rules.trend")
+    _require_numeric(rules_cfg["trend"], "strong_diff_pct", "signals.rules.trend")
+    _require_numeric(rules_cfg["ema"], "neutral_band_pct", "signals.rules.ema")
+    _require_numeric(rules_cfg["rsi"], "oversold", "signals.rules.rsi")
+    _require_numeric(rules_cfg["rsi"], "overbought", "signals.rules.rsi")
+    _require_numeric(rules_cfg["bollinger"], "proximity_pct", "signals.rules.bollinger")
+
+
+_AI_PROVIDERS = ["dummy", "openai", "claude"]
+
+
+def _validate_ai_config(ai_cfg: dict) -> None:
+    required_fields = [
+        "enabled", "provider", "model", "temperature", "max_tokens",
+        "system_prompt", "dummy_delay",
+    ]
+    missing = [f for f in required_fields if f not in ai_cfg]
+    if missing:
+        raise ValueError(f"Faltan campos obligatorios en config.yaml -> ai: {', '.join(missing)}")
+
+    if not isinstance(ai_cfg["enabled"], bool):
+        raise ValueError("'ai.enabled' debe ser verdadero o falso (true/false).")
+
+    if ai_cfg["provider"] not in _AI_PROVIDERS:
+        raise ValueError(f"'ai.provider' debe ser uno de: {', '.join(_AI_PROVIDERS)}.")
+
+    if not isinstance(ai_cfg["model"], str) or not ai_cfg["model"]:
+        raise ValueError("'ai.model' debe ser un texto no vacío.")
+
+    _require_numeric(ai_cfg, "temperature", "ai")
+    # Rango razonable de "temperature" para proveedores de LLM típicos
+    # (OpenAI/Anthropic): 0.0 (determinista) a 2.0 (máxima aleatoriedad).
+    if not (0.0 <= ai_cfg["temperature"] <= 2.0):
+        raise ValueError("'ai.temperature' debe estar entre 0.0 y 2.0.")
+
+    if isinstance(ai_cfg["max_tokens"], bool) or not isinstance(ai_cfg["max_tokens"], int) or ai_cfg["max_tokens"] <= 0:
+        raise ValueError("'ai.max_tokens' debe ser un número entero mayor a 0.")
+
+    if not isinstance(ai_cfg["system_prompt"], str) or not ai_cfg["system_prompt"]:
+        raise ValueError("'ai.system_prompt' debe ser un texto no vacío.")
+
+    _require_numeric(ai_cfg, "dummy_delay", "ai")
+    if ai_cfg["dummy_delay"] < 0:
+        raise ValueError("'ai.dummy_delay' no puede ser negativo.")
 
 
 def load_settings(
@@ -175,5 +483,66 @@ def load_settings(
         external_data=ExternalDataSettings(
             coingecko_api_key=os.getenv("COINGECKO_API_KEY") or None,
             newsapi_api_key=os.getenv("NEWSAPI_API_KEY") or None,
+        ),
+        indicators=IndicatorSettings(
+            sma=config["indicators"]["sma"],
+            ema_fast=config["indicators"]["ema_fast"],
+            ema_medium=config["indicators"]["ema_medium"],
+            ema_slow=config["indicators"]["ema_slow"],
+            rsi=config["indicators"]["rsi"],
+            macd_fast=config["indicators"]["macd_fast"],
+            macd_slow=config["indicators"]["macd_slow"],
+            macd_signal=config["indicators"]["macd_signal"],
+            bollinger_period=config["indicators"]["bollinger_period"],
+            bollinger_stddev=config["indicators"]["bollinger_stddev"],
+            atr=config["indicators"]["atr"],
+            adx=config["indicators"]["adx"],
+            vwap=config["indicators"]["vwap"],
+        ),
+        signals=SignalSettings(
+            score=ScoreThresholds(
+                bullish=config["signals"]["score"]["bullish"],
+                neutral=config["signals"]["score"]["neutral"],
+                bearish=config["signals"]["score"]["bearish"],
+            ),
+            weights=SignalWeights(
+                trend=config["signals"]["weights"]["trend"],
+                ema=config["signals"]["weights"]["ema"],
+                macd=config["signals"]["weights"]["macd"],
+                rsi=config["signals"]["weights"]["rsi"],
+                bollinger=config["signals"]["weights"]["bollinger"],
+            ),
+            confidence=ConfidenceThresholds(
+                very_high=config["signals"]["confidence"]["very_high"],
+                high=config["signals"]["confidence"]["high"],
+                medium=config["signals"]["confidence"]["medium"],
+                low=config["signals"]["confidence"]["low"],
+            ),
+            rules=SignalRuleSettings(
+                trend=TrendRuleSettings(
+                    neutral_band_pct=config["signals"]["rules"]["trend"]["neutral_band_pct"],
+                    strong_diff_pct=config["signals"]["rules"]["trend"]["strong_diff_pct"],
+                ),
+                ema=EMARuleSettings(
+                    neutral_band_pct=config["signals"]["rules"]["ema"]["neutral_band_pct"],
+                ),
+                rsi=RSIRuleSettings(
+                    oversold=config["signals"]["rules"]["rsi"]["oversold"],
+                    overbought=config["signals"]["rules"]["rsi"]["overbought"],
+                ),
+                bollinger=BollingerRuleSettings(
+                    proximity_pct=config["signals"]["rules"]["bollinger"]["proximity_pct"],
+                ),
+            ),
+        ),
+        ai_engine=AIEngineSettings(
+            enabled=config["ai"]["enabled"],
+            provider=config["ai"]["provider"],
+            model=config["ai"]["model"],
+            temperature=config["ai"]["temperature"],
+            max_tokens=config["ai"]["max_tokens"],
+            system_prompt=config["ai"]["system_prompt"],
+            dummy_delay=config["ai"]["dummy_delay"],
+            future_api_key=os.getenv("AI_FUTURE_API_KEY") or None,
         ),
     )
