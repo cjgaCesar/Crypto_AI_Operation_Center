@@ -19,11 +19,16 @@ from src.dashboard.models import (
     MarketHistoryPoint,
     MarketPageView,
     MarketSummaryView,
+    SignalPageView,
+    SignalSummaryView,
     TableStatus,
 )
 from src.models.indicator_data import IndicatorSnapshot
 from src.models.market_data import MarketTicker
-from src.signals.enums import ConfidenceLevel, SignalType
+from src.models.signal_data import SignalSnapshot
+from src.signals.enums import (
+    BollingerLabel, ConfidenceLevel, EMALabel, MACDLabel, RSILabel, SignalType, TrendLabel, TrendStrength,
+)
 
 
 def _ticker() -> MarketTicker:
@@ -383,5 +388,124 @@ class TestIndicatorPageView:
     def test_history_accepts_real_indicator_snapshots(self):
         snapshot = _indicator_snapshot()
         page = IndicatorPageView(selected_symbol="BTCUSDT", history=[snapshot])
+
+        assert page.history[0] is snapshot
+
+
+def _signal_snapshot() -> SignalSnapshot:
+    return SignalSnapshot(
+        exchange="Binance", symbol="BTCUSDT",
+        trend=TrendLabel.BULLISH, trend_strength=TrendStrength.MEDIUM,
+        ema_signal=EMALabel.BULLISH, macd_signal=MACDLabel.NEUTRAL,
+        rsi_signal=RSILabel.NEUTRAL, bollinger_signal=BollingerLabel.INSIDE_BANDS,
+        trend_reason="r", ema_reason="r", macd_reason="r", rsi_reason="r", bollinger_reason="r",
+        trend_rule_strength=0.5, ema_rule_strength=0.5, macd_rule_strength=0.0,
+        rsi_rule_strength=0.0, bollinger_rule_strength=0.0,
+        score=70.0, confidence=ConfidenceLevel.MEDIUM, signal_type=SignalType.BULLISH,
+        generated_at=datetime.now(timezone.utc),
+    )
+
+
+class TestSignalSummaryView:
+    def test_builds_with_all_fields_present(self):
+        now = datetime.now(timezone.utc)
+        summary = SignalSummaryView(
+            exchange="Binance", symbol="BTCUSDT",
+            signal_type=SignalType.BULLISH, score=70.0, confidence=ConfidenceLevel.MEDIUM,
+            trend=TrendLabel.BULLISH, trend_strength=TrendStrength.MEDIUM,
+            ema_signal=EMALabel.BULLISH, macd_signal=MACDLabel.NEUTRAL,
+            rsi_signal=RSILabel.NEUTRAL, bollinger_signal=BollingerLabel.INSIDE_BANDS,
+            generated_at=now, record_count=5, has_data=True,
+        )
+        assert summary.signal_type == SignalType.BULLISH
+        assert summary.score == 70.0
+        assert summary.record_count == 5
+        assert summary.has_data is True
+
+    def test_optional_fields_default_to_none_and_has_data_false(self):
+        summary = SignalSummaryView(exchange="Binance", symbol="BTCUSDT")
+
+        assert summary.signal_type is None
+        assert summary.score is None
+        assert summary.confidence is None
+        assert summary.trend is None
+        assert summary.trend_strength is None
+        assert summary.ema_signal is None
+        assert summary.macd_signal is None
+        assert summary.rsi_signal is None
+        assert summary.bollinger_signal is None
+        assert summary.generated_at is None
+        assert summary.record_count == 0
+        assert summary.has_data is False
+
+    def test_rejects_empty_symbol(self):
+        with pytest.raises(ValidationError):
+            SignalSummaryView(exchange="Binance", symbol="")
+
+    def test_rejects_empty_exchange(self):
+        with pytest.raises(ValidationError):
+            SignalSummaryView(exchange="", symbol="BTCUSDT")
+
+    def test_rejects_negative_record_count(self):
+        with pytest.raises(ValidationError):
+            SignalSummaryView(exchange="Binance", symbol="BTCUSDT", record_count=-1)
+
+    @pytest.mark.parametrize("score", [-0.01, 100.01])
+    def test_rejects_score_outside_valid_range(self, score):
+        """Mismo rango que SignalSnapshot.score (0.0-100.0): no se
+        inventa un límite nuevo, se respeta el que ya define el dominio."""
+        with pytest.raises(ValidationError):
+            SignalSummaryView(exchange="Binance", symbol="BTCUSDT", score=score)
+
+    def test_has_no_risk_field(self):
+        """'risk' no existe en market_signals (vive en ai_recommendations,
+        una tabla/página distinta): el modelo no debe fingir que sí."""
+        summary = SignalSummaryView(exchange="Binance", symbol="BTCUSDT")
+        assert not hasattr(summary, "risk")
+
+
+class TestSignalPageView:
+    def test_builds_with_data_available(self):
+        summary = SignalSummaryView(
+            exchange="Binance", symbol="BTCUSDT", score=70.0, has_data=True,
+        )
+        history = [_signal_snapshot()]
+
+        page = SignalPageView(
+            symbols=["BTCUSDT", "ETHUSDT"], selected_symbol="BTCUSDT",
+            summary=summary, history=history, data_available=True, message=None,
+        )
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.summary is not None
+        assert len(page.history) == 1
+        assert page.data_available is True
+        assert page.message is None
+
+    def test_builds_with_no_data_available(self):
+        page = SignalPageView(
+            symbols=["BTCUSDT"], selected_symbol="BTCUSDT",
+            summary=None, history=[], data_available=False,
+            message="Todavía no hay señales generadas para BTCUSDT.",
+        )
+
+        assert page.summary is None
+        assert page.history == []
+        assert page.data_available is False
+        assert "BTCUSDT" in page.message
+
+    def test_symbols_and_history_default_to_empty_list(self):
+        page = SignalPageView(selected_symbol="BTCUSDT")
+
+        assert page.symbols == []
+        assert page.history == []
+
+    def test_rejects_empty_selected_symbol(self):
+        with pytest.raises(ValidationError):
+            SignalPageView(selected_symbol="")
+
+    def test_history_accepts_real_signal_snapshots(self):
+        snapshot = _signal_snapshot()
+        page = SignalPageView(selected_symbol="BTCUSDT", history=[snapshot])
 
         assert page.history[0] is snapshot

@@ -1,9 +1,9 @@
 """
 Pruebas de integración entre páginas del Dashboard (Etapa 5, Iteración
-5.4 — cierre, ampliada en la 5.5 con 'Indicadores'): usando
-streamlit.testing.v1.AppTest, valida que el modo de vista responsive
-("Vista": Automática/Amplia/Compacta) se comparte entre 'Resumen
-General', 'Mercado' e 'Indicadores' a través de
+5.4 — cierre, ampliada en la 5.5 con 'Indicadores' y en la 5.6 con
+'Señales'): usando streamlit.testing.v1.AppTest, valida que el modo de
+vista responsive ("Vista": Automática/Amplia/Compacta) se comparte entre
+'Resumen General', 'Mercado', 'Indicadores' y 'Señales' a través de
 layout.VIEW_MODE_SESSION_KEY (vía layout.render_view_mode_selector()),
 en vez de mantenerse por separado en cada página.
 
@@ -14,16 +14,18 @@ load_settings()/build_dashboard_config(): así la prueba queda hermética
 (base SQLite temporal), sin depender de config.yaml/.env ni de la base
 de datos real del proyecto.
 
-Nota: el radio del harness usa la etiqueta ASCII "Pagina" (sin tilde),
-a propósito. AppTest.from_function() reconstruye el código fuente de la
-función y lo re-ejecuta en un script temporal; en este entorno Windows,
-un literal con tilde escrito directamente en esa función (ej. "Pagina"
-con tilde) hace que el widget correspondiente no aparezca en el árbol
-de elementos, sin lanzar ninguna excepción capturable (bug de
-codificación de from_function, no del Dashboard: confirmado con una
-reproducción mínima aislada). No afecta a los literales reales de
-resumen.py/mercado.py/app.py, que se leen normalmente del disco (ya
-validados por separado con AppTest.from_file() contra la app real).
+Nota: el radio del harness usa la etiqueta ASCII "Pagina" y la opción
+"Senales" (sin tildes/eñe), a propósito. AppTest.from_function()
+reconstruye el código fuente de la función y lo re-ejecuta en un script
+temporal; en este entorno Windows, cualquier literal no-ASCII escrito
+directamente en esa función (tildes o "ñ") hace que el widget
+correspondiente no aparezca en el árbol de elementos, sin lanzar ninguna
+excepción capturable (bug de codificación de from_function, no del
+Dashboard: confirmado con una reproducción mínima aislada, primero con
+"Página" y ahora también con "Señales"). No afecta a los literales
+reales de resumen.py/mercado.py/indicadores.py/senales.py/app.py, que se
+leen normalmente del disco (ya validados por separado con
+AppTest.from_file() contra la app real).
 """
 
 from datetime import datetime, timezone
@@ -67,9 +69,11 @@ def _populated_db(tmp_path, symbols=("BTCUSDT", "ETHUSDT")) -> str:
 def _render_app(service, exchange, symbol):
     import streamlit as st
 
-    from src.dashboard.pages import indicadores, mercado, resumen
+    from src.dashboard.pages import indicadores, mercado, resumen, senales
 
-    page_name = st.sidebar.radio("Pagina", ["Resumen General", "Mercado", "Indicadores"])
+    page_name = st.sidebar.radio(
+        "Pagina", ["Resumen General", "Mercado", "Indicadores", "Senales"],
+    )
 
     if page_name == "Resumen General":
         resumen.render(service, exchange=exchange)
@@ -77,6 +81,8 @@ def _render_app(service, exchange, symbol):
         mercado.render(service, exchange=exchange, symbol=symbol, limit=100)
     elif page_name == "Indicadores":
         indicadores.render(service, exchange=exchange, symbol=symbol, limit=100)
+    elif page_name == "Senales":
+        senales.render(service, exchange=exchange, symbol=symbol, limit=100)
 
 
 def _run(service, exchange="Binance", symbol="BTCUSDT", timeout=30):
@@ -216,6 +222,64 @@ def test_only_one_vista_selector_with_three_pages(tmp_path):
     at = _run(_service_for(db_path))
 
     for page in ["Mercado", "Indicadores", "Resumen General"]:
+        _radio(at).set_value(page).run(timeout=30)
+        assert not at.exception
+        vista_selectors = [sb for sb in at.sidebar.selectbox if sb.label == "Vista"]
+        assert len(vista_selectors) == 1
+
+
+def test_senales_loads_and_shares_view_mode_across_four_pages(tmp_path):
+    db_path = _populated_db(tmp_path)
+    at = _run(_service_for(db_path))
+
+    # 1. Resumen General por defecto.
+    assert not at.exception
+    assert at.title[0].value == "Resumen General"
+
+    # 2. Elegir "Compacta" en Resumen General.
+    _vista(at).select("Compacta").run(timeout=30)
+    assert not at.exception
+
+    # 3. Navegar a Mercado: conserva "Compacta".
+    _radio(at).set_value("Mercado").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Compacta"
+
+    # 4. Navegar a Indicadores: conserva "Compacta".
+    _radio(at).set_value("Indicadores").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Compacta"
+
+    # 5. Navegar a Señales: conserva "Compacta".
+    _radio(at).set_value("Senales").run(timeout=30)
+    assert not at.exception
+    assert at.title[0].value == "Señales"
+    assert _vista(at).value == "Compacta"
+
+    # 6. Cambiar a "Amplia" en Señales.
+    _vista(at).select("Amplia").run(timeout=30)
+    assert not at.exception
+
+    # 7. Regresar a Resumen General: conserva "Amplia".
+    _radio(at).set_value("Resumen General").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Amplia"
+
+    # 8. Cambiar a "Automática".
+    _vista(at).select("Automática").run(timeout=30)
+    assert not at.exception
+
+    # 9. Navegar nuevamente a Señales: conserva "Automática".
+    _radio(at).set_value("Senales").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Automática"
+
+
+def test_only_one_vista_selector_with_four_pages(tmp_path):
+    db_path = _populated_db(tmp_path)
+    at = _run(_service_for(db_path))
+
+    for page in ["Mercado", "Indicadores", "Senales", "Resumen General"]:
         _radio(at).set_value(page).run(timeout=30)
         assert not at.exception
         vista_selectors = [sb for sb in at.sidebar.selectbox if sb.label == "Vista"]

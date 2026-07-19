@@ -580,3 +580,108 @@ class TestGetIndicatorsPage:
 
         assert page.data_available is False
         assert page.summary is None
+
+
+class TestGetSignalsPage:
+    def test_no_history_returns_unavailable_page_with_message(self):
+        service = _service()
+        page = service.get_signals_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None
+        assert page.history == []
+        assert "BTCUSDT" in page.message
+
+    def test_includes_configured_symbols_and_selected_symbol(self):
+        repository = FakeDashboardRepository()
+        repository.signal_history[("Binance", "BTCUSDT")] = [_signal("BTCUSDT")]
+        service = _service(repository)
+
+        page = service.get_signals_page("Binance", "btcusdt")
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.selected_symbol == "BTCUSDT"
+
+    def test_summary_reflects_the_latest_snapshot(self):
+        repository = FakeDashboardRepository()
+        older = _signal("BTCUSDT")
+        newer = SignalSnapshot(
+            exchange="Binance", symbol="BTCUSDT",
+            trend=TrendLabel.STRONG_BULLISH, trend_strength=TrendStrength.STRONG,
+            ema_signal=EMALabel.BULLISH, macd_signal=MACDLabel.BULLISH_CROSS,
+            rsi_signal=RSILabel.OVERBOUGHT, bollinger_signal=BollingerLabel.UPPER_BAND,
+            trend_reason="r", ema_reason="r", macd_reason="r", rsi_reason="r", bollinger_reason="r",
+            trend_rule_strength=1.0, ema_rule_strength=1.0, macd_rule_strength=0.2,
+            rsi_rule_strength=0.5, bollinger_rule_strength=0.5,
+            score=90.0, confidence=ConfidenceLevel.VERY_HIGH, signal_type=SignalType.BULLISH,
+            generated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        repository.signal_history[("Binance", "BTCUSDT")] = [older, newer]
+        service = _service(repository)
+
+        page = service.get_signals_page("Binance", "BTCUSDT")
+
+        assert page.data_available is True
+        assert page.summary.has_data is True
+        assert page.summary.score == 90.0
+        assert page.summary.signal_type == SignalType.BULLISH
+        assert page.summary.confidence == ConfidenceLevel.VERY_HIGH
+        assert page.summary.trend == TrendLabel.STRONG_BULLISH
+        assert page.summary.generated_at == newer.generated_at
+        assert page.summary.record_count == 2
+
+    def test_history_is_the_full_list_from_repository(self):
+        repository = FakeDashboardRepository()
+        history = [_signal("BTCUSDT"), _signal("BTCUSDT")]
+        repository.signal_history[("Binance", "BTCUSDT")] = history
+        service = _service(repository)
+
+        page = service.get_signals_page("Binance", "BTCUSDT")
+
+        assert page.history == history
+
+    def test_limit_is_resolved_like_other_history_methods(self):
+        repository = FakeDashboardRepository()
+        repository.signal_history[("Binance", "BTCUSDT")] = [_signal() for _ in range(5)]
+        service = DashboardService(
+            repository=repository, exchange="Binance", symbols=["BTCUSDT"],
+            default_history_limit=100, max_history_limit=3,
+        )
+
+        page = service.get_signals_page("Binance", "BTCUSDT", limit=1000)
+        assert len(page.history) <= 3
+
+    def test_view_is_isolated_by_exchange(self):
+        repository = FakeDashboardRepository()
+        repository.signal_history[("Binance", "BTCUSDT")] = [_signal("BTCUSDT")]
+        repository.signal_history[("OtroExchange", "BTCUSDT")] = [
+            SignalSnapshot(
+                exchange="OtroExchange", symbol="BTCUSDT",
+                trend=TrendLabel.BEARISH, trend_strength=TrendStrength.WEAK,
+                ema_signal=EMALabel.BEARISH, macd_signal=MACDLabel.BEARISH_CROSS,
+                rsi_signal=RSILabel.OVERSOLD, bollinger_signal=BollingerLabel.LOWER_BAND,
+                trend_reason="r", ema_reason="r", macd_reason="r", rsi_reason="r", bollinger_reason="r",
+                trend_rule_strength=0.1, ema_rule_strength=0.1, macd_rule_strength=0.1,
+                rsi_rule_strength=0.1, bollinger_rule_strength=0.1,
+                score=10.0, confidence=ConfidenceLevel.LOW, signal_type=SignalType.BEARISH,
+                generated_at=datetime.now(timezone.utc),
+            )
+        ]
+        service = _service(repository)
+
+        page = service.get_signals_page("Binance", "BTCUSDT")
+        other_page = service.get_signals_page("OtroExchange", "BTCUSDT")
+
+        assert page.summary.score == 70.0
+        assert other_page.summary.score == 10.0
+
+    def test_repository_exception_is_handled_gracefully(self):
+        class RaisingRepository(FakeDashboardRepository):
+            def get_signal_history(self, exchange, symbol, limit):
+                raise RuntimeError("fallo simulado del repositorio")
+
+        service = _service(RaisingRepository())
+        page = service.get_signals_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None

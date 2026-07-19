@@ -39,8 +39,10 @@ from src.dashboard.models import (
     IndicatorSummaryView,
     MarketHistoryPoint,
     MarketSummaryView,
+    SignalSummaryView,
 )
 from src.models.indicator_data import IndicatorSnapshot
+from src.models.signal_data import SignalSnapshot
 from src.dashboard.theme import (
     COLOR_AI,
     get_change_color,
@@ -301,3 +303,89 @@ def render_indicator_history_charts(history: list[IndicatorSnapshot], symbol: st
         title=f"Medias móviles — {symbol}",
     )
     st.plotly_chart(moving_averages_figure, use_container_width=True)
+
+
+def render_signal_status(summary: SignalSummaryView) -> None:
+    """Señal principal (insignia de color, siempre en su propia línea —
+    es lo prioritario), vía theme.get_signal_color()."""
+    st.caption("Señal")
+    render_status_badge(format_enum(summary.signal_type), get_signal_color(summary.signal_type))
+
+
+def render_signal_metrics(summary: SignalSummaryView, compact: bool) -> None:
+    """Score, confianza y tendencia (con su fuerza) de la señal actual,
+    vía render_responsive_metric_group()."""
+    metrics = [
+        ("Score", format_score(summary.score)),
+        ("Confianza", format_enum(summary.confidence)),
+        ("Tendencia", format_enum(summary.trend)),
+        ("Fuerza de tendencia", format_enum(summary.trend_strength)),
+    ]
+    render_responsive_metric_group(metrics, compact=compact)
+
+
+def render_signal_explanation(summary: SignalSummaryView, compact: bool) -> None:
+    """Veredicto de cada componente (EMA/MACD/RSI/Bollinger) que explica
+    la señal agregada. Solo el resultado de cada regla (ej. 'Bullish
+    Cross'); el detalle en texto ('reason') de cada una vive en
+    SignalSnapshot pero no se muestra aquí para no sobrecargar el
+    resumen — sigue disponible en el historial subyacente si una
+    iteración futura decide exponerlo."""
+    metrics = [
+        ("EMA", format_enum(summary.ema_signal)),
+        ("MACD", format_enum(summary.macd_signal)),
+        ("RSI", format_enum(summary.rsi_signal)),
+        ("Bollinger", format_enum(summary.bollinger_signal)),
+    ]
+    render_responsive_metric_group(metrics, compact=compact)
+
+
+def render_signal_availability(summary: Optional[SignalSummaryView]) -> None:
+    """Fecha de generación de la última señal + cantidad de registros
+    disponibles. El riesgo no se menciona aquí: no es un campo de
+    'market_signals' (vive en 'ai_recommendations', página
+    'Recomendaciones de IA', todavía no implementada) — es un concepto
+    de una página distinta, no un dato ausente de esta."""
+    if summary is None:
+        st.caption("Sin datos disponibles todavía.")
+        return
+    st.caption(
+        f"Generado: {format_timestamp(summary.generated_at)} · "
+        f"Registros disponibles: {format_record_count(summary.record_count)}"
+    )
+    st.caption(
+        "El riesgo no aplica a esta página: vive en 'Recomendaciones de "
+        "IA' (todavía no implementada), no en 'market_signals'."
+    )
+
+
+def render_signal_history_chart(history: list[SignalSnapshot], symbol: str) -> None:
+    """Gráfico de línea de la evolución del score (valor numérico
+    continuo, sin inventar una escala para las categorías). El
+    historial de señal/confianza/tendencia (categóricos) se muestra por
+    separado en render_signal_history_table(), no en este gráfico."""
+    timestamps = [snapshot.generated_at for snapshot in history]
+    scores = [snapshot.score for snapshot in history]
+    figure = line_chart(timestamps, scores, title=f"Score de señal — {symbol}")
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def render_signal_history_table(history: list[SignalSnapshot]) -> None:
+    """Historial cronológico (más reciente primero) de señal/confianza/
+    tendencia/score como tabla, no como gráfico: señal/confianza/
+    tendencia son categóricas, y representarlas como números arbitrarios
+    en un eje sería engañoso. `st.dataframe(..., use_container_width=True)`:
+    sin ancho fijo, sin scroll horizontal forzado."""
+    if not history:
+        return
+    rows = [
+        {
+            "Fecha": format_timestamp(snapshot.generated_at),
+            "Señal": format_enum(snapshot.signal_type),
+            "Confianza": format_enum(snapshot.confidence),
+            "Tendencia": format_enum(snapshot.trend),
+            "Score": format_score(snapshot.score),
+        }
+        for snapshot in reversed(history)
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)

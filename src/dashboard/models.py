@@ -20,7 +20,16 @@ from src.ai.recommendation import AIRecommendation, RecommendationAction, RiskLe
 from src.models.indicator_data import IndicatorSnapshot
 from src.models.market_data import MarketTicker
 from src.models.signal_data import SignalSnapshot
-from src.signals.enums import ConfidenceLevel, SignalType
+from src.signals.enums import (
+    BollingerLabel,
+    ConfidenceLevel,
+    EMALabel,
+    MACDLabel,
+    RSILabel,
+    SignalType,
+    TrendLabel,
+    TrendStrength,
+)
 
 
 class TableStatus(BaseModel):
@@ -216,6 +225,54 @@ class IndicatorSummaryView(BaseModel):
     calculated_at: Optional[datetime] = None
 
     has_data: bool = False
+
+
+class SignalSummaryView(BaseModel):
+    """Resumen de la última señal de un símbolo para la página 'Señales'
+    (Iteración 5.6): los mismos campos de `SignalSnapshot` que ya
+    representan el veredicto y sus componentes, aplanados, más
+    `record_count`/`has_data`. No incluye 'risk': ese campo no existe en
+    `market_signals` (vive en `ai_recommendations`, tabla de
+    'Recomendaciones de IA', todavía no implementada) — no es un dato
+    ausente de esta tabla, es un concepto de una página distinta."""
+
+    exchange: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+
+    signal_type: Optional[SignalType] = None
+    score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    confidence: Optional[ConfidenceLevel] = None
+    trend: Optional[TrendLabel] = None
+    trend_strength: Optional[TrendStrength] = None
+    ema_signal: Optional[EMALabel] = None
+    macd_signal: Optional[MACDLabel] = None
+    rsi_signal: Optional[RSILabel] = None
+    bollinger_signal: Optional[BollingerLabel] = None
+    generated_at: Optional[datetime] = None
+
+    record_count: int = Field(ge=0, default=0)
+    has_data: bool = False
+
+
+class SignalPageView(BaseModel):
+    """Todo lo que necesita la página 'Señales' para un símbolo: los
+    símbolos configurados, el símbolo elegido, el resumen (None si
+    todavía no hay datos) y el historial para el gráfico de score y la
+    tabla cronológica de señal/confianza/tendencia.
+
+    El historial reutiliza 'list[SignalSnapshot]' directamente, mismo
+    criterio que IndicatorPageView: cada punto ya necesita los mismos
+    campos que SignalSnapshot expone (score, confidence, signal_type,
+    trend, las 4 señales de componente y sus razones) — un modelo
+    "SignalHistoryPointView" sería una copia redundante, no una
+    separación real."""
+
+    symbols: list[str] = Field(default_factory=list)
+    selected_symbol: str = Field(min_length=1)
+    summary: Optional[SignalSummaryView] = None
+    history: list[SignalSnapshot] = Field(default_factory=list)
+    data_available: bool = False
+    message: Optional[str] = None
 
 
 class IndicatorPageView(BaseModel):

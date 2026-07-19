@@ -42,6 +42,8 @@ from src.dashboard.models import (
     MarketHistoryPoint,
     MarketPageView,
     MarketSummaryView,
+    SignalPageView,
+    SignalSummaryView,
 )
 from src.dashboard.repository import DashboardRepository
 from src.models.indicator_data import IndicatorSnapshot
@@ -298,6 +300,59 @@ class DashboardService:
         exchange, symbol, limit = self._resolve(exchange, symbol, limit)
         return self._safe_call(
             lambda: self.repository.get_indicator_history(exchange, symbol, limit), fallback=[],
+        )
+
+    def get_signals_page(
+        self, exchange: str, symbol: str, limit: Optional[int] = None
+    ) -> SignalPageView:
+        """Todo lo que necesita la página 'Señales' para un símbolo:
+        reutiliza get_signal_history() (una sola consulta, igual criterio
+        que get_market_page()/get_indicators_page(): el último snapshot
+        ya es el último elemento del historial) y arma el resumen a
+        partir del mismo resultado, sin recalcular ni regenerar ninguna
+        señal (no llama a SignalEngine)."""
+        resolved_exchange, resolved_symbol, resolved_limit = self._resolve(exchange, symbol, limit)
+
+        history = self._safe_call(
+            lambda: self.repository.get_signal_history(resolved_exchange, resolved_symbol, resolved_limit),
+            fallback=[],
+        ) or []
+
+        if not history:
+            return SignalPageView(
+                symbols=self.symbols,
+                selected_symbol=resolved_symbol,
+                summary=None,
+                history=[],
+                data_available=False,
+                message=f"Todavía no hay señales generadas para {resolved_symbol}.",
+            )
+
+        latest = history[-1]
+        summary = SignalSummaryView(
+            exchange=resolved_exchange,
+            symbol=resolved_symbol,
+            signal_type=latest.signal_type,
+            score=latest.score,
+            confidence=latest.confidence,
+            trend=latest.trend,
+            trend_strength=latest.trend_strength,
+            ema_signal=latest.ema_signal,
+            macd_signal=latest.macd_signal,
+            rsi_signal=latest.rsi_signal,
+            bollinger_signal=latest.bollinger_signal,
+            generated_at=latest.generated_at,
+            record_count=len(history),
+            has_data=True,
+        )
+
+        return SignalPageView(
+            symbols=self.symbols,
+            selected_symbol=resolved_symbol,
+            summary=summary,
+            history=history,
+            data_available=True,
+            message=None,
         )
 
     def get_signals_view(

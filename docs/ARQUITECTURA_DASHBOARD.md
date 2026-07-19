@@ -3,11 +3,12 @@
 > Diseño original de la Iteración 5.1, actualizado en la Iteración 5.2 con
 > la estructura de módulos realmente implementada, en la Iteración 5.3 con
 > la primera página funcional, en la Iteración 5.4 con la página
-> "Mercado" y en la Iteración 5.5 con la página "Indicadores" (ver "Nota
-> de implementación" de cada iteración más abajo). "Resumen General",
-> "Mercado" e "Indicadores" ya son funcionales; el resto del Dashboard
-> **todavía no está completo**: Señales y Recomendaciones de IA siguen
-> siendo esqueletos mínimos (ver `docs/ALCANCE_ETAPA_5.md`).
+> "Mercado", en la Iteración 5.5 con la página "Indicadores" y en la
+> Iteración 5.6 con la página "Señales" (ver "Nota de implementación" de
+> cada iteración más abajo). "Resumen General", "Mercado", "Indicadores"
+> y "Señales" ya son funcionales; el resto del Dashboard **todavía no
+> está completo**: Recomendaciones de IA sigue siendo un esqueleto mínimo
+> (ver `docs/ALCANCE_ETAPA_5.md`).
 
 ## Nota de implementación (Iteración 5.2)
 
@@ -317,6 +318,76 @@ la infraestructura ya existente sin agregar ninguna dependencia nueva:
   recalcula ningún indicador — todo viene de
   `DashboardService.get_indicators_page()`.
 
+## Nota de implementación (Iteración 5.6)
+
+Se implementó la página "Señales" (`senales.py`), reutilizando la
+infraestructura ya existente sin agregar ninguna dependencia nueva:
+
+- **`repository.py` no ganó ningún método nuevo**: `get_signal_history()`
+  (ya existente desde la Iteración 5.2) fue suficiente — mismo criterio
+  que "Mercado"/"Indicadores". Antes de escribir código se inspeccionó el
+  esquema real de `market_signals` (`PRAGMA table_info`): `id, exchange,
+  symbol, trend, trend_strength, ema_signal, macd_signal, rsi_signal,
+  bollinger_signal, trend_reason, ema_reason, macd_reason, rsi_reason,
+  bollinger_reason, trend_rule_strength, ema_rule_strength,
+  macd_rule_strength, rsi_rule_strength, bollinger_rule_strength, score,
+  confidence, signal_type, generated_at`. A diferencia de
+  `market_indicators`, **todas las columnas son `NOT NULL`** (153/153
+  filas sin ningún nulo) y coinciden exactamente con `SignalSnapshot`
+  (`src/models/signal_data.py`): no hay diferencia entre esquema y
+  modelo de dominio. **No existe una columna `risk`**: el riesgo vive en
+  `ai_recommendations` (página "Recomendaciones de IA", todavía no
+  implementada), no en `market_signals` — no es un dato ausente de esta
+  tabla, es un concepto de otra tabla/página.
+- **`DashboardService.get_signals_page(exchange, symbol, limit)`**
+  (`service.py`): una sola llamada a `get_signal_history()` (no llama
+  también a `get_latest_signal()`), mismo patrón que
+  `get_market_page()`/`get_indicators_page()`. No llama a `SignalEngine`
+  ni recalcula ninguna señal.
+- **`models.py`** ganó 2 modelos nuevos: `SignalSummaryView` (los mismos
+  campos de veredicto de `SignalSnapshot` — `signal_type`, `score`,
+  `confidence`, `trend`, `trend_strength`, y el veredicto de cada
+  componente `ema_signal`/`macd_signal`/`rsi_signal`/`bollinger_signal`
+  — aplanados, más `record_count`/`has_data`; sin `risk`, por lo ya
+  explicado) e `SignalPageView` (símbolos, símbolo elegido, resumen
+  opcional, historial, disponibilidad y mensaje). El historial reutiliza
+  `list[SignalSnapshot]` directamente, mismo criterio que
+  `IndicatorPageView`: cada punto ya necesita los mismos campos que
+  `SignalSnapshot` expone (incluidas las 5 `*_reason` de texto) — un
+  modelo "SignalHistoryPointView" habría sido una copia redundante.
+- **`formatters.py`/`charts.py` no ganaron nada nuevo**: `format_score`,
+  `format_enum` y `format_timestamp` (ya existentes) cubrían todo lo
+  necesario; `charts.line_chart()` (ya existente) se reutilizó para el
+  score.
+- **`components.py`** ganó 5 helpers: `render_signal_status()` (insignia
+  de color vía `theme.get_signal_color()`), `render_signal_metrics()`
+  (score/confianza/tendencia/fuerza), `render_signal_explanation()`
+  (veredicto de EMA/MACD/RSI/Bollinger), `render_signal_availability()`
+  (fecha de generación + registros, con la nota explícita de que el
+  riesgo no aplica aquí) y `render_signal_history_chart()`/
+  `render_signal_history_table()`.
+- **Gráfico vs. tabla — decisión explícita**: `signal_type`/`confidence`/
+  `trend` son categóricos (ej. "Bullish"/"Very High"/"Strong Bullish");
+  graficarlos como números arbitrarios en un eje sería engañoso (el
+  proyecto lo prohíbe explícitamente). Por eso solo el **score** (numérico
+  continuo, 0-100) se grafica con `charts.line_chart()`; el historial de
+  señal/confianza/tendencia se muestra en una **tabla cronológica**
+  (`st.dataframe(..., use_container_width=True)`), no en un gráfico.
+- **Diseño responsive**: reutiliza `layout.render_view_mode_selector()`
+  (misma key/help que las otras 3 páginas) y
+  `render_responsive_metric_group()`. Igual que "Mercado"/"Indicadores",
+  `get_cards_per_row()`/`render_responsive_grid()` no aplican: la página
+  muestra un único símbolo a la vez.
+- **Garantía de solo lectura sin cambios**: `senales.py` no ejecuta SQL,
+  no importa `sqlite3` ni el Repository directamente, y no recalcula ni
+  regenera ninguna señal — todo viene de
+  `DashboardService.get_signals_page()`.
+- **`tests/test_dashboard_navigation.py`** se amplió para incluir
+  "Señales" como cuarta página en la validación de estado compartido
+  (el radio del harness usa la opción ASCII "Senales", sin eñe, por el
+  mismo bug de codificación de `AppTest.from_function()` ya documentado
+  en ese archivo — confirmado también con "ñ", no solo con tildes).
+
 ## Tecnología seleccionada: Streamlit
 
 | Opción | Evaluación |
@@ -371,7 +442,7 @@ Resumido: **Repository → Service → View Model → Components/Layout → Page
   `models.py` cambiarían — solo `components.py`/`layout.py` (capa 100%
   de presentación) dejarían de usarse en ese contexto.
 
-## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3/5.4/5.5)
+## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3/5.4/5.5/5.6)
 
 ```
 src/dashboard/
@@ -381,18 +452,21 @@ src/dashboard/
 ├── models.py                   # TableStatus, DashboardStatus, Latest*Snapshot,
 │                                # DashboardSummary, DashboardSummaryView (5.3),
 │                                # MarketSummaryView/MarketHistoryPoint/MarketPageView (5.4),
-│                                # IndicatorSummaryView/IndicatorPageView (5.5)
+│                                # IndicatorSummaryView/IndicatorPageView (5.5),
+│                                # SignalSummaryView/SignalPageView (5.6)
 ├── repository.py                 # DashboardRepository (interfaz) + SQLiteDashboardRepository
-│                                  # (sin cambios en 5.4/5.5: get_market_history()/
-│                                  # get_indicator_history() ya alcanzaban)
+│                                  # (sin cambios en 5.4/5.5/5.6: get_market_history()/
+│                                  # get_indicator_history()/get_signal_history() ya alcanzaban)
 ├── service.py                      # DashboardService (+ get_summary_view() 5.3,
-│                                    # + get_market_page() 5.4, + get_indicators_page() 5.5)
+│                                    # + get_market_page() 5.4, + get_indicators_page() 5.5,
+│                                    # + get_signals_page() 5.6)
 ├── filters.py                        # normalize_symbol/normalize_exchange/validate_limit
 ├── formatters.py                       # format_price/percent/timestamp/enum +
 │                                        # format_price_compact/confidence/score/
 │                                        # risk_level/relative_status (5.3) +
 │                                        # format_price_change/volume/record_count (5.4)
-│                                        # (5.5 reutiliza format_price/format_timestamp)
+│                                        # (5.5/5.6 reutilizan format_price/format_score/
+│                                        # format_enum/format_timestamp, sin agregar nada)
 ├── theme.py                              # Paleta + get_signal_color/get_risk_color/
 │                                         # get_change_color/to_streamlit_color_name (5.3)
 ├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
@@ -400,7 +474,7 @@ src/dashboard/
 │                                          # render_view_mode_selector() (construcción única y
 │                                          # compartida del selector "Vista" entre páginas, 5.4)
 ├── charts.py                             # empty_figure/line_chart (5.2; reutilizado sin
-│                                         # cambios por Mercado en 5.4) +
+│                                         # cambios por Mercado en 5.4 y Señales en 5.6) +
 │                                         # multi_line_chart() (series superpuestas, 5.5)
 ├── components.py                           # render_not_available/render_kpi_card +
 │                                           # render_section_header/render_status_badge (sin HTML)/
@@ -409,13 +483,16 @@ src/dashboard/
 │                                           # render_market_metrics/render_market_availability/
 │                                           # render_price_history_chart (5.4) +
 │                                           # render_indicator_metrics/render_indicator_availability/
-│                                           # render_indicator_history_charts (5.5)
+│                                           # render_indicator_history_charts (5.5) +
+│                                           # render_signal_status/render_signal_metrics/
+│                                           # render_signal_explanation/render_signal_availability/
+│                                           # render_signal_history_chart/render_signal_history_table (5.6)
 └── pages/                                    # Una página por vista
     ├── __init__.py
     ├── resumen.py                             # Funcional desde 5.3 (tarjetas por símbolo)
     ├── mercado.py                             # Funcional desde 5.4 ("Mercado", antes "Precios")
     ├── indicadores.py                         # Funcional desde 5.5
-    ├── senales.py                             # Esqueleto
+    ├── senales.py                             # Funcional desde 5.6
     ├── recomendaciones.py                     # Esqueleto
     └── estado_tecnico.py                      # Funcional desde 5.2
 ```
@@ -475,12 +552,17 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
    como no disponibles (no existen en `market_indicators`, ver "Nota de
    implementación (Iteración 5.5)" más arriba). Incluye el selector de
    vista responsive compartido.
-4. **Señales** (`senales.py`) — esqueleto: hoy solo `signal_type`/`score`
-   más recientes. En una iteración futura, historial de
-   `score`/`confidence`/`signal_type` en el tiempo, y el detalle completo
-   de la señal más reciente (`trend`/`ema_signal`/`macd_signal`/
-   `rsi_signal`/`bollinger_signal` con su `reason` y `rule_strength`
-   individuales).
+4. **Señales** (`senales.py`) — **funcional desde la Iteración 5.6**: para
+   el símbolo elegido en la barra lateral
+   (`DashboardService.get_signals_page()`), muestra la señal actual
+   (`signal_type`, insignia de color), score, confianza, tendencia y su
+   fuerza, el veredicto de cada componente (`ema_signal`/`macd_signal`/
+   `rsi_signal`/`bollinger_signal`), la fecha de generación, la cantidad
+   de registros disponibles, un gráfico de la evolución del score y una
+   tabla cronológica de señal/confianza/tendencia. El riesgo no aparece
+   aquí: no es un campo de `market_signals` (vive en
+   `ai_recommendations`, página "Recomendaciones de IA", todavía no
+   implementada). Incluye el selector de vista responsive compartido.
 5. **Recomendaciones de IA** (`recomendaciones.py`) — esqueleto: hoy solo
    `recommendation`/`confidence` más recientes. En una iteración futura,
    historial de `recommendation`/`confidence`/`risk_level` en el tiempo, y
@@ -528,13 +610,32 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 - **`render_indicator_history_charts(history, symbol)`** (5.5): 3
   gráficos (RSI, MACD, medias móviles), vía `charts.line_chart()` y
   `charts.multi_line_chart()`.
+- **`render_signal_status(summary)`** (5.6): insignia de color de la
+  señal actual, vía `theme.get_signal_color()`.
+- **`render_signal_metrics(summary, compact)`** (5.6): score, confianza,
+  tendencia y su fuerza de "Señales".
+- **`render_signal_explanation(summary, compact)`** (5.6): veredicto de
+  cada componente (EMA/MACD/RSI/Bollinger).
+- **`render_signal_availability(summary)`** (5.6): fecha de generación +
+  registros disponibles, con la nota explícita de que el riesgo no
+  aplica a esta página.
+- **`render_signal_history_chart(history, symbol)`** (5.6): evolución
+  del score, vía `charts.line_chart()`.
+- **`render_signal_history_table(history)`** (5.6): historial
+  cronológico de señal/confianza/tendencia como tabla
+  (`st.dataframe(..., use_container_width=True)`), no como gráfico —
+  son valores categóricos, y graficarlos como números arbitrarios sería
+  engañoso.
 - **Gráfico de serie temporal** (`charts.line_chart`/`charts.multi_line_chart`):
-  envoltura común para precio/indicadores a lo largo del tiempo — en uso
-  desde la 5.4 en "Mercado" y desde la 5.5 en "Indicadores";
-  Señales/Recomendaciones de IA lo reutilizarán en una iteración futura.
-- **Bloque de razones**: lista de `reason`/`rule_strength` o
-  `advantages`/`risks` — pendiente de una iteración futura (Señales y
-  Recomendaciones de IA todavía son esqueletos).
+  envoltura común para precio/indicadores/score a lo largo del tiempo —
+  en uso desde la 5.4 en "Mercado", desde la 5.5 en "Indicadores" y desde
+  la 5.6 en "Señales"; Recomendaciones de IA lo reutilizará en una
+  iteración futura.
+- **Bloque de razones**: lista de `reason`/`rule_strength` de cada regla
+  de señal — no se expone todavía en el resumen de "Señales" (solo el
+  veredicto de cada componente, no su explicación en texto completo);
+  `advantages`/`risks` de IA quedan pendientes para "Recomendaciones de
+  IA", todavía un esqueleto.
 
 ## Filtros globales
 
@@ -567,12 +668,19 @@ responsive, más arriba, para la regla completa de tablas/gráficos.)
   en ninguna etapa (ni el bot ni el Dashboard) — "Indicadores" los
   declara explícitamente como no disponibles en vez de omitirlos en
   silencio o inventarlos.
+- No muestra nivel de riesgo en "Señales": ese campo no existe en
+  `market_signals` (vive en `ai_recommendations`, página "Recomendaciones
+  de IA", todavía no implementada) — es un concepto de otra página, no
+  un dato ausente de esta tabla.
+- No ejecuta `SignalEngine`, `IndicatorEngine` ni `DecisionEngine`: el
+  Dashboard entero es de solo lectura sobre lo que esos motores ya
+  guardaron en ciclos anteriores de `python -m src.main`.
 
 ## Dependencias
 
 `streamlit` y `plotly` (ambas Python puro, sin servicios adicionales),
 agregadas a `requirements.txt` desde la Iteración 5.2. Ninguna iteración
-posterior (5.3, 5.4, 5.5) agregó ninguna dependencia nueva.
+posterior (5.3, 5.4, 5.5, 5.6) agregó ninguna dependencia nueva.
 
 ## Estado por iteración
 
@@ -590,14 +698,24 @@ posterior (5.3, 5.4, 5.5) agregó ninguna dependencia nueva.
   arriba), compartido entre páginas, y se agregó
   `tests/test_dashboard_navigation.py` (pruebas de integración de
   navegación y estado compartido).
-- **5.5** (esta): página "Indicadores" funcional
+- **5.5**: página "Indicadores" funcional
   (`IndicatorSummaryView`/`IndicatorPageView`, `get_indicators_page()`,
   `charts.multi_line_chart()`, 3 gráficos de historial). ATR, ADX y
   Volatilidad declarados explícitamente como no disponibles (no existen
   en `market_indicators`). `tests/test_dashboard_navigation.py` se
   amplió para incluir "Indicadores" en la validación de estado
-  compartido. Señales y Recomendaciones de IA siguen siendo esqueletos.
-- **Pendiente para la Iteración 5.6**: gráficos históricos completos de
-  Señales/Recomendaciones de IA, auto-refresh real, comparación entre
-  símbolos, diseño visual definitivo de toda la aplicación (identidad
-  visual más allá de la paleta ya centralizada en `theme.py`).
+  compartido.
+- **5.6** (esta): página "Señales" funcional
+  (`SignalSummaryView`/`SignalPageView`, `get_signals_page()`, gráfico
+  de score + tabla cronológica de señal/confianza/tendencia). Riesgo
+  declarado explícitamente como no aplicable a esta página (vive en
+  `ai_recommendations`, no en `market_signals`).
+  `tests/test_dashboard_navigation.py` se amplió para incluir "Señales"
+  como cuarta página en la validación de estado compartido.
+  Recomendaciones de IA sigue siendo un esqueleto.
+- **Pendiente para la Iteración 5.7**: página "Recomendaciones de IA"
+  (`ai_recommendations`: `recommendation`/`confidence`/`risk_level`,
+  historial, razonamiento/ventajas/riesgos), auto-refresh real,
+  comparación entre símbolos, diseño visual definitivo de toda la
+  aplicación (identidad visual más allá de la paleta ya centralizada en
+  `theme.py`).
