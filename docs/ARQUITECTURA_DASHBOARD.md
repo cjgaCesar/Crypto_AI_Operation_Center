@@ -3,12 +3,15 @@
 > Diseño original de la Iteración 5.1, actualizado en la Iteración 5.2 con
 > la estructura de módulos realmente implementada, en la Iteración 5.3 con
 > la primera página funcional, en la Iteración 5.4 con la página
-> "Mercado", en la Iteración 5.5 con la página "Indicadores" y en la
-> Iteración 5.6 con la página "Señales" (ver "Nota de implementación" de
-> cada iteración más abajo). "Resumen General", "Mercado", "Indicadores"
-> y "Señales" ya son funcionales; el resto del Dashboard **todavía no
-> está completo**: Recomendaciones de IA sigue siendo un esqueleto mínimo
-> (ver `docs/ALCANCE_ETAPA_5.md`).
+> "Mercado", en la Iteración 5.5 con la página "Indicadores", en la
+> Iteración 5.6 con la página "Señales" y en la Iteración 5.7 con la
+> página "Recomendaciones de IA" (ver "Nota de implementación" de cada
+> iteración más abajo). Las 6 páginas del Dashboard ya son funcionales:
+> "Resumen General", "Mercado", "Indicadores", "Señales", "Recomendaciones
+> de IA" y "Estado Técnico". La Etapa 5 **todavía no está cerrada**: falta
+> el refinamiento visual definitivo, validación visual real en navegador,
+> y la aprobación formal de esta iteración (ver
+> `docs/ALCANCE_ETAPA_5.md`).
 
 ## Nota de implementación (Iteración 5.2)
 
@@ -388,6 +391,73 @@ infraestructura ya existente sin agregar ninguna dependencia nueva:
   mismo bug de codificación de `AppTest.from_function()` ya documentado
   en ese archivo — confirmado también con "ñ", no solo con tildes).
 
+## Nota de implementación (Iteración 5.7)
+
+Se implementó la página "Recomendaciones de IA" (`recomendaciones.py`),
+reutilizando la infraestructura ya existente sin agregar ninguna
+dependencia nueva:
+
+- **`repository.py` no ganó ningún método nuevo**: `get_ai_history()`
+  (ya existente desde la Iteración 5.2) fue suficiente — mismo criterio
+  que "Mercado"/"Indicadores"/"Señales". Antes de escribir código se
+  inspeccionó el esquema real de `ai_recommendations` (`PRAGMA
+  table_info`): `id, exchange, symbol, recommendation, confidence,
+  risk_level, reasoning, advantages, risks, summary, provider, model,
+  prompt_version, created_at, processing_time_ms, raw_response`. Todas
+  las columnas son `NOT NULL` **excepto `raw_response`** (153/153 filas
+  en `NULL` actualmente: `DummyProvider` nunca la puebla, ver
+  `src/ai/recommendation.py`). Coincide exactamente con `AIRecommendation`
+  (`src/ai/recommendation.py`), salvo que el modelo llama `timestamp` al
+  campo que la tabla llama `created_at` (mapeo ya resuelto por
+  `SQLiteAIRepository`, sin relación con esta iteración). Con los datos
+  actuales, `recommendation` es siempre "Hold", `risk_level` siempre
+  "Low" y `confidence` siempre 60.0 (`DummyProvider` es determinista).
+- **`DashboardService.get_ai_recommendations_page(exchange, symbol,
+  limit)`** (`service.py`): una sola llamada a `get_ai_history()` (no
+  llama también a `get_latest_ai_recommendation()`), mismo patrón que
+  `get_market_page()`/`get_indicators_page()`/`get_signals_page()`. No
+  llama a `DecisionEngine` ni a ningún `AIProvider`.
+- **`models.py`** ganó 2 modelos nuevos: `AIRecommendationSummaryView`
+  (los mismos campos de `AIRecommendation` — `recommendation`,
+  `confidence`, `risk_level`, `reasoning`, `summary`, `advantages`,
+  `risks`, `provider`, `model` — aplanados, más `record_count`/
+  `has_data`) e `AIRecommendationPageView` (símbolos, símbolo elegido,
+  resumen opcional, historial, disponibilidad y mensaje). El historial
+  reutiliza `list[AIRecommendation]` directamente, mismo criterio que
+  `IndicatorPageView`/`SignalPageView`: un modelo
+  "AIRecommendationHistoryView" habría sido una copia redundante.
+- **`formatters.py`/`charts.py` no ganaron nada nuevo**: `format_confidence`,
+  `format_risk_level`, `format_enum` y `format_timestamp` (ya existentes)
+  cubrían todo lo necesario; `charts.line_chart()` (ya existente) se
+  reutilizó para la confianza.
+- **`components.py`** ganó 6 helpers: `render_ai_status()` (insignia de
+  la recomendación, color fijo `theme.COLOR_AI`, mismo criterio que ya
+  usa "Resumen General"), `render_ai_metrics()` (confianza + riesgo, vía
+  `theme.get_risk_color()`), `render_ai_explanation()` (resumen en una
+  línea + razonamiento/ventajas/riesgos completos en un
+  `st.expander`, detalle expandible para móvil), `render_ai_availability()`
+  (fecha de generación + registros + proveedor/modelo, dejando explícito
+  que sigue siendo un proveedor simulado) y
+  `render_ai_history_chart()`/`render_ai_history_table()`.
+- **Gráfico vs. tabla — misma decisión que "Señales"**: `recommendation`/
+  `risk_level` son categóricos; solo la **confianza** (numérica continua,
+  0-100) se grafica con `charts.line_chart()`, y el historial de
+  recomendación/confianza/riesgo se muestra en una **tabla cronológica**
+  (`st.dataframe(..., use_container_width=True)`).
+- **Diseño responsive**: reutiliza `layout.render_view_mode_selector()`
+  (misma key/help que las otras 4 páginas) y
+  `render_responsive_metric_group()`. Igual que "Mercado"/"Indicadores"/
+  "Señales", `get_cards_per_row()`/`render_responsive_grid()` no
+  aplican: la página muestra un único símbolo a la vez.
+- **Garantía de solo lectura sin cambios**: `recomendaciones.py` no
+  ejecuta SQL, no importa `sqlite3` ni el Repository directamente, y no
+  recalcula ni regenera ninguna recomendación — todo viene de
+  `DashboardService.get_ai_recommendations_page()`.
+- **`tests/test_dashboard_navigation.py`** se amplió para incluir
+  "Recomendaciones de IA" como quinta página en la validación de estado
+  compartido (la etiqueta "Recomendaciones de IA" no tiene tildes ni
+  "ñ", así que no requirió ningún alias ASCII para el harness).
+
 ## Tecnología seleccionada: Streamlit
 
 | Opción | Evaluación |
@@ -442,7 +512,7 @@ Resumido: **Repository → Service → View Model → Components/Layout → Page
   `models.py` cambiarían — solo `components.py`/`layout.py` (capa 100%
   de presentación) dejarían de usarse en ese contexto.
 
-## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3/5.4/5.5/5.6)
+## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3/5.4/5.5/5.6/5.7)
 
 ```
 src/dashboard/
@@ -453,20 +523,23 @@ src/dashboard/
 │                                # DashboardSummary, DashboardSummaryView (5.3),
 │                                # MarketSummaryView/MarketHistoryPoint/MarketPageView (5.4),
 │                                # IndicatorSummaryView/IndicatorPageView (5.5),
-│                                # SignalSummaryView/SignalPageView (5.6)
+│                                # SignalSummaryView/SignalPageView (5.6),
+│                                # AIRecommendationSummaryView/AIRecommendationPageView (5.7)
 ├── repository.py                 # DashboardRepository (interfaz) + SQLiteDashboardRepository
-│                                  # (sin cambios en 5.4/5.5/5.6: get_market_history()/
-│                                  # get_indicator_history()/get_signal_history() ya alcanzaban)
+│                                  # (sin cambios en 5.4/5.5/5.6/5.7: get_market_history()/
+│                                  # get_indicator_history()/get_signal_history()/
+│                                  # get_ai_history() ya alcanzaban)
 ├── service.py                      # DashboardService (+ get_summary_view() 5.3,
 │                                    # + get_market_page() 5.4, + get_indicators_page() 5.5,
-│                                    # + get_signals_page() 5.6)
+│                                    # + get_signals_page() 5.6, + get_ai_recommendations_page() 5.7)
 ├── filters.py                        # normalize_symbol/normalize_exchange/validate_limit
 ├── formatters.py                       # format_price/percent/timestamp/enum +
 │                                        # format_price_compact/confidence/score/
 │                                        # risk_level/relative_status (5.3) +
 │                                        # format_price_change/volume/record_count (5.4)
-│                                        # (5.5/5.6 reutilizan format_price/format_score/
-│                                        # format_enum/format_timestamp, sin agregar nada)
+│                                        # (5.5/5.6/5.7 reutilizan format_price/format_score/
+│                                        # format_confidence/format_risk_level/format_enum/
+│                                        # format_timestamp, sin agregar nada)
 ├── theme.py                              # Paleta + get_signal_color/get_risk_color/
 │                                         # get_change_color/to_streamlit_color_name (5.3)
 ├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
@@ -474,7 +547,8 @@ src/dashboard/
 │                                          # render_view_mode_selector() (construcción única y
 │                                          # compartida del selector "Vista" entre páginas, 5.4)
 ├── charts.py                             # empty_figure/line_chart (5.2; reutilizado sin
-│                                         # cambios por Mercado en 5.4 y Señales en 5.6) +
+│                                         # cambios por Mercado en 5.4, Señales en 5.6 y
+│                                         # Recomendaciones de IA en 5.7) +
 │                                         # multi_line_chart() (series superpuestas, 5.5)
 ├── components.py                           # render_not_available/render_kpi_card +
 │                                           # render_section_header/render_status_badge (sin HTML)/
@@ -486,14 +560,17 @@ src/dashboard/
 │                                           # render_indicator_history_charts (5.5) +
 │                                           # render_signal_status/render_signal_metrics/
 │                                           # render_signal_explanation/render_signal_availability/
-│                                           # render_signal_history_chart/render_signal_history_table (5.6)
+│                                           # render_signal_history_chart/render_signal_history_table (5.6) +
+│                                           # render_ai_status/render_ai_metrics/render_ai_explanation/
+│                                           # render_ai_availability/render_ai_history_chart/
+│                                           # render_ai_history_table (5.7)
 └── pages/                                    # Una página por vista
     ├── __init__.py
     ├── resumen.py                             # Funcional desde 5.3 (tarjetas por símbolo)
     ├── mercado.py                             # Funcional desde 5.4 ("Mercado", antes "Precios")
     ├── indicadores.py                         # Funcional desde 5.5
     ├── senales.py                             # Funcional desde 5.6
-    ├── recomendaciones.py                     # Esqueleto
+    ├── recomendaciones.py                     # Funcional desde 5.7
     └── estado_tecnico.py                      # Funcional desde 5.2
 ```
 
@@ -561,14 +638,21 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
    de registros disponibles, un gráfico de la evolución del score y una
    tabla cronológica de señal/confianza/tendencia. El riesgo no aparece
    aquí: no es un campo de `market_signals` (vive en
-   `ai_recommendations`, página "Recomendaciones de IA", todavía no
-   implementada). Incluye el selector de vista responsive compartido.
-5. **Recomendaciones de IA** (`recomendaciones.py`) — esqueleto: hoy solo
-   `recommendation`/`confidence` más recientes. En una iteración futura,
-   historial de `recommendation`/`confidence`/`risk_level` en el tiempo, y
-   el detalle completo de la recomendación más reciente (`reasoning`,
-   `advantages`, `risks`, `summary`, `provider`/`model`/`prompt_version`,
-   `processing_time_ms`).
+   `ai_recommendations`, página "Recomendaciones de IA"). Incluye el
+   selector de vista responsive compartido.
+5. **Recomendaciones de IA** (`recomendaciones.py`) — **funcional desde
+   la Iteración 5.7**: para el símbolo elegido en la barra lateral
+   (`DashboardService.get_ai_recommendations_page()`), muestra la
+   recomendación actual (insignia), confianza, nivel de riesgo (insignia
+   de color), un resumen en una línea y el razonamiento completo con
+   ventajas/riesgos en un `st.expander`, la fecha de generación, la
+   cantidad de registros disponibles, un gráfico de la evolución de la
+   confianza y una tabla cronológica de recomendación/confianza/riesgo.
+   Declara explícitamente que el proveedor (`DummyProvider`) sigue siendo
+   simulado, no un modelo de lenguaje real. `processing_time_ms` no se
+   muestra en el resumen (detalle interno de rendimiento, no relevante
+   para la interpretación de la recomendación). Incluye el selector de
+   vista responsive compartido.
 6. **Estado Técnico** (`estado_tecnico.py`): estado de las 4 tablas SQLite
    (existe, cuántas filas, registro más reciente). Ya queda completamente
    funcional desde la Iteración 5.2, porque no depende de gráficos ni de
@@ -626,16 +710,31 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
   (`st.dataframe(..., use_container_width=True)`), no como gráfico —
   son valores categóricos, y graficarlos como números arbitrarios sería
   engañoso.
+- **`render_ai_status(summary)`** (5.7): insignia de la recomendación
+  actual, color fijo `theme.COLOR_AI` (mismo criterio que ya usa
+  "Resumen General").
+- **`render_ai_metrics(summary, compact)`** (5.7): confianza (métrica) +
+  riesgo (insignia, vía `theme.get_risk_color()`).
+- **`render_ai_explanation(summary)`** (5.7): resumen en una línea +
+  razonamiento/ventajas/riesgos completos en un `st.expander`.
+- **`render_ai_availability(summary)`** (5.7): fecha de generación +
+  registros + proveedor/modelo, dejando explícito que sigue siendo un
+  proveedor simulado.
+- **`render_ai_history_chart(history, symbol)`** (5.7): evolución de la
+  confianza, vía `charts.line_chart()`.
+- **`render_ai_history_table(history)`** (5.7): historial cronológico de
+  recomendación/confianza/riesgo como tabla, no como gráfico — mismo
+  criterio que "Señales".
 - **Gráfico de serie temporal** (`charts.line_chart`/`charts.multi_line_chart`):
-  envoltura común para precio/indicadores/score a lo largo del tiempo —
-  en uso desde la 5.4 en "Mercado", desde la 5.5 en "Indicadores" y desde
-  la 5.6 en "Señales"; Recomendaciones de IA lo reutilizará en una
-  iteración futura.
+  envoltura común para precio/indicadores/score/confianza a lo largo del
+  tiempo — en uso desde la 5.4 en "Mercado", desde la 5.5 en
+  "Indicadores", desde la 5.6 en "Señales" y desde la 5.7 en
+  "Recomendaciones de IA".
 - **Bloque de razones**: lista de `reason`/`rule_strength` de cada regla
   de señal — no se expone todavía en el resumen de "Señales" (solo el
-  veredicto de cada componente, no su explicación en texto completo);
-  `advantages`/`risks` de IA quedan pendientes para "Recomendaciones de
-  IA", todavía un esqueleto.
+  veredicto de cada componente, no su explicación en texto completo).
+  `advantages`/`risks` de IA sí se exponen desde la 5.7, en
+  `render_ai_explanation()`.
 
 ## Filtros globales
 
@@ -670,8 +769,12 @@ responsive, más arriba, para la regla completa de tablas/gráficos.)
   silencio o inventarlos.
 - No muestra nivel de riesgo en "Señales": ese campo no existe en
   `market_signals` (vive en `ai_recommendations`, página "Recomendaciones
-  de IA", todavía no implementada) — es un concepto de otra página, no
-  un dato ausente de esta tabla.
+  de IA") — es un concepto de otra página, no un dato ausente de esta
+  tabla.
+- No conecta con un proveedor de IA real: "Recomendaciones de IA"
+  muestra lo que `DummyProvider` (simulado) ya guardó, no un modelo de
+  lenguaje real — lo declara explícitamente en vez de sugerir lo
+  contrario.
 - No ejecuta `SignalEngine`, `IndicatorEngine` ni `DecisionEngine`: el
   Dashboard entero es de solo lectura sobre lo que esos motores ya
   guardaron en ciclos anteriores de `python -m src.main`.
@@ -680,7 +783,7 @@ responsive, más arriba, para la regla completa de tablas/gráficos.)
 
 `streamlit` y `plotly` (ambas Python puro, sin servicios adicionales),
 agregadas a `requirements.txt` desde la Iteración 5.2. Ninguna iteración
-posterior (5.3, 5.4, 5.5, 5.6) agregó ninguna dependencia nueva.
+posterior (5.3, 5.4, 5.5, 5.6, 5.7) agregó ninguna dependencia nueva.
 
 ## Estado por iteración
 
@@ -705,17 +808,24 @@ posterior (5.3, 5.4, 5.5, 5.6) agregó ninguna dependencia nueva.
   en `market_indicators`). `tests/test_dashboard_navigation.py` se
   amplió para incluir "Indicadores" en la validación de estado
   compartido.
-- **5.6** (esta): página "Señales" funcional
+- **5.6**: página "Señales" funcional
   (`SignalSummaryView`/`SignalPageView`, `get_signals_page()`, gráfico
   de score + tabla cronológica de señal/confianza/tendencia). Riesgo
   declarado explícitamente como no aplicable a esta página (vive en
   `ai_recommendations`, no en `market_signals`).
   `tests/test_dashboard_navigation.py` se amplió para incluir "Señales"
   como cuarta página en la validación de estado compartido.
-  Recomendaciones de IA sigue siendo un esqueleto.
-- **Pendiente para la Iteración 5.7**: página "Recomendaciones de IA"
-  (`ai_recommendations`: `recommendation`/`confidence`/`risk_level`,
-  historial, razonamiento/ventajas/riesgos), auto-refresh real,
+- **5.7** (esta): página "Recomendaciones de IA" funcional
+  (`AIRecommendationSummaryView`/`AIRecommendationPageView`,
+  `get_ai_recommendations_page()`, gráfico de confianza + tabla
+  cronológica de recomendación/confianza/riesgo + razonamiento/ventajas/
+  riesgos en un expander). Proveedor declarado explícitamente como
+  simulado (`DummyProvider`). `tests/test_dashboard_navigation.py` se
+  amplió para incluir "Recomendaciones de IA" como quinta página en la
+  validación de estado compartido. Las 6 páginas del Dashboard ya son
+  funcionales.
+- **Pendiente para una iteración futura**: auto-refresh real,
   comparación entre símbolos, diseño visual definitivo de toda la
   aplicación (identidad visual más allá de la paleta ya centralizada en
-  `theme.py`).
+  `theme.py`), conexión a un proveedor de IA real (OpenAI/Claude),
+  validación visual real en navegador, aprobación formal de la Etapa 5.

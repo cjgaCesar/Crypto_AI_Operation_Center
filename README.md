@@ -29,11 +29,11 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   factores positivos/negativos), persistida en una tabla independiente.
   Hoy usa un proveedor simulado (`DummyProvider`); OpenAI/Claude quedan
   preparados pero sin conectar. Ver [docs/ALCANCE_ETAPA_4.md](docs/ALCANCE_ETAPA_4.md).
-- 📝 **Etapa 5 (en desarrollo, Iteración 5.6 — Resumen General, Mercado,
-  Indicadores y Señales funcionales, el resto del Dashboard todavía no
-  está completo)** — Dashboard de solo lectura (Streamlit) sobre las 4
-  tablas ya generadas por las Etapas 1 a 4. Ver
-  [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
+- 📝 **Etapa 5 (en desarrollo, Iteración 5.7 — las 6 páginas del
+  Dashboard ya son funcionales: Resumen General, Mercado, Indicadores,
+  Señales, Recomendaciones de IA y Estado Técnico)** — Dashboard de solo
+  lectura (Streamlit) sobre las 4 tablas ya generadas por las Etapas 1 a
+  4. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
   [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
 
 ## Qué hace el bot hoy
@@ -229,7 +229,7 @@ historial (ej. la EMA lenta, que por defecto usa 200 lecturas) no van a
 tener valor todavía en los primeros ciclos — es normal, y se completan
 solos a medida que se acumulan datos.
 
-## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.6 — Resumen General, Mercado, Indicadores y Señales funcionales)
+## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.7 — las 6 páginas ya son funcionales)
 
 Instalar dependencias (incluye `streamlit`/`plotly`, ya en `requirements.txt`):
 
@@ -243,9 +243,11 @@ Ejecutar:
 streamlit run src/dashboard/app.py
 ```
 
-**Estado actual: Iteración 5.6 completada — "Resumen General", "Mercado",
-"Indicadores" y "Señales" ya son funcionales; el resto del Dashboard
-todavía NO está completo, y la Etapa 5 en general tampoco.**
+**Estado actual: Iteración 5.7 completada — las 6 páginas del Dashboard
+("Resumen General", "Mercado", "Indicadores", "Señales", "Recomendaciones
+de IA" y "Estado Técnico") ya son funcionales. La Etapa 5 en general
+todavía NO está cerrada**: falta el refinamiento visual definitivo, la
+validación visual real en navegador y tu aprobación formal.
 
 "Resumen General" muestra, para cada símbolo configurado
 (`BTCUSDT`/`ETHUSDT`/`SOLUSDT`), una tarjeta con precio, variación 24h,
@@ -283,34 +285,40 @@ evolución del score y una tabla cronológica de señal/confianza/
 tendencia (categóricas: se muestran en tabla, no en gráfico, para no
 representarlas con una escala numérica engañosa). **El nivel de riesgo
 no aparece en esta página**: no es un campo de `market_signals` (vive en
-`ai_recommendations`, página "Recomendaciones de IA", todavía no
-implementada) — la página lo declara explícitamente en vez de omitirlo
-en silencio.
+`ai_recommendations`, página "Recomendaciones de IA") — la página lo
+declara explícitamente en vez de omitirlo en silencio.
 
-Las 4 páginas tienen **diseño responsive**: cada una incluye el selector
+**Recomendaciones de IA** muestra, para el mismo símbolo elegido, la
+recomendación actual, confianza, nivel de riesgo, un resumen en una
+línea y el razonamiento completo con ventajas/riesgos en un panel
+expandible, la fecha de generación, la cantidad de registros
+disponibles, un gráfico con la evolución de la confianza y una tabla
+cronológica de recomendación/confianza/riesgo. **El proveedor sigue
+siendo simulado (`DummyProvider`)**, no un modelo de lenguaje real
+todavía — la página lo deja explícito.
+
+Las 5 páginas tienen **diseño responsive**: cada una incluye el selector
 **"Vista"** con 3 modos (**Automática**, **Amplia**, **Compacta**) en la
 barra lateral. En "Resumen General" controla cuántas tarjetas se
 muestran por fila (3 en Amplia, 2 en Automática, 1 apilada verticalmente
-en Compacta); en "Mercado", "Indicadores" y "Señales" controla si las
-métricas se muestran en columnas o apiladas. **El modo de vista
-responsive es compartido entre las páginas del Dashboard mediante una
-única clave centralizada de st.session_state**: elegir "Compacta" en una
-página y navegar a otra conserva "Compacta", en vez de resetear a un
-valor distinto. La elección se guarda solo en la sesión del navegador
-(`st.session_state`), nunca en disco ni en `config.yaml`.
+en Compacta); en "Mercado", "Indicadores", "Señales" y "Recomendaciones
+de IA" controla si las métricas se muestran en columnas o apiladas. **El
+modo de vista responsive es compartido entre las páginas del Dashboard
+mediante una única clave centralizada de st.session_state**: elegir
+"Compacta" en una página y navegar a otra conserva "Compacta", en vez de
+resetear a un valor distinto. La elección se guarda solo en la sesión
+del navegador (`st.session_state`), nunca en disco ni en `config.yaml`.
 
-La página que falta (Recomendaciones de IA) sigue siendo un esqueleto
-mínimo — su contenido completo queda para una iteración futura, y la
-identidad visual definitiva de toda la aplicación (más allá de la
-paleta ya centralizada en `theme.py`) también se completará más
-adelante. "Estado Técnico" ya es funcional desde la Iteración 5.2
-(estado de las 4 tablas SQLite).
+Las 6 páginas del Dashboard ya son funcionales — la identidad visual
+definitiva de toda la aplicación (más allá de la paleta ya centralizada
+en `theme.py`) todavía se completará más adelante. "Estado Técnico" es
+funcional desde la Iteración 5.2 (estado de las 4 tablas SQLite).
 
 El diseño responsive se validó mediante pruebas automatizadas (AppTest) y
 revisión de código (sin anchos/altos fijos, sin tablas HTML, sin scroll
 horizontal forzado), pero **todavía no se validó visualmente en un
 navegador real** en ningún tamaño de pantalla — se recomienda hacerlo
-antes de dar por cerrado el diseño responsive de estas cuatro páginas.
+antes de dar por cerrado el diseño responsive de estas cinco páginas.
 
 El Dashboard es de **solo lectura**: nunca escribe en
 `data/crypto_data.db`, no recalcula indicadores ni señales, no genera
@@ -376,29 +384,29 @@ AIRecommendation` —, proveedor simulado `DummyProvider` conectado
 (OpenAI/Claude preparados, sin conectar), tabla independiente
 `ai_recommendations`. Pendiente de tu revisión y aprobación formal.
 
-📝 Etapa 5, Iteración 5.6 (Resumen General, Mercado, Indicadores y
-Señales funcionales, resto del Dashboard todavía NO completo): las
-Iteraciones 5.3-5.5 agregaron `DashboardSummaryView`/`MarketSummaryView`/
-`IndicatorSummaryView` y sus páginas, además de centralizar el selector
-"Vista" en `layout.render_view_mode_selector()` (compartido entre
-páginas). Esta iteración agregó, reutilizando lo anterior sin
-duplicarlo: `SignalSummaryView`/`SignalPageView` (`models.py`, el
-historial reutiliza `SignalSnapshot` directamente en vez de un modelo
-nuevo), `DashboardService.get_signals_page()` (una sola llamada a
-`get_signal_history()` ya existente: sin métodos nuevos en
-`repository.py`, sin llamar a `SignalEngine`) y 6 componentes nuevos
-(`render_signal_status`/`render_signal_metrics`/
-`render_signal_explanation`/`render_signal_availability`/
-`render_signal_history_chart`/`render_signal_history_table`). La página
-"Señales" ya muestra la señal actual, score, confianza, tendencia,
-veredicto de cada componente, fecha de generación, un gráfico del score
-y una tabla cronológica para el símbolo elegido, con el selector de
-vista responsive compartido; el riesgo se declara explícitamente como
-no aplicable a esta página (vive en `ai_recommendations`, no en
-`market_signals`). Recomendaciones de IA sigue siendo un esqueleto (sin
-gráficos históricos todavía, eso es una iteración futura). Pendiente tu
-auditoría antes de continuar.
+📝 Etapa 5, Iteración 5.7 (las 6 páginas del Dashboard ya son
+funcionales; la Etapa 5 en general todavía NO está cerrada): las
+Iteraciones 5.3-5.6 agregaron `DashboardSummaryView`/`MarketSummaryView`/
+`IndicatorSummaryView`/`SignalSummaryView` y sus páginas, además de
+centralizar el selector "Vista" en `layout.render_view_mode_selector()`
+(compartido entre páginas). Esta iteración agregó, reutilizando lo
+anterior sin duplicarlo: `AIRecommendationSummaryView`/
+`AIRecommendationPageView` (`models.py`, el historial reutiliza
+`AIRecommendation` directamente en vez de un modelo nuevo),
+`DashboardService.get_ai_recommendations_page()` (una sola llamada a
+`get_ai_history()` ya existente: sin métodos nuevos en `repository.py`,
+sin llamar a `DecisionEngine` ni a ningún `AIProvider`) y 6 componentes
+nuevos (`render_ai_status`/`render_ai_metrics`/`render_ai_explanation`/
+`render_ai_availability`/`render_ai_history_chart`/
+`render_ai_history_table`). La página "Recomendaciones de IA" ya muestra
+la recomendación actual, confianza, riesgo, resumen y razonamiento
+completo (con ventajas/riesgos en un panel expandible), fecha de
+generación, un gráfico de confianza y una tabla cronológica para el
+símbolo elegido, con el selector de vista responsive compartido; declara
+explícitamente que el proveedor (`DummyProvider`) sigue siendo simulado.
+Pendiente tu auditoría antes de continuar.
 
 Pendiente: aprobación formal de la Etapa 4 antes de avanzar a cualquier
-etapa futura (Dashboard, Telegram, paper trading o trading automático, o
-conectar un proveedor de IA real).
+etapa futura (Telegram, paper trading o trading automático, o conectar
+un proveedor de IA real); aprobación formal de esta Iteración 5.7 y de
+la Etapa 5 en general antes de cualquier refinamiento visual definitivo.

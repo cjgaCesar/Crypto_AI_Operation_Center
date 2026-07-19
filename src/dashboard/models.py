@@ -275,6 +275,53 @@ class SignalPageView(BaseModel):
     message: Optional[str] = None
 
 
+class AIRecommendationSummaryView(BaseModel):
+    """Resumen de la última recomendación de IA de un símbolo para la
+    página 'Recomendaciones de IA' (Iteración 5.7): los mismos campos de
+    `AIRecommendation` que representan la recomendación, aplanados, más
+    `record_count`/`has_data`. Incluye `provider`/`model` para dejar
+    explícito que hoy es un proveedor simulado (`DummyProvider`), no un
+    modelo de lenguaje real."""
+
+    exchange: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+
+    recommendation: Optional[RecommendationAction] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    risk_level: Optional[RiskLevel] = None
+    reasoning: Optional[str] = None
+    summary: Optional[str] = None
+    advantages: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    timestamp: Optional[datetime] = None
+
+    record_count: int = Field(ge=0, default=0)
+    has_data: bool = False
+
+
+class AIRecommendationPageView(BaseModel):
+    """Todo lo que necesita la página 'Recomendaciones de IA' para un
+    símbolo: los símbolos configurados, el símbolo elegido, el resumen
+    (None si todavía no hay datos) y el historial para el gráfico de
+    confianza y la tabla cronológica de recomendación/riesgo.
+
+    El historial reutiliza 'list[AIRecommendation]' directamente, mismo
+    criterio que IndicatorPageView/SignalPageView: cada punto ya
+    necesita los mismos campos que AIRecommendation expone (incluidos
+    reasoning/advantages/risks) — un modelo
+    "AIRecommendationHistoryView" sería una copia redundante, no una
+    separación real."""
+
+    symbols: list[str] = Field(default_factory=list)
+    selected_symbol: str = Field(min_length=1)
+    summary: Optional[AIRecommendationSummaryView] = None
+    history: list[AIRecommendation] = Field(default_factory=list)
+    data_available: bool = False
+    message: Optional[str] = None
+
+
 class IndicatorPageView(BaseModel):
     """Todo lo que necesita la página 'Indicadores' para un símbolo: los
     símbolos configurados, el símbolo elegido, el resumen (None si

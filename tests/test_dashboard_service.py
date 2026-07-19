@@ -685,3 +685,103 @@ class TestGetSignalsPage:
 
         assert page.data_available is False
         assert page.summary is None
+
+
+class TestGetAiRecommendationsPage:
+    def test_no_history_returns_unavailable_page_with_message(self):
+        service = _service()
+        page = service.get_ai_recommendations_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None
+        assert page.history == []
+        assert "BTCUSDT" in page.message
+
+    def test_includes_configured_symbols_and_selected_symbol(self):
+        repository = FakeDashboardRepository()
+        repository.ai_history[("Binance", "BTCUSDT")] = [_recommendation("BTCUSDT")]
+        service = _service(repository)
+
+        page = service.get_ai_recommendations_page("Binance", "btcusdt")
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.selected_symbol == "BTCUSDT"
+
+    def test_summary_reflects_the_latest_recommendation(self):
+        repository = FakeDashboardRepository()
+        older = _recommendation("BTCUSDT")
+        newer = AIRecommendation(
+            exchange="Binance", symbol="BTCUSDT", timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            recommendation=RecommendationAction.STRONG_SELL, confidence=90.0, risk_level=RiskLevel.HIGH,
+            reasoning="r2", advantages=["a2"], risks=["b2"], summary="s2",
+            provider="DummyProvider", model="dummy-v1", prompt_version="v1",
+            processing_time_ms=2.0, raw_response=None,
+        )
+        repository.ai_history[("Binance", "BTCUSDT")] = [older, newer]
+        service = _service(repository)
+
+        page = service.get_ai_recommendations_page("Binance", "BTCUSDT")
+
+        assert page.data_available is True
+        assert page.summary.has_data is True
+        assert page.summary.recommendation == RecommendationAction.STRONG_SELL
+        assert page.summary.confidence == 90.0
+        assert page.summary.risk_level == RiskLevel.HIGH
+        assert page.summary.reasoning == "r2"
+        assert page.summary.advantages == ["a2"]
+        assert page.summary.risks == ["b2"]
+        assert page.summary.provider == "DummyProvider"
+        assert page.summary.timestamp == newer.timestamp
+        assert page.summary.record_count == 2
+
+    def test_history_is_the_full_list_from_repository(self):
+        repository = FakeDashboardRepository()
+        history = [_recommendation("BTCUSDT"), _recommendation("BTCUSDT")]
+        repository.ai_history[("Binance", "BTCUSDT")] = history
+        service = _service(repository)
+
+        page = service.get_ai_recommendations_page("Binance", "BTCUSDT")
+
+        assert page.history == history
+
+    def test_limit_is_resolved_like_other_history_methods(self):
+        repository = FakeDashboardRepository()
+        repository.ai_history[("Binance", "BTCUSDT")] = [_recommendation() for _ in range(5)]
+        service = DashboardService(
+            repository=repository, exchange="Binance", symbols=["BTCUSDT"],
+            default_history_limit=100, max_history_limit=3,
+        )
+
+        page = service.get_ai_recommendations_page("Binance", "BTCUSDT", limit=1000)
+        assert len(page.history) <= 3
+
+    def test_view_is_isolated_by_exchange(self):
+        repository = FakeDashboardRepository()
+        repository.ai_history[("Binance", "BTCUSDT")] = [_recommendation("BTCUSDT")]
+        repository.ai_history[("OtroExchange", "BTCUSDT")] = [
+            AIRecommendation(
+                exchange="OtroExchange", symbol="BTCUSDT", timestamp=datetime.now(timezone.utc),
+                recommendation=RecommendationAction.SELL, confidence=10.0, risk_level=RiskLevel.VERY_HIGH,
+                reasoning="r", advantages=["a"], risks=["b"], summary="s",
+                provider="DummyProvider", model="dummy-v1", prompt_version="v1",
+                processing_time_ms=1.0, raw_response=None,
+            )
+        ]
+        service = _service(repository)
+
+        page = service.get_ai_recommendations_page("Binance", "BTCUSDT")
+        other_page = service.get_ai_recommendations_page("OtroExchange", "BTCUSDT")
+
+        assert page.summary.confidence == 60.0
+        assert other_page.summary.confidence == 10.0
+
+    def test_repository_exception_is_handled_gracefully(self):
+        class RaisingRepository(FakeDashboardRepository):
+            def get_ai_history(self, exchange, symbol, limit):
+                raise RuntimeError("fallo simulado del repositorio")
+
+        service = _service(RaisingRepository())
+        page = service.get_ai_recommendations_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None

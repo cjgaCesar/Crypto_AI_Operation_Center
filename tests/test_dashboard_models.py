@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from src.ai.recommendation import RecommendationAction, RiskLevel
+from src.ai.recommendation import AIRecommendation, RecommendationAction, RiskLevel
 from src.dashboard.models import (
+    AIRecommendationPageView,
+    AIRecommendationSummaryView,
     DashboardStatus,
     DashboardSummary,
     DashboardSummaryView,
@@ -509,3 +511,111 @@ class TestSignalPageView:
         page = SignalPageView(selected_symbol="BTCUSDT", history=[snapshot])
 
         assert page.history[0] is snapshot
+
+
+def _ai_recommendation() -> AIRecommendation:
+    return AIRecommendation(
+        exchange="Binance", symbol="BTCUSDT", timestamp=datetime.now(timezone.utc),
+        recommendation=RecommendationAction.BUY, confidence=60.0, risk_level=RiskLevel.MEDIUM,
+        reasoning="r", advantages=["a"], risks=["b"], summary="s",
+        provider="DummyProvider", model="dummy-v1", prompt_version="v1",
+        processing_time_ms=1.0, raw_response=None,
+    )
+
+
+class TestAIRecommendationSummaryView:
+    def test_builds_with_all_fields_present(self):
+        now = datetime.now(timezone.utc)
+        summary = AIRecommendationSummaryView(
+            exchange="Binance", symbol="BTCUSDT",
+            recommendation=RecommendationAction.BUY, confidence=60.0, risk_level=RiskLevel.MEDIUM,
+            reasoning="r", summary="s", advantages=["a"], risks=["b"],
+            provider="DummyProvider", model="dummy-v1",
+            timestamp=now, record_count=5, has_data=True,
+        )
+        assert summary.recommendation == RecommendationAction.BUY
+        assert summary.confidence == 60.0
+        assert summary.record_count == 5
+        assert summary.has_data is True
+
+    def test_optional_fields_default_to_none_and_has_data_false(self):
+        summary = AIRecommendationSummaryView(exchange="Binance", symbol="BTCUSDT")
+
+        assert summary.recommendation is None
+        assert summary.confidence is None
+        assert summary.risk_level is None
+        assert summary.reasoning is None
+        assert summary.summary is None
+        assert summary.advantages == []
+        assert summary.risks == []
+        assert summary.provider is None
+        assert summary.model is None
+        assert summary.timestamp is None
+        assert summary.record_count == 0
+        assert summary.has_data is False
+
+    def test_rejects_empty_symbol(self):
+        with pytest.raises(ValidationError):
+            AIRecommendationSummaryView(exchange="Binance", symbol="")
+
+    def test_rejects_empty_exchange(self):
+        with pytest.raises(ValidationError):
+            AIRecommendationSummaryView(exchange="", symbol="BTCUSDT")
+
+    def test_rejects_negative_record_count(self):
+        with pytest.raises(ValidationError):
+            AIRecommendationSummaryView(exchange="Binance", symbol="BTCUSDT", record_count=-1)
+
+    @pytest.mark.parametrize("confidence", [-0.01, 100.01])
+    def test_rejects_confidence_outside_valid_range(self, confidence):
+        """Mismo rango que AIRecommendation.confidence (0.0-100.0): no se
+        inventa un límite nuevo, se respeta el que ya define el dominio."""
+        with pytest.raises(ValidationError):
+            AIRecommendationSummaryView(exchange="Binance", symbol="BTCUSDT", confidence=confidence)
+
+
+class TestAIRecommendationPageView:
+    def test_builds_with_data_available(self):
+        summary = AIRecommendationSummaryView(
+            exchange="Binance", symbol="BTCUSDT", confidence=60.0, has_data=True,
+        )
+        history = [_ai_recommendation()]
+
+        page = AIRecommendationPageView(
+            symbols=["BTCUSDT", "ETHUSDT"], selected_symbol="BTCUSDT",
+            summary=summary, history=history, data_available=True, message=None,
+        )
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.summary is not None
+        assert len(page.history) == 1
+        assert page.data_available is True
+        assert page.message is None
+
+    def test_builds_with_no_data_available(self):
+        page = AIRecommendationPageView(
+            symbols=["BTCUSDT"], selected_symbol="BTCUSDT",
+            summary=None, history=[], data_available=False,
+            message="Todavía no hay recomendaciones de IA para BTCUSDT.",
+        )
+
+        assert page.summary is None
+        assert page.history == []
+        assert page.data_available is False
+        assert "BTCUSDT" in page.message
+
+    def test_symbols_and_history_default_to_empty_list(self):
+        page = AIRecommendationPageView(selected_symbol="BTCUSDT")
+
+        assert page.symbols == []
+        assert page.history == []
+
+    def test_rejects_empty_selected_symbol(self):
+        with pytest.raises(ValidationError):
+            AIRecommendationPageView(selected_symbol="")
+
+    def test_history_accepts_real_ai_recommendations(self):
+        recommendation = _ai_recommendation()
+        page = AIRecommendationPageView(selected_symbol="BTCUSDT", history=[recommendation])
+
+        assert page.history[0] is recommendation

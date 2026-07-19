@@ -1,11 +1,12 @@
 """
 Pruebas de integración entre páginas del Dashboard (Etapa 5, Iteración
-5.4 — cierre, ampliada en la 5.5 con 'Indicadores' y en la 5.6 con
-'Señales'): usando streamlit.testing.v1.AppTest, valida que el modo de
-vista responsive ("Vista": Automática/Amplia/Compacta) se comparte entre
-'Resumen General', 'Mercado', 'Indicadores' y 'Señales' a través de
-layout.VIEW_MODE_SESSION_KEY (vía layout.render_view_mode_selector()),
-en vez de mantenerse por separado en cada página.
+5.4 — cierre, ampliada en la 5.5 con 'Indicadores', en la 5.6 con
+'Señales' y en la 5.7 con 'Recomendaciones de IA'): usando
+streamlit.testing.v1.AppTest, valida que el modo de vista responsive
+("Vista": Automática/Amplia/Compacta) se comparte entre las 5 páginas
+funcionales a través de layout.VIEW_MODE_SESSION_KEY (vía
+layout.render_view_mode_selector()), en vez de mantenerse por separado
+en cada página.
 
 El harness reproduce el mismo enrutamiento de src/dashboard/app.py (un
 radio de página + despacho a resumen.render()/mercado.render()), pero
@@ -69,10 +70,11 @@ def _populated_db(tmp_path, symbols=("BTCUSDT", "ETHUSDT")) -> str:
 def _render_app(service, exchange, symbol):
     import streamlit as st
 
-    from src.dashboard.pages import indicadores, mercado, resumen, senales
+    from src.dashboard.pages import indicadores, mercado, recomendaciones, resumen, senales
 
     page_name = st.sidebar.radio(
-        "Pagina", ["Resumen General", "Mercado", "Indicadores", "Senales"],
+        "Pagina",
+        ["Resumen General", "Mercado", "Indicadores", "Senales", "Recomendaciones de IA"],
     )
 
     if page_name == "Resumen General":
@@ -83,6 +85,8 @@ def _render_app(service, exchange, symbol):
         indicadores.render(service, exchange=exchange, symbol=symbol, limit=100)
     elif page_name == "Senales":
         senales.render(service, exchange=exchange, symbol=symbol, limit=100)
+    elif page_name == "Recomendaciones de IA":
+        recomendaciones.render(service, exchange=exchange, symbol=symbol, limit=100)
 
 
 def _run(service, exchange="Binance", symbol="BTCUSDT", timeout=30):
@@ -280,6 +284,69 @@ def test_only_one_vista_selector_with_four_pages(tmp_path):
     at = _run(_service_for(db_path))
 
     for page in ["Mercado", "Indicadores", "Senales", "Resumen General"]:
+        _radio(at).set_value(page).run(timeout=30)
+        assert not at.exception
+        vista_selectors = [sb for sb in at.sidebar.selectbox if sb.label == "Vista"]
+        assert len(vista_selectors) == 1
+
+
+def test_ai_recommendations_loads_and_shares_view_mode_across_five_pages(tmp_path):
+    db_path = _populated_db(tmp_path)
+    at = _run(_service_for(db_path))
+
+    # 1. Resumen General por defecto.
+    assert not at.exception
+    assert at.title[0].value == "Resumen General"
+
+    # 2. Elegir "Compacta" en Resumen General.
+    _vista(at).select("Compacta").run(timeout=30)
+    assert not at.exception
+
+    # 3. Navegar a Mercado: conserva "Compacta".
+    _radio(at).set_value("Mercado").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Compacta"
+
+    # 4. Navegar a Indicadores: conserva "Compacta".
+    _radio(at).set_value("Indicadores").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Compacta"
+
+    # 5. Navegar a Señales: conserva "Compacta".
+    _radio(at).set_value("Senales").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Compacta"
+
+    # 6. Navegar a Recomendaciones de IA: conserva "Compacta".
+    _radio(at).set_value("Recomendaciones de IA").run(timeout=30)
+    assert not at.exception
+    assert at.title[0].value == "Recomendaciones de IA"
+    assert _vista(at).value == "Compacta"
+
+    # 7. Cambiar a "Amplia" en Recomendaciones de IA.
+    _vista(at).select("Amplia").run(timeout=30)
+    assert not at.exception
+
+    # 8. Regresar a Resumen General: conserva "Amplia".
+    _radio(at).set_value("Resumen General").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Amplia"
+
+    # 9. Cambiar a "Automática".
+    _vista(at).select("Automática").run(timeout=30)
+    assert not at.exception
+
+    # 10. Navegar nuevamente a Recomendaciones de IA: conserva "Automática".
+    _radio(at).set_value("Recomendaciones de IA").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Automática"
+
+
+def test_only_one_vista_selector_with_five_pages(tmp_path):
+    db_path = _populated_db(tmp_path)
+    at = _run(_service_for(db_path))
+
+    for page in ["Mercado", "Indicadores", "Senales", "Recomendaciones de IA", "Resumen General"]:
         _radio(at).set_value(page).run(timeout=30)
         assert not at.exception
         vista_selectors = [sb for sb in at.sidebar.selectbox if sb.label == "Vista"]

@@ -35,12 +35,14 @@ from src.dashboard.formatters import (
 )
 from src.dashboard.layout import render_responsive_metric_group
 from src.dashboard.models import (
+    AIRecommendationSummaryView,
     DashboardSummaryView,
     IndicatorSummaryView,
     MarketHistoryPoint,
     MarketSummaryView,
     SignalSummaryView,
 )
+from src.ai.recommendation import AIRecommendation
 from src.models.indicator_data import IndicatorSnapshot
 from src.models.signal_data import SignalSnapshot
 from src.dashboard.theme import (
@@ -387,5 +389,92 @@ def render_signal_history_table(history: list[SignalSnapshot]) -> None:
             "Score": format_score(snapshot.score),
         }
         for snapshot in reversed(history)
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def render_ai_status(summary: AIRecommendationSummaryView) -> None:
+    """Recomendación actual (insignia de color, propia línea). Usa
+    theme.COLOR_AI (color fijo), mismo criterio ya establecido en
+    'Resumen General' para la insignia de recomendación de IA: no varía
+    según la acción sugerida (a diferencia de la señal, que sí tiene un
+    color por SignalType)."""
+    st.caption("Recomendación")
+    render_status_badge(format_enum(summary.recommendation), COLOR_AI)
+
+
+def render_ai_metrics(summary: AIRecommendationSummaryView, compact: bool) -> None:
+    """Confianza (métrica) + riesgo (insignia de color, vía
+    theme.get_risk_color(), propia línea)."""
+    render_responsive_metric_group(
+        [("Confianza", format_confidence(summary.confidence))], compact=compact,
+    )
+    st.caption("Riesgo")
+    render_status_badge(format_risk_level(summary.risk_level), get_risk_color(summary.risk_level))
+
+
+def render_ai_explanation(summary: AIRecommendationSummaryView) -> None:
+    """Resumen en una línea + razonamiento/ventajas/riesgos completos en
+    un expander (detalle expandible, ideal para móvil: no ocupa espacio
+    hasta que el usuario lo abre)."""
+    st.caption("Resumen")
+    st.write(summary.summary or NOT_AVAILABLE)
+    with st.expander("Razonamiento completo"):
+        st.write(summary.reasoning or NOT_AVAILABLE)
+        if summary.advantages:
+            st.write("**Ventajas:**")
+            for advantage in summary.advantages:
+                st.write(f"- {advantage}")
+        if summary.risks:
+            st.write("**Riesgos:**")
+            for risk in summary.risks:
+                st.write(f"- {risk}")
+
+
+def render_ai_availability(summary: Optional[AIRecommendationSummaryView]) -> None:
+    """Fecha de generación + cantidad de registros + proveedor/modelo,
+    dejando explícito que hoy es un proveedor simulado (no un modelo de
+    lenguaje real) — para no sugerir que la recomendación viene de una
+    IA real todavía."""
+    if summary is None:
+        st.caption("Sin datos disponibles todavía.")
+        return
+    st.caption(
+        f"Generado: {format_timestamp(summary.timestamp)} · "
+        f"Registros disponibles: {format_record_count(summary.record_count)}"
+    )
+    st.caption(
+        f"Proveedor: {summary.provider or NOT_AVAILABLE} · "
+        f"Modelo: {summary.model or NOT_AVAILABLE} "
+        "(simulado — todavía no es un modelo de lenguaje real)"
+    )
+
+
+def render_ai_history_chart(history: list[AIRecommendation], symbol: str) -> None:
+    """Gráfico de línea de la evolución de la confianza (valor numérico
+    continuo 0-100). El historial de recomendación/riesgo (categóricos)
+    se muestra por separado en render_ai_history_table(), no en este
+    gráfico."""
+    timestamps = [recommendation.timestamp for recommendation in history]
+    confidences = [recommendation.confidence for recommendation in history]
+    figure = line_chart(timestamps, confidences, title=f"Confianza de IA — {symbol}")
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def render_ai_history_table(history: list[AIRecommendation]) -> None:
+    """Historial cronológico (más reciente primero) de recomendación/
+    confianza/riesgo como tabla, no como gráfico: recomendación y riesgo
+    son categóricos, y representarlos como números arbitrarios en un eje
+    sería engañoso."""
+    if not history:
+        return
+    rows = [
+        {
+            "Fecha": format_timestamp(recommendation.timestamp),
+            "Recomendación": format_enum(recommendation.recommendation),
+            "Confianza": format_confidence(recommendation.confidence),
+            "Riesgo": format_risk_level(recommendation.risk_level),
+        }
+        for recommendation in reversed(history)
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)

@@ -30,6 +30,8 @@ from typing import Callable, Optional, TypeVar
 from src.ai.recommendation import AIRecommendation
 from src.dashboard.filters import normalize_exchange, normalize_symbol, validate_limit
 from src.dashboard.models import (
+    AIRecommendationPageView,
+    AIRecommendationSummaryView,
     DashboardStatus,
     DashboardSummary,
     DashboardSummaryView,
@@ -361,6 +363,60 @@ class DashboardService:
         exchange, symbol, limit = self._resolve(exchange, symbol, limit)
         return self._safe_call(
             lambda: self.repository.get_signal_history(exchange, symbol, limit), fallback=[],
+        )
+
+    def get_ai_recommendations_page(
+        self, exchange: str, symbol: str, limit: Optional[int] = None
+    ) -> AIRecommendationPageView:
+        """Todo lo que necesita la página 'Recomendaciones de IA' para un
+        símbolo: reutiliza get_ai_history() (una sola consulta, igual
+        criterio que get_market_page()/get_indicators_page()/
+        get_signals_page(): el último registro ya es el último elemento
+        del historial) y arma el resumen a partir del mismo resultado,
+        sin recalcular ni regenerar ninguna recomendación (no llama a
+        DecisionEngine/AIProvider)."""
+        resolved_exchange, resolved_symbol, resolved_limit = self._resolve(exchange, symbol, limit)
+
+        history = self._safe_call(
+            lambda: self.repository.get_ai_history(resolved_exchange, resolved_symbol, resolved_limit),
+            fallback=[],
+        ) or []
+
+        if not history:
+            return AIRecommendationPageView(
+                symbols=self.symbols,
+                selected_symbol=resolved_symbol,
+                summary=None,
+                history=[],
+                data_available=False,
+                message=f"Todavía no hay recomendaciones de IA para {resolved_symbol}.",
+            )
+
+        latest = history[-1]
+        summary = AIRecommendationSummaryView(
+            exchange=resolved_exchange,
+            symbol=resolved_symbol,
+            recommendation=latest.recommendation,
+            confidence=latest.confidence,
+            risk_level=latest.risk_level,
+            reasoning=latest.reasoning,
+            summary=latest.summary,
+            advantages=latest.advantages,
+            risks=latest.risks,
+            provider=latest.provider,
+            model=latest.model,
+            timestamp=latest.timestamp,
+            record_count=len(history),
+            has_data=True,
+        )
+
+        return AIRecommendationPageView(
+            symbols=self.symbols,
+            selected_symbol=resolved_symbol,
+            summary=summary,
+            history=history,
+            data_available=True,
+            message=None,
         )
 
     def get_ai_view(
