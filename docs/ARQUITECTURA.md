@@ -847,10 +847,28 @@ a propósito). Para activarlos en el futuro:
 
 `src/dashboard/`, `src/alerts/` y `src/telegram/` existen como carpetas con
 un `__init__.py` que documenta su propósito futuro, pero sin ningún código
-funcional. Se crearon para que, cuando se autorice cada etapa, el código
-nuevo tenga un lugar natural donde vivir, sin tener que reorganizar el
-proyecto otra vez. `src/ai/` dejó de estar en esta lista desde la Etapa 4:
-ya contiene código funcional (ver "Motor de decisión de IA" más arriba).
+funcional todavía. Se crearon para que, cuando se autorice cada etapa, el
+código nuevo tenga un lugar natural donde vivir, sin tener que reorganizar
+el proyecto otra vez. `src/ai/` dejó de estar en esta lista desde la
+Etapa 4: ya contiene código funcional (ver "Motor de decisión de IA" más
+arriba). `src/dashboard/` tiene su diseño completo definido en la
+Iteración 5.1 (ver más abajo), pendiente de aprobación antes de
+implementarse en la Iteración 5.2.
+
+## Dashboard (Etapa 5 — en diseño, sin implementar todavía)
+
+La Etapa 5 agrega un Dashboard de **solo lectura** sobre las 4 tablas ya
+generadas por las Etapas 1 a 4 (`market_data`, `market_indicators`,
+`market_signals`, `ai_recommendations`), sin recalcular ni modificar
+ningún dato. Tecnología seleccionada: **Streamlit** (Python puro, un solo
+proceso, sin backend adicional). El diseño separa la consulta de datos
+(`src/dashboard/data_access.py`, que reutiliza los 4 repositorios
+existentes solo con `fetch_latest`/`fetch_history`) de la presentación
+(páginas Streamlit), precisamente para poder migrar esa capa de consulta
+a una futura API sin reescribirla. Ver el diseño completo, las páginas,
+los componentes y los filtros globales en
+[ARQUITECTURA_DASHBOARD.md](ARQUITECTURA_DASHBOARD.md) y el alcance en
+[ALCANCE_ETAPA_5.md](ALCANCE_ETAPA_5.md).
 
 ## Qué NO cambia para el usuario
 

@@ -29,6 +29,11 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   factores positivos/negativos), persistida en una tabla independiente.
   Hoy usa un proveedor simulado (`DummyProvider`); OpenAI/Claude quedan
   preparados pero sin conectar. Ver [docs/ALCANCE_ETAPA_4.md](docs/ALCANCE_ETAPA_4.md).
+- 📝 **Etapa 5 (en diseño, Iteración 5.1 — solo documentación, sin
+  código todavía)** — Dashboard de solo lectura (Streamlit) sobre las 4
+  tablas ya generadas por las Etapas 1 a 4. Ver
+  [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
+  [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
 
 ## Qué hace el bot hoy
 
@@ -136,7 +141,9 @@ Crypto_AI_Operation_Center/
     ├── ALCANCE_ETAPA_2.md
     ├── ALCANCE_ETAPA_3.md
     ├── ALCANCE_ETAPA_4.md
-    └── ARQUITECTURA.md
+    ├── ALCANCE_ETAPA_5.md
+    ├── ARQUITECTURA.md
+    └── ARQUITECTURA_DASHBOARD.md
 ```
 
 Ver el detalle de por qué está organizado así en [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md).
@@ -277,6 +284,13 @@ reemplazarlas — `MarketContext -> PromptBuilder -> AIProvider ->
 AIRecommendation` —, proveedor simulado `DummyProvider` conectado
 (OpenAI/Claude preparados, sin conectar), tabla independiente
 `ai_recommendations`. Pendiente de tu revisión y aprobación formal.
+
+📝 Etapa 5, Iteración 5.1 (solo diseño, sin código): alcance y arquitectura
+del Dashboard definidos (`docs/ALCANCE_ETAPA_5.md`,
+`docs/ARQUITECTURA_DASHBOARD.md`) — Streamlit, solo lectura sobre las 4
+tablas existentes, capa `data_access.py` separada para poder migrar a una
+futura API sin reescribir la lógica de consulta. Pendiente tu aprobación
+antes de la Iteración 5.2 (implementación).
 
 Pendiente: aprobación formal de la Etapa 4 antes de avanzar a cualquier
 etapa futura (Dashboard, Telegram, paper trading o trading automático, o
