@@ -14,6 +14,9 @@ from src.dashboard.models import (
     LatestIndicatorSnapshot,
     LatestMarketSnapshot,
     LatestSignalSnapshot,
+    MarketHistoryPoint,
+    MarketPageView,
+    MarketSummaryView,
     TableStatus,
 )
 from src.models.market_data import MarketTicker
@@ -185,3 +188,95 @@ class TestDashboardSummaryView:
         assert view.signal_type == SignalType.BULLISH
         assert view.ai_recommendation == RecommendationAction.BUY
         assert view.ai_risk_level == RiskLevel.MEDIUM
+
+
+class TestMarketSummaryView:
+    def test_builds_with_all_fields_present(self):
+        now = datetime.now(timezone.utc)
+        summary = MarketSummaryView(
+            exchange="Binance", symbol="BTCUSDT",
+            latest_price=110.0, previous_price=100.0, absolute_change=10.0,
+            percentage_change=10.0, period_high=110.0, period_low=90.0,
+            latest_timestamp=now, record_count=3, volume=500.0,
+        )
+        assert summary.latest_price == 110.0
+        assert summary.record_count == 3
+
+    def test_optional_fields_default_to_none_and_zero(self):
+        summary = MarketSummaryView(exchange="Binance", symbol="BTCUSDT")
+
+        assert summary.latest_price is None
+        assert summary.previous_price is None
+        assert summary.absolute_change is None
+        assert summary.percentage_change is None
+        assert summary.period_high is None
+        assert summary.period_low is None
+        assert summary.latest_timestamp is None
+        assert summary.record_count == 0
+        assert summary.volume is None
+
+    def test_rejects_empty_symbol(self):
+        with pytest.raises(ValidationError):
+            MarketSummaryView(exchange="Binance", symbol="")
+
+    def test_rejects_empty_exchange(self):
+        with pytest.raises(ValidationError):
+            MarketSummaryView(exchange="", symbol="BTCUSDT")
+
+    def test_rejects_negative_record_count(self):
+        with pytest.raises(ValidationError):
+            MarketSummaryView(exchange="Binance", symbol="BTCUSDT", record_count=-1)
+
+
+class TestMarketHistoryPoint:
+    def test_builds_with_all_fields(self):
+        now = datetime.now(timezone.utc)
+        point = MarketHistoryPoint(timestamp=now, price=100.0, volume=5.0)
+
+        assert point.timestamp == now
+        assert point.price == 100.0
+        assert point.volume == 5.0
+
+    def test_requires_timestamp_price_and_volume(self):
+        with pytest.raises(ValidationError):
+            MarketHistoryPoint(price=100.0, volume=5.0)
+
+
+class TestMarketPageView:
+    def test_builds_with_data_available(self):
+        now = datetime.now(timezone.utc)
+        summary = MarketSummaryView(exchange="Binance", symbol="BTCUSDT", latest_price=100.0)
+        history = [MarketHistoryPoint(timestamp=now, price=100.0, volume=1.0)]
+
+        page = MarketPageView(
+            symbols=["BTCUSDT", "ETHUSDT"], selected_symbol="BTCUSDT",
+            summary=summary, history=history, data_available=True, message=None,
+        )
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.summary is not None
+        assert len(page.history) == 1
+        assert page.data_available is True
+        assert page.message is None
+
+    def test_builds_with_no_data_available(self):
+        page = MarketPageView(
+            symbols=["BTCUSDT"], selected_symbol="BTCUSDT",
+            summary=None, history=[], data_available=False,
+            message="Todavía no hay precios guardados para BTCUSDT.",
+        )
+
+        assert page.summary is None
+        assert page.history == []
+        assert page.data_available is False
+        assert "BTCUSDT" in page.message
+
+    def test_symbols_and_history_default_to_empty_list(self):
+        page = MarketPageView(selected_symbol="BTCUSDT")
+
+        assert page.symbols == []
+        assert page.history == []
+
+    def test_rejects_empty_selected_symbol(self):
+        with pytest.raises(ValidationError):
+            MarketPageView(selected_symbol="")

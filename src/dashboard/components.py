@@ -17,18 +17,24 @@ from typing import Optional
 
 import streamlit as st
 
+from src.dashboard.charts import line_chart
 from src.dashboard.formatters import (
     NOT_AVAILABLE,
     format_confidence,
     format_enum,
     format_percent,
+    format_price,
+    format_price_change,
     format_price_compact,
+    format_record_count,
     format_relative_status,
     format_risk_level,
     format_score,
+    format_timestamp,
+    format_volume,
 )
 from src.dashboard.layout import render_responsive_metric_group
-from src.dashboard.models import DashboardSummaryView
+from src.dashboard.models import DashboardSummaryView, MarketHistoryPoint, MarketSummaryView
 from src.dashboard.theme import (
     COLOR_AI,
     get_change_color,
@@ -168,3 +174,45 @@ def render_summary_card(view: DashboardSummaryView, compact: bool = False) -> No
         _render_signal_section(view, compact)
         _render_ai_section(view, compact)
         _render_update_section(view)
+
+
+def render_market_metrics(summary: MarketSummaryView, compact: bool) -> None:
+    """Métricas principales de la página 'Mercado': precio actual,
+    variación absoluta y porcentual frente al registro anterior, máximo y
+    mínimo del período disponible, y volumen del último dato — en
+    columnas lado a lado o apiladas según 'compact', igual criterio que
+    render_responsive_metric_group() ya usa en 'Resumen General'."""
+    metrics = [
+        ("Precio actual", format_price(summary.latest_price)),
+        ("Variación", format_price_change(summary.absolute_change)),
+        ("Variación %", format_percent(summary.percentage_change)),
+        ("Máximo del período", format_price(summary.period_high)),
+        ("Mínimo del período", format_price(summary.period_low)),
+    ]
+    if summary.volume is not None:
+        metrics.append(("Volumen", format_volume(summary.volume)))
+    render_responsive_metric_group(metrics, compact=compact)
+
+
+def render_market_availability(summary: Optional[MarketSummaryView]) -> None:
+    """Fecha del último dato disponible y cantidad de registros del
+    historial consultado (respeta el límite elegido en la barra
+    lateral: no es necesariamente el total histórico de la tabla)."""
+    if summary is None:
+        st.caption("Sin datos disponibles todavía.")
+        return
+    st.caption(
+        f"Último dato: {format_timestamp(summary.latest_timestamp)} · "
+        f"Registros disponibles: {format_record_count(summary.record_count)}"
+    )
+
+
+def render_price_history_chart(history: list[MarketHistoryPoint], symbol: str) -> None:
+    """Gráfico de línea del historial de precio, a ancho completo del
+    contenedor (se adapta a cualquier modo de vista, sin scroll
+    horizontal). Con 0 o 1 registro, charts.line_chart() ya devuelve una
+    figura vacía o un único punto sin fallar."""
+    timestamps = [point.timestamp for point in history]
+    prices = [point.price for point in history]
+    figure = line_chart(timestamps, prices, title=f"Precio histórico — {symbol}")
+    st.plotly_chart(figure, use_container_width=True)

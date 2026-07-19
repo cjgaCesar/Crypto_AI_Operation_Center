@@ -1,11 +1,13 @@
 # Arquitectura del Dashboard (Etapa 5)
 
 > Diseño original de la Iteración 5.1, actualizado en la Iteración 5.2 con
-> la estructura de módulos realmente implementada, y en la Iteración 5.3
-> con la primera página funcional (ver "Nota de implementación" e
-> "Iteración 5.3" más abajo). La página "Resumen General" ya es funcional;
-> el resto del Dashboard **todavía no está completo**: las demás páginas
-> siguen siendo esqueletos mínimos (ver `docs/ALCANCE_ETAPA_5.md`).
+> la estructura de módulos realmente implementada, en la Iteración 5.3 con
+> la primera página funcional y en la Iteración 5.4 con la página
+> "Mercado" (ver "Nota de implementación" de cada iteración más abajo).
+> "Resumen General" y "Mercado" ya son funcionales; el resto del
+> Dashboard **todavía no está completo**: Indicadores, Señales y
+> Recomendaciones de IA siguen siendo esqueletos mínimos (ver
+> `docs/ALCANCE_ETAPA_5.md`).
 
 ## Nota de implementación (Iteración 5.2)
 
@@ -130,11 +132,12 @@ guardado únicamente en `st.session_state` (nunca en disco ni en
   `st.metric`, sintaxis de markdown coloreado); no se agregó ningún
   paquete a `requirements.txt` para esto.
 
-### Reglas obligatorias para páginas futuras (Precios/Indicadores/Señales/Recomendaciones)
+### Reglas obligatorias para páginas futuras (Indicadores/Señales/Recomendaciones)
 
-Cuando se implementen los gráficos históricos e indicadores de esas 4
-páginas (todavía esqueletos), deben ser **responsive desde el inicio**,
-no revisarse después:
+Cuando se implementen los gráficos históricos e indicadores de esas 3
+páginas (todavía esqueletos; "Mercado" ya sigue estas reglas desde la
+Iteración 5.4), deben ser **responsive desde el inicio**, no revisarse
+después:
 
 - Tablas con ancho del contenedor: `st.dataframe(..., use_container_width=True)`.
 - Gráficos con ancho del contenedor: Plotly con `use_container_width=True`.
@@ -144,6 +147,67 @@ no revisarse después:
 - Detalle expandible en móvil (`st.expander`) cuando haya demasiada
   información para mostrar de una vez, en vez de comprimir columnas hasta
   volverlas ilegibles.
+
+## Nota de implementación (Iteración 5.4)
+
+Se implementó la página "Mercado" (`mercado.py`, renombrada de "Precios" a
+"Mercado" para que el título de la página, el nombre del módulo y la
+tabla que consulta —`market_data`— usen el mismo nombre), reutilizando
+todo lo que ya existía sin agregar ninguna dependencia nueva:
+
+- **`repository.py` no ganó ningún método nuevo**: `get_market_history()`
+  y `get_available_symbols()` (ambos ya existentes desde la Iteración
+  5.2/5.3) ya eran suficientes para construir la página completa. Antes
+  de escribir código se inspeccionó el esquema real de `market_data`
+  (`PRAGMA table_info`) para confirmar los nombres de columna reales
+  (`price`, `volume_24h`, `price_change_percent_24h`, `queried_at`; no
+  existen columnas de máximo/mínimo separadas) y verificar que no hay
+  filas nulas, duplicadas ni fuera de orden cronológico.
+- **`DashboardService.get_market_page(exchange, symbol, limit)`**
+  (`service.py`): una sola llamada a `get_market_history()` (no llama
+  también a `get_latest_market()`: el último elemento del historial ya
+  es el dato más reciente, evitando una consulta duplicada). A partir de
+  esa misma lista construye el resumen (`_build_market_summary()`,
+  método estático) y los puntos del gráfico. El máximo/mínimo del
+  período y la variación frente al registro anterior son cálculos
+  simples sobre filas ya existentes (no son indicadores técnicos: no se
+  recalcula nada que ya viva en `market_indicators`).
+- **`models.py`** ganó 3 modelos nuevos: `MarketSummaryView` (precio
+  actual, precio anterior, variación absoluta/porcentual, máximo/mínimo
+  del período, timestamp, cantidad de registros, volumen),
+  `MarketHistoryPoint` (timestamp/precio/volumen de un punto del
+  gráfico) y `MarketPageView` (símbolos configurados, símbolo elegido,
+  resumen opcional, historial, disponibilidad y mensaje).
+- **`formatters.py`** ganó 3 funciones: `format_price_change` (variación
+  absoluta con signo, sin símbolo de porcentaje), `format_volume` y
+  `format_record_count`. Ninguna asigna color (igual criterio que el
+  resto del archivo).
+- **`components.py`** ganó 3 helpers: `render_market_metrics()` (grupo de
+  métricas responsive vía `layout.render_responsive_metric_group()`),
+  `render_market_availability()` (última actualización + cantidad de
+  registros) y `render_price_history_chart()` (envuelve
+  `charts.line_chart()`, ya existente desde la Iteración 5.2, sin
+  agregar ninguna librería nueva: sigue siendo Plotly).
+- **Diseño responsive**: la página "Mercado" reutiliza exactamente el
+  mismo selector "Vista" (Automática/Amplia/Compacta) que "Resumen
+  General", guardado en su propia clave de `st.session_state`
+  (`mercado_view_mode`) para no interferir con la de "Resumen General".
+  El gráfico usa `use_container_width=True` (sin ancho fijo, sin scroll
+  horizontal), y las métricas usan `render_responsive_metric_group()` ya
+  existente. A diferencia de "Resumen General" (que muestra una tarjeta
+  por símbolo y sí varía cuántas tarjetas caben por fila), "Mercado"
+  muestra un único símbolo a la vez: `get_cards_per_row()` y
+  `render_responsive_grid()` no aplican aquí porque no hay una colección
+  de tarjetas que distribuir, solo un grupo de métricas y un gráfico.
+- **Garantía de solo lectura sin cambios**: el selector de símbolo
+  (compartido entre páginas) sigue viviendo en `app.py`; "Mercado" no
+  abre conexiones ni ejecuta SQL directamente.
+- **Manejo de ausencia de datos**: si `get_market_history()` devuelve una
+  lista vacía (símbolo sin ningún precio guardado todavía), la página
+  muestra un mensaje explícito en vez de un resumen vacío o un error.
+  Con un único registro, `previous_price`/`absolute_change`/
+  `percentage_change` quedan en `None` ("N/D"), pero el precio actual y
+  el máximo/mínimo (iguales al único precio disponible) sí se muestran.
 
 ## Tecnología seleccionada: Streamlit
 
@@ -199,7 +263,7 @@ Resumido: **Repository → Service → View Model → Components/Layout → Page
   `models.py` cambiarían — solo `components.py`/`layout.py` (capa 100%
   de presentación) dejarían de usarse en ese contexto.
 
-## Estructura de módulos (base en la Iteración 5.2, ampliada en la 5.3)
+## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3 y 5.4)
 
 ```
 src/dashboard/
@@ -207,27 +271,33 @@ src/dashboard/
 ├── app.py                  # Punto de entrada: streamlit run src/dashboard/app.py
 ├── config.py                 # DashboardConfig + build_dashboard_config()
 ├── models.py                   # TableStatus, DashboardStatus, Latest*Snapshot,
-│                                # DashboardSummary, DashboardSummaryView (5.3)
+│                                # DashboardSummary, DashboardSummaryView (5.3),
+│                                # MarketSummaryView/MarketHistoryPoint/MarketPageView (5.4)
 ├── repository.py                 # DashboardRepository (interfaz) + SQLiteDashboardRepository
-├── service.py                      # DashboardService (+ get_summary_view(), 5.3)
+│                                  # (sin cambios en 5.4: get_market_history() ya alcanzaba)
+├── service.py                      # DashboardService (+ get_summary_view() 5.3,
+│                                    # + get_market_page() 5.4)
 ├── filters.py                        # normalize_symbol/normalize_exchange/validate_limit
 ├── formatters.py                       # format_price/percent/timestamp/enum +
 │                                        # format_price_compact/confidence/score/
-│                                        # risk_level/relative_status (5.3)
+│                                        # risk_level/relative_status (5.3) +
+│                                        # format_price_change/volume/record_count (5.4)
 ├── theme.py                              # Paleta + get_signal_color/get_risk_color/
 │                                         # get_change_color/to_streamlit_color_name (5.3)
 ├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
 │                                          # render_responsive_metric_group (responsive, 5.3)
-├── charts.py                             # empty_figure/line_chart (mínimos; gráficos
-│                                         # históricos completos en una iteración futura)
+├── charts.py                             # empty_figure/line_chart (5.2; reutilizado sin
+│                                         # cambios por Mercado en 5.4)
 ├── components.py                           # render_not_available/render_kpi_card +
 │                                           # render_section_header/render_status_badge (sin HTML)/
 │                                           # render_data_availability/render_summary_card
-│                                           # (con modo compact, 5.3)
+│                                           # (con modo compact, 5.3) +
+│                                           # render_market_metrics/render_market_availability/
+│                                           # render_price_history_chart (5.4)
 └── pages/                                    # Una página por vista
     ├── __init__.py
     ├── resumen.py                             # Funcional desde 5.3 (tarjetas por símbolo)
-    ├── mercado.py                             # Esqueleto
+    ├── mercado.py                             # Funcional desde 5.4 ("Mercado", antes "Precios")
     ├── indicadores.py                         # Esqueleto
     ├── senales.py                             # Esqueleto
     ├── recomendaciones.py                     # Esqueleto
@@ -249,9 +319,11 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 > de las 4 tablas SQLite (existe/vacía/con datos) que una vista de solo
 > lectura de `config.yaml`. En la Iteración 5.2 las 6 páginas eran
 > esqueletos mínimos (título + un dato simple + manejo de ausencia de
-> datos). En la Iteración 5.3, "Resumen General" se completó; las otras 4
-> páginas de símbolo (Precios/Indicadores/Señales/Recomendaciones) siguen
-> como esqueletos, pendientes de una iteración futura.
+> datos). En la Iteración 5.3, "Resumen General" se completó. En la
+> Iteración 5.4, `mercado.py` se completó y su página pasó a llamarse
+> "Mercado" (antes "Precios", para que coincida con el nombre del
+> módulo y de la tabla que consulta); Indicadores/Señales/Recomendaciones
+> de IA siguen como esqueletos, pendientes de una iteración futura.
 
 1. **Resumen General** (`resumen.py`) — **funcional desde la Iteración
    5.3**: una tarjeta por símbolo configurado (`DashboardService.get_summary_view()`)
@@ -264,9 +336,18 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
    precios sin señales, señales sin IA), y un selector de vista responsive
    (`Vista: Automática/Amplia/Compacta`, ver "Diseño responsive" más
    arriba) que controla cuántas tarjetas se muestran por fila.
-2. **Precios** (`mercado.py`) — esqueleto: hoy solo el último precio. En
-   una iteración futura, gráfico de precio histórico (`market_data`)
-   superpuesto con SMA/EMA.
+2. **Mercado** (`mercado.py`, antes "Precios") — **funcional desde la
+   Iteración 5.4**: para el símbolo elegido en la barra lateral
+   (`DashboardService.get_market_page()`), muestra precio actual,
+   variación absoluta y porcentual frente al registro anterior, máximo y
+   mínimo del período disponible, volumen del último dato, fecha del
+   último dato, cantidad de registros disponibles y un gráfico de línea
+   con el historial de precio (`charts.line_chart()`, ya existente desde
+   la 5.2). Sin indicadores técnicos ni señales superpuestas (eso vive en
+   `market_indicators`/`market_signals`, no en `market_data`): quedan
+   para las páginas Indicadores/Señales. Incluye su propio selector de
+   vista responsive (`Vista`, misma mecánica que "Resumen General", clave
+   de sesión independiente `mercado_view_mode`).
 3. **Indicadores** (`indicadores.py`) — esqueleto: hoy solo el RSI más
    reciente. En una iteración futura, gráficos de RSI, MACD y Bandas de
    Bollinger (`market_indicators`).
@@ -305,9 +386,18 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 - **`layout.render_responsive_grid`/`render_responsive_metric_group`**
   (5.3): distribución de tarjetas y grupos de métricas según el modo de
   vista elegido (ver "Diseño responsive" más arriba).
+- **`render_market_metrics(summary, compact)`** (5.4): precio actual,
+  variación absoluta/porcentual, máximo/mínimo del período y volumen de
+  "Mercado", vía `render_responsive_metric_group()`.
+- **`render_market_availability(summary)`** (5.4): última actualización
+  relativa + cantidad de registros disponibles de "Mercado".
+- **`render_price_history_chart(history, symbol)`** (5.4): envuelve
+  `charts.line_chart()` con `st.plotly_chart(..., use_container_width=True)`
+  (sin ancho fijo, sin scroll horizontal).
 - **Gráfico de serie temporal** (`charts.line_chart`): envoltura común
-  para precio/indicadores/score/confidence a lo largo del tiempo —
-  todavía sin usar en ninguna página (pendiente de una iteración futura).
+  para precio/indicadores/score/confidence a lo largo del tiempo — en
+  uso desde la 5.4 en "Mercado"; Indicadores/Señales/Recomendaciones de
+  IA lo reutilizarán en una iteración futura.
 - **Bloque de razones**: lista de `reason`/`rule_strength` o
   `advantages`/`risks` — pendiente de una iteración futura (Señales y
   Recomendaciones de IA todavía son esqueletos).
@@ -343,20 +433,24 @@ responsive, más arriba, para la regla completa de tablas/gráficos.)
 ## Dependencias
 
 `streamlit` y `plotly` (ambas Python puro, sin servicios adicionales),
-agregadas a `requirements.txt` desde la Iteración 5.2. La Iteración 5.3 no
-agregó ninguna dependencia nueva.
+agregadas a `requirements.txt` desde la Iteración 5.2. Ni la Iteración 5.3
+ni la 5.4 agregaron ninguna dependencia nueva.
 
 ## Estado por iteración
 
 - **5.1** (diseño): alcance y arquitectura documentados, sin código.
 - **5.2** (estructura base): repositorio/servicio/config/helpers/`app.py`
   funcionando, 6 páginas esqueleto.
-- **5.3** (esta): página "Resumen General" funcional
-  (`DashboardSummaryView`, `get_summary_view()`, `theme.py`,
-  `layout.py`/diseño responsive, tarjetas de resumen sin HTML). Las otras
-  4 páginas de símbolo siguen siendo esqueletos.
-- **Pendiente para la Iteración 5.4**: gráficos históricos completos
-  (Precios/Indicadores/Señales/Recomendaciones), auto-refresh real,
+- **5.3**: página "Resumen General" funcional (`DashboardSummaryView`,
+  `get_summary_view()`, `theme.py`, `layout.py`/diseño responsive,
+  tarjetas de resumen sin HTML).
+- **5.4** (esta): página "Mercado" funcional (antes "Precios";
+  `MarketSummaryView`/`MarketHistoryPoint`/`MarketPageView`,
+  `get_market_page()`, gráfico de historial de precio, selector de vista
+  responsive propio). Indicadores, Señales y Recomendaciones de IA siguen
+  siendo esqueletos.
+- **Pendiente para la Iteración 5.5**: gráficos históricos completos de
+  Indicadores/Señales/Recomendaciones de IA, auto-refresh real,
   comparación entre símbolos, diseño visual definitivo de toda la
   aplicación (identidad visual más allá de la paleta ya centralizada en
   `theme.py`).

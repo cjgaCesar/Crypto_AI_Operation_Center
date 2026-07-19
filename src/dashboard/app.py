@@ -27,7 +27,7 @@ from src.dashboard.service import DashboardService
 from src.utils.config import load_settings
 
 _PAGE_RESUMEN = "Resumen General"
-_PAGE_PRECIOS = "Precios"
+_PAGE_MERCADO = "Mercado"
 _PAGE_INDICADORES = "Indicadores"
 _PAGE_SENALES = "Señales"
 _PAGE_RECOMENDACIONES = "Recomendaciones de IA"
@@ -35,7 +35,7 @@ _PAGE_ESTADO_TECNICO = "Estado Técnico"
 
 _PAGE_NAMES = [
     _PAGE_RESUMEN,
-    _PAGE_PRECIOS,
+    _PAGE_MERCADO,
     _PAGE_INDICADORES,
     _PAGE_SENALES,
     _PAGE_RECOMENDACIONES,
@@ -107,7 +107,7 @@ def main() -> None:
             resumen.render(service, exchange=config.exchange)
         elif page_name == _PAGE_ESTADO_TECNICO:
             estado_tecnico.render(service)
-        elif page_name == _PAGE_PRECIOS:
+        elif page_name == _PAGE_MERCADO:
             mercado.render(service, exchange=config.exchange, symbol=symbol, limit=limit)
         elif page_name == _PAGE_INDICADORES:
             indicadores.render(service, exchange=config.exchange, symbol=symbol, limit=limit)

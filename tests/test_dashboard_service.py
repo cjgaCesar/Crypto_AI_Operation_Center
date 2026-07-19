@@ -367,3 +367,123 @@ class TestGetSummaryView:
         # Exactamente 1 llamada por símbolo a cada una de las 4 fuentes
         # (2 símbolos configurados): ninguna llamada repetida ni de más.
         assert repository.call_counts == {"market": 2, "indicators": 2, "signal": 2, "ai": 2}
+
+
+class TestGetMarketPage:
+    def test_no_history_returns_unavailable_page_with_message(self):
+        service = _service()
+        page = service.get_market_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None
+        assert page.history == []
+        assert "BTCUSDT" in page.message
+
+    def test_includes_configured_symbols_and_selected_symbol(self):
+        repository = FakeDashboardRepository()
+        repository.market_history[("Binance", "BTCUSDT")] = [_ticker("BTCUSDT")]
+        service = _service(repository)
+
+        page = service.get_market_page("Binance", "btcusdt")
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.selected_symbol == "BTCUSDT"
+
+    def test_single_record_has_no_previous_price_or_change(self):
+        repository = FakeDashboardRepository()
+        repository.market_history[("Binance", "BTCUSDT")] = [_ticker("BTCUSDT")]
+        service = _service(repository)
+
+        page = service.get_market_page("Binance", "BTCUSDT")
+
+        assert page.data_available is True
+        assert page.summary.previous_price is None
+        assert page.summary.absolute_change is None
+        assert page.summary.percentage_change is None
+        assert page.summary.record_count == 1
+        assert page.summary.period_high == 100.0
+        assert page.summary.period_low == 100.0
+
+    def test_multiple_records_compute_change_and_period_high_low(self):
+        repository = FakeDashboardRepository()
+        history = [
+            MarketTicker(
+                exchange="Binance", symbol="BTCUSDT", price=price, volume_24h=1.0,
+                price_change_percent_24h=1.0, queried_at=datetime.now(timezone.utc),
+            )
+            for price in (100.0, 90.0, 110.0)
+        ]
+        repository.market_history[("Binance", "BTCUSDT")] = history
+        service = _service(repository)
+
+        page = service.get_market_page("Binance", "BTCUSDT")
+
+        assert page.summary.latest_price == 110.0
+        assert page.summary.previous_price == 90.0
+        assert page.summary.absolute_change == 20.0
+        assert page.summary.percentage_change == pytest.approx((20.0 / 90.0) * 100)
+        assert page.summary.period_high == 110.0
+        assert page.summary.period_low == 90.0
+        assert page.summary.record_count == 3
+
+    def test_history_points_preserve_order_and_values(self):
+        repository = FakeDashboardRepository()
+        t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t2 = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        history = [
+            MarketTicker(
+                exchange="Binance", symbol="BTCUSDT", price=100.0, volume_24h=5.0,
+                price_change_percent_24h=1.0, queried_at=t1,
+            ),
+            MarketTicker(
+                exchange="Binance", symbol="BTCUSDT", price=105.0, volume_24h=6.0,
+                price_change_percent_24h=1.0, queried_at=t2,
+            ),
+        ]
+        repository.market_history[("Binance", "BTCUSDT")] = history
+        service = _service(repository)
+
+        page = service.get_market_page("Binance", "BTCUSDT")
+
+        assert [p.timestamp for p in page.history] == [t1, t2]
+        assert [p.price for p in page.history] == [100.0, 105.0]
+        assert [p.volume for p in page.history] == [5.0, 6.0]
+
+    def test_limit_is_resolved_like_other_history_methods(self):
+        repository = FakeDashboardRepository()
+        repository.market_history[("Binance", "BTCUSDT")] = [_ticker() for _ in range(5)]
+        service = DashboardService(
+            repository=repository, exchange="Binance", symbols=["BTCUSDT"],
+            default_history_limit=100, max_history_limit=3,
+        )
+
+        page = service.get_market_page("Binance", "BTCUSDT", limit=1000)
+        assert page.summary.record_count <= 3
+
+    def test_view_is_isolated_by_exchange(self):
+        repository = FakeDashboardRepository()
+        repository.market_history[("Binance", "BTCUSDT")] = [_ticker("BTCUSDT")]
+        repository.market_history[("OtroExchange", "BTCUSDT")] = [
+            MarketTicker(
+                exchange="OtroExchange", symbol="BTCUSDT", price=999.0, volume_24h=1.0,
+                price_change_percent_24h=1.0, queried_at=datetime.now(timezone.utc),
+            )
+        ]
+        service = _service(repository)
+
+        page = service.get_market_page("Binance", "BTCUSDT")
+        other_page = service.get_market_page("OtroExchange", "BTCUSDT")
+
+        assert page.summary.latest_price == 100.0
+        assert other_page.summary.latest_price == 999.0
+
+    def test_repository_exception_is_handled_gracefully(self):
+        class RaisingRepository(FakeDashboardRepository):
+            def get_market_history(self, exchange, symbol, limit):
+                raise RuntimeError("fallo simulado del repositorio")
+
+        service = _service(RaisingRepository())
+        page = service.get_market_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None

@@ -37,6 +37,9 @@ from src.dashboard.models import (
     LatestIndicatorSnapshot,
     LatestMarketSnapshot,
     LatestSignalSnapshot,
+    MarketHistoryPoint,
+    MarketPageView,
+    MarketSummaryView,
 )
 from src.dashboard.repository import DashboardRepository
 from src.models.indicator_data import IndicatorSnapshot
@@ -161,6 +164,76 @@ class DashboardService:
         exchange, symbol, limit = self._resolve(exchange, symbol, limit)
         return self._safe_call(
             lambda: self.repository.get_market_history(exchange, symbol, limit), fallback=[],
+        )
+
+    def get_market_page(
+        self, exchange: str, symbol: str, limit: Optional[int] = None
+    ) -> MarketPageView:
+        """Todo lo que necesita la página 'Mercado' para un símbolo:
+        reutiliza get_market_history() (una sola consulta, sin llamar
+        también a get_latest_market(): el último ticker ya es el último
+        elemento del historial) y arma el resumen y los puntos del
+        gráfico a partir del mismo resultado, sin recalcular indicadores,
+        señales ni recomendaciones de IA."""
+        resolved_exchange, resolved_symbol, resolved_limit = self._resolve(exchange, symbol, limit)
+
+        history = self._safe_call(
+            lambda: self.repository.get_market_history(resolved_exchange, resolved_symbol, resolved_limit),
+            fallback=[],
+        ) or []
+
+        if not history:
+            return MarketPageView(
+                symbols=self.symbols,
+                selected_symbol=resolved_symbol,
+                summary=None,
+                history=[],
+                data_available=False,
+                message=f"Todavía no hay precios guardados para {resolved_symbol}.",
+            )
+
+        return MarketPageView(
+            symbols=self.symbols,
+            selected_symbol=resolved_symbol,
+            summary=self._build_market_summary(resolved_exchange, resolved_symbol, history),
+            history=[
+                MarketHistoryPoint(timestamp=ticker.queried_at, price=ticker.price, volume=ticker.volume_24h)
+                for ticker in history
+            ],
+            data_available=True,
+            message=None,
+        )
+
+    @staticmethod
+    def _build_market_summary(
+        exchange: str, symbol: str, history: list[MarketTicker]
+    ) -> MarketSummaryView:
+        """Resumen derivado del historial ya consultado (sin volver a
+        llamar al repositorio): variación frente al registro anterior, y
+        máximo/mínimo del período disponible en ese mismo historial."""
+        latest = history[-1]
+        previous = history[-2] if len(history) >= 2 else None
+        prices = [ticker.price for ticker in history]
+
+        absolute_change = (latest.price - previous.price) if previous else None
+        percentage_change = (
+            (absolute_change / previous.price) * 100
+            if previous is not None and previous.price != 0
+            else None
+        )
+
+        return MarketSummaryView(
+            exchange=exchange,
+            symbol=symbol,
+            latest_price=latest.price,
+            previous_price=previous.price if previous else None,
+            absolute_change=absolute_change,
+            percentage_change=percentage_change,
+            period_high=max(prices),
+            period_low=min(prices),
+            latest_timestamp=latest.queried_at,
+            record_count=len(history),
+            volume=latest.volume_24h,
         )
 
     def get_indicators_view(

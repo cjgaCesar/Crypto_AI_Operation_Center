@@ -77,6 +77,30 @@ def format_risk_level(value: Optional[object]) -> str:
     return format_enum(value)
 
 
+def format_price_change(value: Optional[float], decimals: int = 2) -> str:
+    """Variación absoluta de precio (ej. -12.34), con signo explícito
+    +/- pero sin símbolo de porcentaje — a diferencia de format_percent,
+    que sí lleva '%' y está pensado para variaciones porcentuales."""
+    if value is None:
+        return NOT_AVAILABLE
+    return f"{value:+,.{decimals}f}"
+
+
+def format_volume(value: Optional[float], decimals: int = 2) -> str:
+    """Volumen con separador de miles, mismo criterio que
+    format_price_compact (sin signo: un volumen nunca es negativo)."""
+    if value is None:
+        return NOT_AVAILABLE
+    return f"{value:,.{decimals}f}"
+
+
+def format_record_count(value: Optional[int]) -> str:
+    """Cantidad de registros como entero con separador de miles."""
+    if value is None:
+        return NOT_AVAILABLE
+    return f"{value:,}"
+
+
 def format_relative_status(
     timestamp: Optional[datetime], reference: Optional[datetime] = None
 ) -> str:

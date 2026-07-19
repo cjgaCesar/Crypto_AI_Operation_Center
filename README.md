@@ -29,8 +29,8 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   factores positivos/negativos), persistida en una tabla independiente.
   Hoy usa un proveedor simulado (`DummyProvider`); OpenAI/Claude quedan
   preparados pero sin conectar. Ver [docs/ALCANCE_ETAPA_4.md](docs/ALCANCE_ETAPA_4.md).
-- 📝 **Etapa 5 (en desarrollo, Iteración 5.3 — Resumen General
-  funcional, el resto del Dashboard todavía no está completo)** —
+- 📝 **Etapa 5 (en desarrollo, Iteración 5.4 — Resumen General y Mercado
+  funcionales, el resto del Dashboard todavía no está completo)** —
   Dashboard de solo lectura (Streamlit) sobre las 4 tablas ya generadas
   por las Etapas 1 a 4. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md)
   y [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
@@ -228,7 +228,7 @@ historial (ej. la EMA lenta, que por defecto usa 200 lecturas) no van a
 tener valor todavía en los primeros ciclos — es normal, y se completan
 solos a medida que se acumulan datos.
 
-## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.3 — Resumen General funcional)
+## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.4 — Resumen General y Mercado funcionales)
 
 Instalar dependencias (incluye `streamlit`/`plotly`, ya en `requirements.txt`):
 
@@ -242,37 +242,49 @@ Ejecutar:
 streamlit run src/dashboard/app.py
 ```
 
-**Estado actual: Iteración 5.3 completada — la página "Resumen General" ya
-es funcional; el resto del Dashboard todavía NO está completo, y la
-Etapa 5 en general tampoco.** Esa página muestra, para cada símbolo
-configurado (`BTCUSDT`/`ETHUSDT`/`SOLUSDT`), una tarjeta con precio,
-variación 24h, señal más reciente, score, confianza de la señal,
-recomendación de IA, confianza de IA, nivel de riesgo, última
-actualización relativa ("Hace 5 min") y qué tablas tienen datos
-disponibles (mercado/indicadores/señales/IA) — todo con valores "N/D"
-cuando algo todavía no existe, y un resumen general (cuántos símbolos
-están configurados, cuántos tienen datos completos, cuándo se actualizó
-el sistema por última vez).
+**Estado actual: Iteración 5.4 completada — "Resumen General" y "Mercado"
+ya son funcionales; el resto del Dashboard todavía NO está completo, y la
+Etapa 5 en general tampoco.**
 
-Desde esta iteración, la página tiene **diseño responsive**: incluye un
+"Resumen General" muestra, para cada símbolo configurado
+(`BTCUSDT`/`ETHUSDT`/`SOLUSDT`), una tarjeta con precio, variación 24h,
+señal más reciente, score, confianza de la señal, recomendación de IA,
+confianza de IA, nivel de riesgo, última actualización relativa ("Hace 5
+min") y qué tablas tienen datos disponibles (mercado/indicadores/
+señales/IA) — todo con valores "N/D" cuando algo todavía no existe, y un
+resumen general (cuántos símbolos están configurados, cuántos tienen
+datos completos, cuándo se actualizó el sistema por última vez).
+
+**Mercado** (antes "Precios") muestra, para el símbolo elegido en la
+barra lateral, el precio actual, la variación absoluta y porcentual
+frente al registro anterior, el máximo y el mínimo del período
+disponible, el volumen del último dato, la fecha del último dato, la
+cantidad de registros disponibles (respeta el límite de historial
+elegido en la barra lateral) y un gráfico de línea con el historial de
+precio. No calcula indicadores técnicos, señales ni recomendaciones de
+IA (eso vive en las páginas Indicadores/Señales/Recomendaciones de IA,
+todavía esqueletos).
+
+Ambas páginas tienen **diseño responsive**: cada una incluye su propio
 selector **"Vista"** con 3 modos (**Automática**, **Amplia**,
-**Compacta**) en la barra lateral, para controlar cuántas tarjetas se
-muestran por fila (3 en Amplia, 2 en Automática, 1 apilada verticalmente
-en Compacta, para pantallas angostas) — la elección se guarda solo en la
-sesión del navegador (`st.session_state`), nunca en disco ni en
-`config.yaml`.
+**Compacta**) en la barra lateral. En "Resumen General" controla cuántas
+tarjetas se muestran por fila (3 en Amplia, 2 en Automática, 1 apilada
+verticalmente en Compacta); en "Mercado" controla si las métricas se
+muestran en columnas o apiladas. La elección se guarda solo en la sesión
+del navegador (`st.session_state`), nunca en disco ni en `config.yaml`.
 
-Las demás páginas (Precios, Indicadores, Señales, Recomendaciones de IA,
-Estado Técnico) siguen siendo esqueletos mínimos — su contenido completo
-(gráficos históricos, comparaciones) queda para una iteración futura, y
-la identidad visual definitiva de toda la aplicación (más allá de la
-paleta ya centralizada en `theme.py`) también se completará más adelante.
+Las demás páginas (Indicadores, Señales, Recomendaciones de IA) siguen
+siendo esqueletos mínimos — su contenido completo (gráficos históricos,
+comparaciones) queda para una iteración futura, y la identidad visual
+definitiva de toda la aplicación (más allá de la paleta ya centralizada
+en `theme.py`) también se completará más adelante. "Estado Técnico" ya es
+funcional desde la Iteración 5.2 (estado de las 4 tablas SQLite).
 
 El diseño responsive se validó mediante pruebas automatizadas (AppTest) y
 revisión de código (sin anchos/altos fijos, sin tablas HTML, sin scroll
 horizontal forzado), pero **todavía no se validó visualmente en un
 navegador real** en ningún tamaño de pantalla — se recomienda hacerlo
-antes de dar por cerrado el diseño responsive de esta iteración.
+antes de dar por cerrado el diseño responsive de estas dos páginas.
 
 El Dashboard es de **solo lectura**: nunca escribe en
 `data/crypto_data.db`, no recalcula indicadores ni señales, no genera
@@ -338,18 +350,25 @@ AIRecommendation` —, proveedor simulado `DummyProvider` conectado
 (OpenAI/Claude preparados, sin conectar), tabla independiente
 `ai_recommendations`. Pendiente de tu revisión y aprobación formal.
 
-📝 Etapa 5, Iteración 5.3 (Resumen General funcional, resto del Dashboard
-todavía NO completo): sobre la estructura base de la Iteración 5.2, se
-agregó `DashboardSummaryView` (vista aplanada por símbolo),
-`DashboardService.get_summary_view()` (incluye `latest_update_timestamp`
-calculado como el máximo entre mercado/indicadores/señal/IA), 5
-formatters nuevos, `theme.py` (paleta centralizada + `get_signal_color`/
-`get_risk_color`/`get_change_color`) y componentes de tarjeta/badge en
-`components.py`. La página "Resumen General" ya muestra precio, señal,
-score, recomendación de IA y disponibilidad de datos reales para los 3
-símbolos configurados. Las demás páginas siguen siendo esqueletos (sin
-gráficos históricos todavía, eso es una iteración futura). Pendiente tu
-auditoría antes de continuar.
+📝 Etapa 5, Iteración 5.4 (Resumen General y Mercado funcionales, resto
+del Dashboard todavía NO completo): la Iteración 5.3 agregó
+`DashboardSummaryView`, `DashboardService.get_summary_view()`, `theme.py`
+y los componentes de tarjeta/badge de "Resumen General". Esta iteración
+agregó, reutilizando lo anterior sin duplicarlo: `MarketSummaryView`/
+`MarketHistoryPoint`/`MarketPageView` (`models.py`),
+`DashboardService.get_market_page()` (una sola llamada a
+`get_market_history()` ya existente: sin métodos nuevos en
+`repository.py`), 3 formatters nuevos (`format_price_change`/
+`format_volume`/`format_record_count`) y 3 componentes nuevos
+(`render_market_metrics`/`render_market_availability`/
+`render_price_history_chart`, este último reutilizando
+`charts.line_chart()` ya existente desde la 5.2). La página "Mercado"
+(antes "Precios") ya muestra precio, variación, máximo/mínimo del
+período, volumen, fecha del último dato, cantidad de registros y un
+gráfico de historial de precio para el símbolo elegido, con su propio
+selector de vista responsive. Indicadores, Señales y Recomendaciones de
+IA siguen siendo esqueletos (sin gráficos históricos todavía, eso es una
+iteración futura). Pendiente tu auditoría antes de continuar.
 
 Pendiente: aprobación formal de la Etapa 4 antes de avanzar a cualquier
 etapa futura (Dashboard, Telegram, paper trading o trading automático, o

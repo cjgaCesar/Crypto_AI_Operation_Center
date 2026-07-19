@@ -132,3 +132,50 @@ class DashboardSummaryView(BaseModel):
     has_indicator_data: bool = False
     has_signal_data: bool = False
     has_ai_data: bool = False
+
+
+class MarketSummaryView(BaseModel):
+    """Resumen de mercado de un símbolo para la página 'Mercado' (Iteración
+    5.4): último precio, variación frente al registro anterior, máximo y
+    mínimo del período disponible (el mismo historial ya consultado, no
+    "de siempre"), volumen del último dato y cantidad de registros. Todos
+    los campos numéricos son cálculos simples sobre filas ya existentes de
+    'market_data' (no son indicadores técnicos): no se recalcula nada que
+    ya viva en market_indicators/market_signals/ai_recommendations."""
+
+    exchange: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+
+    latest_price: Optional[float] = None
+    previous_price: Optional[float] = None
+    absolute_change: Optional[float] = None
+    percentage_change: Optional[float] = None
+    period_high: Optional[float] = None
+    period_low: Optional[float] = None
+    latest_timestamp: Optional[datetime] = None
+    record_count: int = Field(ge=0, default=0)
+    volume: Optional[float] = None
+
+
+class MarketHistoryPoint(BaseModel):
+    """Un punto del historial de precio para el gráfico de la página
+    'Mercado': timestamp, precio y volumen de un registro de
+    'market_data', sin ningún cálculo adicional."""
+
+    timestamp: datetime
+    price: float
+    volume: float
+
+
+class MarketPageView(BaseModel):
+    """Todo lo que necesita la página 'Mercado' para un símbolo: los
+    símbolos configurados (para el selector), el símbolo elegido, el
+    resumen (None si todavía no hay datos), el historial de precio para
+    el gráfico, y un mensaje listo para mostrar cuando no hay datos."""
+
+    symbols: list[str] = Field(default_factory=list)
+    selected_symbol: str = Field(min_length=1)
+    summary: Optional[MarketSummaryView] = None
+    history: list[MarketHistoryPoint] = Field(default_factory=list)
+    data_available: bool = False
+    message: Optional[str] = None
