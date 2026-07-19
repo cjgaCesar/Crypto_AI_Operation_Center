@@ -254,11 +254,13 @@ cuando algo todavía no existe, y un resumen general (cuántos símbolos
 están configurados, cuántos tienen datos completos, cuándo se actualizó
 el sistema por última vez).
 
-La página incluye un selector **"Vista"** (Automática/Amplia/Compacta) en
-la barra lateral para controlar cuántas tarjetas se muestran por fila (3
-en Amplia, 2 en Automática, 1 apilada verticalmente en Compacta, para
-pantallas angostas) — la elección se guarda solo en la sesión del
-navegador (`st.session_state`), nunca en disco ni en `config.yaml`.
+Desde esta iteración, la página tiene **diseño responsive**: incluye un
+selector **"Vista"** con 3 modos (**Automática**, **Amplia**,
+**Compacta**) en la barra lateral, para controlar cuántas tarjetas se
+muestran por fila (3 en Amplia, 2 en Automática, 1 apilada verticalmente
+en Compacta, para pantallas angostas) — la elección se guarda solo en la
+sesión del navegador (`st.session_state`), nunca en disco ni en
+`config.yaml`.
 
 Las demás páginas (Precios, Indicadores, Señales, Recomendaciones de IA,
 Estado Técnico) siguen siendo esqueletos mínimos — su contenido completo

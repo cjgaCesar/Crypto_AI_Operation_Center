@@ -117,6 +117,33 @@ guardado únicamente en `st.session_state` (nunca en disco ni en
 - Ninguna tarjeta usa ancho/alto fijo, posiciones absolutas ni CSS con
   coordenadas: solo `st.container(border=True)`, `st.columns()` y
   `st.metric()`, que ya se adaptan al ancho disponible.
+- **Cero persistencia del modo de vista**: la selección vive solo en
+  `st.session_state` durante la sesión del navegador; nunca se escribe a
+  disco ni a `config.yaml`. Al recargar la página desde cero, vuelve a
+  "Automática".
+- **Cero detección de viewport mediante JavaScript**: no hay ningún
+  `components.html`, `streamlit-js-eval` ni script de terceros que lea el
+  ancho real de la ventana. El modo "Automática" es un valor conservador
+  fijo (2 tarjetas por fila), no una detección real de pantalla.
+- **Cero dependencias nuevas**: todo el diseño responsive se construyó
+  con lo que ya provee Streamlit (`st.container`, `st.columns`,
+  `st.metric`, sintaxis de markdown coloreado); no se agregó ningún
+  paquete a `requirements.txt` para esto.
+
+### Reglas obligatorias para páginas futuras (Precios/Indicadores/Señales/Recomendaciones)
+
+Cuando se implementen los gráficos históricos e indicadores de esas 4
+páginas (todavía esqueletos), deben ser **responsive desde el inicio**,
+no revisarse después:
+
+- Tablas con ancho del contenedor: `st.dataframe(..., use_container_width=True)`.
+- Gráficos con ancho del contenedor: Plotly con `use_container_width=True`.
+- Sin tamaños fijos en píxeles (ni ancho ni alto).
+- **Sin scroll horizontal**: ninguna tabla, gráfico o bloque de texto debe
+  forzarlo.
+- Detalle expandible en móvil (`st.expander`) cuando haya demasiada
+  información para mostrar de una vez, en vez de comprimir columnas hasta
+  volverlas ilegibles.
 
 ## Tecnología seleccionada: Streamlit
 
@@ -136,18 +163,20 @@ futuro sin reescribir la lógica de consulta:
 ```
 SQLite (4 repositorios ya existentes, solo lectura)
     ↓
-Repository    src/dashboard/repository.py   (DashboardRepository / SQLiteDashboardRepository)
+Repository        src/dashboard/repository.py   (DashboardRepository / SQLiteDashboardRepository)
     ↓
-Service       src/dashboard/service.py        (DashboardService: arma modelos de presentación)
+Service           src/dashboard/service.py        (DashboardService: arma modelos de presentación)
     ↓
-View Model    src/dashboard/models.py           (DashboardSummary, DashboardSummaryView, ...)
+View Model        src/dashboard/models.py           (DashboardSummary, DashboardSummaryView, ...)
     ↓
-Components    src/dashboard/components.py         (render_summary_card, render_status_badge, ...)
+Components/Layout src/dashboard/components.py + layout.py (tarjetas, insignias, grid responsive)
     ↓
-Page          src/dashboard/pages/*.py               (una página Streamlit por vista)
+Page              src/dashboard/pages/*.py               (una página Streamlit por vista)
     ↓
 Streamlit (renderiza en el navegador)
 ```
+
+Resumido: **Repository → Service → View Model → Components/Layout → Page**.
 
 - **`repository.py`** es la única pieza que sabe instanciar
   `SQLiteMarketDataRepository`, `SQLiteIndicatorRepository`,
@@ -297,19 +326,8 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
   página (ej. cada 30s), para reflejar nuevos ciclos del bot sin recargar
   manualmente.
 
-## Regla para tablas y gráficos futuros (Precios/Indicadores/Señales/Recomendaciones)
-
-Cuando se implementen los gráficos históricos e indicadores de esas 4
-páginas (todavía esqueletos), seguir esta regla para que sean responsive
-desde el primer commit, sin tener que revisarlos después:
-
-- Usar `st.dataframe(..., use_container_width=True)` para cualquier
-  tabla; evitar tablas estáticas en markdown.
-- Usar gráficos Plotly con `use_container_width=True`; evitar tamaños
-  fijos en píxeles.
-- Limitar columnas visibles en pantallas angostas; ofrecer detalle
-  expandible (`st.expander`) cuando haya demasiada información para
-  mostrar de una vez.
+(Ver "Reglas obligatorias para páginas futuras" en la sección de diseño
+responsive, más arriba, para la regla completa de tablas/gráficos.)
 
 ## Qué NO hace el Dashboard
 
