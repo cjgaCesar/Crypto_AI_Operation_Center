@@ -1,0 +1,9 @@
+# Librerías necesarias para el Crypto AI Operation Center
+# Instalar con: pip install -r requirements.txt
+
+requests==2.32.3      # Para hacer las consultas HTTP a la API pública de Binance
+PyYAML==6.0.2          # Para leer el archivo de configuración config/config.yaml
+schedule==1.2.2        # Para repetir la consulta automáticamente cada N minutos
+pytest==8.3.4          # Para ejecutar las pruebas automatizadas del proyecto
+pydantic==2.9.2        # Modelos de datos con validación (ej. MarketTicker)
+python-dotenv==1.0.1    # Para leer credenciales desde el archivo .env

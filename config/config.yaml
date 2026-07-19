@@ -1,0 +1,49 @@
+# Configuración del Crypto AI Operation Center
+#
+# Este archivo controla el comportamiento del bot SIN necesidad de tocar
+# el código en Python. Puedes editar estos valores con cualquier editor
+# de texto y guardarlos; el bot los leerá la próxima vez que se ejecute.
+#
+# Las credenciales y secretos (claves de API, tokens) NO van aquí: van en
+# el archivo .env (ver .env.example), que nunca se sube a git.
+
+# Lista de pares de monedas a consultar en la API pública de Binance.
+# Deben coincidir exactamente con el formato de Binance (mayúsculas, sin espacios).
+symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+
+# Cada cuántos minutos se repite la consulta automática.
+interval_minutes: 5
+
+# Límites de alerta. Por ahora solo se guardan como configuración
+# (Settings.alerts): el bot NO evalúa ni envía ninguna alerta todavía.
+# Esto se activará en una etapa futura (módulo src/alerts/).
+alerts:
+  # Si la variación % de 24h es menor o igual a este valor, en el futuro
+  # se podría considerar una caída importante.
+  price_change_percent_low: -5.0
+
+  # Si la variación % de 24h es mayor o igual a este valor, en el futuro
+  # se podría considerar una subida importante.
+  price_change_percent_high: 5.0
+
+# Configuración de la base de datos.
+database:
+  # Motor actual: "sqlite" (base de datos de desarrollo, un solo archivo).
+  # En una etapa futura podrá cambiarse a "postgres" (ver
+  # src/database/postgres_repository.py), usando la variable de entorno
+  # DATABASE_URL definida en .env.
+  engine: sqlite
+  sqlite_path: data/crypto_data.db
+
+# Configuración de logs.
+logging:
+  path: logs/app.log
+  level: INFO   # Opciones típicas: DEBUG, INFO, WARNING, ERROR
+
+# Configuración del exchange Binance (API pública, no requiere claves ni cuenta).
+binance:
+  base_url: https://api.binance.com
+  timeout_seconds: 10

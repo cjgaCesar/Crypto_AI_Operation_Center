@@ -1,0 +1,17 @@
+# Entorno virtual
+venv/
+
+# Credenciales y secretos (basado en .env.example, nunca subir el real)
+.env
+
+# Archivos generados por el bot (no deben subirse al control de versiones)
+data/*.db
+logs/*.log
+
+# Archivos de Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Configuración local del editor
+.vscode/
