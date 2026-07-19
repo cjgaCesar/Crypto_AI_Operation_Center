@@ -29,11 +29,11 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   factores positivos/negativos), persistida en una tabla independiente.
   Hoy usa un proveedor simulado (`DummyProvider`); OpenAI/Claude quedan
   preparados pero sin conectar. Ver [docs/ALCANCE_ETAPA_4.md](docs/ALCANCE_ETAPA_4.md).
-- 📝 **Etapa 5 (en desarrollo, Iteración 5.2 — estructura base, todavía
-  no completa)** — Dashboard de solo lectura (Streamlit) sobre las 4
-  tablas ya generadas por las Etapas 1 a 4. Ver
-  [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
-  [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
+- 📝 **Etapa 5 (en desarrollo, Iteración 5.3 — Resumen General
+  funcional, el resto del Dashboard todavía no está completo)** —
+  Dashboard de solo lectura (Streamlit) sobre las 4 tablas ya generadas
+  por las Etapas 1 a 4. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md)
+  y [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
 
 ## Qué hace el bot hoy
 
@@ -228,26 +228,40 @@ historial (ej. la EMA lenta, que por defecto usa 200 lecturas) no van a
 tener valor todavía en los primeros ciclos — es normal, y se completan
 solos a medida que se acumulan datos.
 
-## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.2 — estructura base)
+## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.3 — Resumen General funcional)
+
+Instalar dependencias (incluye `streamlit`/`plotly`, ya en `requirements.txt`):
+
+```bash
+pip install -r requirements.txt
+```
+
+Ejecutar:
 
 ```bash
 streamlit run src/dashboard/app.py
 ```
 
-**Estado actual: estructura base, el Dashboard todavía NO está completo.**
-Esta iteración solo entrega la arquitectura funcionando (repositorio de
-solo lectura, servicio, configuración, navegación y una página por vista),
-con esqueletos mínimos por página — no gráficos históricos completos, no
-comparación entre símbolos, no auto-refresh real, no diseño visual
-definitivo (eso es la Iteración 5.3). En particular, la página **Resumen
-General** hoy solo lista los símbolos configurados: las tarjetas KPI por
-símbolo (precio, señal y recomendación de IA más recientes) se desarrollan
-en la Iteración 5.3. El Dashboard es de **solo lectura**:
-nunca escribe en `data/crypto_data.db`, no recalcula indicadores ni
-señales, no genera recomendaciones de IA ni se conecta a Binance
-directamente — solo lee lo que `python -m src.main` ya guardó. Si la base
-de datos todavía no existe, lo indica en la barra lateral en vez de
-crearla. Ver [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
+**Estado actual: la página "Resumen General" ya es funcional; el resto del
+Dashboard todavía NO está completo.** La Iteración 5.3 convirtió esa
+página en la primera realmente útil: muestra, para cada símbolo
+configurado (`BTCUSDT`/`ETHUSDT`/`SOLUSDT`), una tarjeta con precio,
+variación 24h, señal más reciente, score, confianza de la señal,
+recomendación de IA, confianza de IA, nivel de riesgo, última
+actualización relativa ("Hace 5 min") y qué tablas tienen datos
+disponibles — todo con valores "N/D" cuando algo todavía no existe, y un
+resumen general (cuántos símbolos están configurados, cuántos tienen
+datos completos, cuándo se actualizó el sistema por última vez). Las
+demás páginas (Precios, Indicadores, Señales, Recomendaciones de IA,
+Estado Técnico) siguen siendo esqueletos mínimos — su contenido completo
+(gráficos históricos, comparaciones) queda para una iteración futura.
+
+El Dashboard es de **solo lectura**: nunca escribe en
+`data/crypto_data.db`, no recalcula indicadores ni señales, no genera
+recomendaciones de IA ni se conecta a Binance directamente — solo lee lo
+que `python -m src.main` ya guardó. Si la base de datos todavía no existe,
+lo indica en la barra lateral en vez de crearla. Ver
+[docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
 
 ## Cómo ejecutar las pruebas
 
@@ -306,14 +320,18 @@ AIRecommendation` —, proveedor simulado `DummyProvider` conectado
 (OpenAI/Claude preparados, sin conectar), tabla independiente
 `ai_recommendations`. Pendiente de tu revisión y aprobación formal.
 
-📝 Etapa 5, Iteración 5.2 (estructura base, Dashboard todavía NO completo):
-`src/dashboard/` con `DashboardRepository`/`SQLiteDashboardRepository`
-(solo lectura), `DashboardService`, modelos de presentación
-(`DashboardSummary`, etc.), configuración propia, helpers
-(`filters`/`formatters`/`charts`/`components`), `app.py` con navegación
-lateral y 6 páginas esqueleto (Resumen, Precios, Indicadores, Señales,
-Recomendaciones de IA, Estado Técnico). Sin gráficos históricos completos
-todavía (Iteración 5.3). Pendiente tu auditoría antes de continuar.
+📝 Etapa 5, Iteración 5.3 (Resumen General funcional, resto del Dashboard
+todavía NO completo): sobre la estructura base de la Iteración 5.2, se
+agregó `DashboardSummaryView` (vista aplanada por símbolo),
+`DashboardService.get_summary_view()` (incluye `latest_update_timestamp`
+calculado como el máximo entre mercado/indicadores/señal/IA), 5
+formatters nuevos, `theme.py` (paleta centralizada + `get_signal_color`/
+`get_risk_color`/`get_change_color`) y componentes de tarjeta/badge en
+`components.py`. La página "Resumen General" ya muestra precio, señal,
+score, recomendación de IA y disponibilidad de datos reales para los 3
+símbolos configurados. Las demás páginas siguen siendo esqueletos (sin
+gráficos históricos todavía, eso es una iteración futura). Pendiente tu
+auditoría antes de continuar.
 
 Pendiente: aprobación formal de la Etapa 4 antes de avanzar a cualquier
 etapa futura (Dashboard, Telegram, paper trading o trading automático, o

@@ -1,10 +1,11 @@
 # Arquitectura del Dashboard (Etapa 5)
 
 > Diseño original de la Iteración 5.1, actualizado en la Iteración 5.2 con
-> la estructura de módulos realmente implementada (ver "Nota de
-> implementación" más abajo). El Dashboard tiene su estructura base
-> funcionando, pero **todavía no está completo**: las páginas son
-> esqueletos mínimos (ver `docs/ALCANCE_ETAPA_5.md`).
+> la estructura de módulos realmente implementada, y en la Iteración 5.3
+> con la primera página funcional (ver "Nota de implementación" e
+> "Iteración 5.3" más abajo). La página "Resumen General" ya es funcional;
+> el resto del Dashboard **todavía no está completo**: las demás páginas
+> siguen siendo esqueletos mínimos (ver `docs/ALCANCE_ETAPA_5.md`).
 
 ## Nota de implementación (Iteración 5.2)
 
@@ -35,6 +36,42 @@ El principio de fondo (consulta separada de presentación, migrable a una
 futura API sin reescribirse) **no cambió**: sigue siendo válido reemplazar
 "`data_access.py`" por "`repository.py` + `service.py`" en el diagrama de
 abajo.
+
+## Nota de implementación (Iteración 5.3)
+
+Se agregaron 2 piezas nuevas, sin romper el principio de diseño:
+
+- **`DashboardSummaryView`** (`models.py`): vista aplanada de
+  `DashboardSummary` para la página "Resumen General". `DashboardSummary`
+  anida los 4 modelos completos (`summary.signal.signal.score`);
+  `DashboardSummaryView` expone directamente los campos puntuales que una
+  tarjeta necesita (`price`, `signal_type`, `signal_score`,
+  `ai_recommendation`, etc.), reutilizando los mismos Enums de dominio
+  (`SignalType`, `ConfidenceLevel`, `RecommendationAction`, `RiskLevel`)
+  sin duplicarlos, más 4 banderas `has_*_data` y un
+  `latest_update_timestamp` (el máximo entre los timestamps de mercado,
+  indicadores, señal e IA — `None` si ninguno existe todavía).
+- **`DashboardService.get_summary_view()`**: reutiliza `get_summary()` tal
+  cual (mismas llamadas al repositorio, ninguna adicional) y solo
+  transforma cada `DashboardSummary` ya obtenido en un
+  `DashboardSummaryView`, sin volver a consultar nada.
+- **`theme.py`** (nuevo): centraliza la paleta de colores del Dashboard
+  (fondo, panel, borde, texto, positivo/negativo/advertencia/información/
+  acento/IA/neutral) y 3 funciones puras (`get_signal_color`,
+  `get_risk_color`, `get_change_color`) que devuelven siempre un color
+  válido (`COLOR_NEUTRAL` para valores desconocidos o `None`, nunca una
+  excepción). Ninguna función de `formatters.py` asigna color: eso vive
+  exclusivamente en `theme.py`, a propósito, para no mezclar formato de
+  texto con presentación visual.
+- **`components.py`** ganó 4 helpers nuevos: `render_section_header`,
+  `render_status_badge` (insignia con color de fondo, usada para señal/
+  riesgo/recomendación de IA/variación 24h), `render_data_availability`
+  (fila ✅/❌ de las 4 tablas) y `render_summary_card` (la tarjeta completa
+  de un símbolo, combinando todo lo anterior).
+- **`formatters.py`** ganó 5 funciones nuevas: `format_price_compact`,
+  `format_confidence`, `format_score`, `format_risk_level` y
+  `format_relative_status` (esta última acepta un `reference` explícito,
+  para que las pruebas sean deterministas sin depender del reloj real).
 
 ## Tecnología seleccionada: Streamlit
 
@@ -76,28 +113,36 @@ Streamlit (renderiza en el navegador)
   Streamlit. Ni los repositorios ni `repository.py`/`service.py`
   cambiarían.
 
-## Estructura de módulos (implementada en la Iteración 5.2)
+## Estructura de módulos (base en la Iteración 5.2, ampliada en la 5.3)
 
 ```
 src/dashboard/
 ├── __init__.py
 ├── app.py                  # Punto de entrada: streamlit run src/dashboard/app.py
 ├── config.py                 # DashboardConfig + build_dashboard_config()
-├── models.py                   # TableStatus, DashboardStatus, Latest*Snapshot, DashboardSummary
+├── models.py                   # TableStatus, DashboardStatus, Latest*Snapshot,
+│                                # DashboardSummary, DashboardSummaryView (5.3)
 ├── repository.py                 # DashboardRepository (interfaz) + SQLiteDashboardRepository
-├── service.py                      # DashboardService
+├── service.py                      # DashboardService (+ get_summary_view(), 5.3)
 ├── filters.py                        # normalize_symbol/normalize_exchange/validate_limit
-├── formatters.py                       # format_price/format_percent/format_timestamp/format_enum
-├── charts.py                             # empty_figure/line_chart (mínimos; completos en 5.3)
-├── components.py                           # render_not_available/render_kpi_card
-└── pages/                                    # Una página por vista (esqueletos en 5.2)
+├── formatters.py                       # format_price/percent/timestamp/enum +
+│                                        # format_price_compact/confidence/score/
+│                                        # risk_level/relative_status (5.3)
+├── theme.py                              # Paleta + get_signal_color/get_risk_color/
+│                                         # get_change_color (nuevo, 5.3)
+├── charts.py                             # empty_figure/line_chart (mínimos; gráficos
+│                                         # históricos completos en una iteración futura)
+├── components.py                           # render_not_available/render_kpi_card +
+│                                           # render_section_header/render_status_badge/
+│                                           # render_data_availability/render_summary_card (5.3)
+└── pages/                                    # Una página por vista
     ├── __init__.py
-    ├── resumen.py
-    ├── mercado.py
-    ├── indicadores.py
-    ├── senales.py
-    ├── recomendaciones.py
-    └── estado_tecnico.py
+    ├── resumen.py                             # Funcional desde 5.3 (tarjetas por símbolo)
+    ├── mercado.py                             # Esqueleto
+    ├── indicadores.py                         # Esqueleto
+    ├── senales.py                             # Esqueleto
+    ├── recomendaciones.py                     # Esqueleto
+    └── estado_tecnico.py                      # Funcional desde 5.2
 ```
 
 No se usa la convención automática de nombres numerados de páginas de
@@ -113,30 +158,39 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 > `indicadores.py`), y "Configuración" se reemplazó por "Estado Técnico"
 > (`estado_tecnico.py`), que resultó más útil para diagnosticar el estado
 > de las 4 tablas SQLite (existe/vacía/con datos) que una vista de solo
-> lectura de `config.yaml`. En la Iteración 5.2 las 6 páginas son
+> lectura de `config.yaml`. En la Iteración 5.2 las 6 páginas eran
 > esqueletos mínimos (título + un dato simple + manejo de ausencia de
-> datos); el contenido completo de cada una es la Iteración 5.3.
+> datos). En la Iteración 5.3, "Resumen General" se completó; las otras 4
+> páginas de símbolo (Precios/Indicadores/Señales/Recomendaciones) siguen
+> como esqueletos, pendientes de una iteración futura.
 
-1. **Resumen General** (`resumen.py`): en 5.3, una tarjeta KPI por símbolo
-   configurado (precio actual, variación 24h, `signal_type` más reciente,
-   `recommendation` de IA más reciente con su `confidence`). En 5.2, solo
-   lista los símbolos configurados.
-2. **Precios** (`mercado.py`): en 5.3, gráfico de precio histórico
-   (`market_data`) superpuesto con SMA/EMA. En 5.2, solo el último precio.
-3. **Indicadores** (`indicadores.py`): en 5.3, gráficos de RSI, MACD y
-   Bandas de Bollinger (`market_indicators`). En 5.2, solo el RSI más
-   reciente.
-4. **Señales** (`senales.py`): en 5.3, historial de
+1. **Resumen General** (`resumen.py`) — **funcional desde la Iteración
+   5.3**: una tarjeta por símbolo configurado (`DashboardService.get_summary_view()`)
+   con precio, variación 24h, señal más reciente (`signal_type`, `score`,
+   `confidence`), recomendación de IA (`recommendation`, `confidence`,
+   `risk_level`), última actualización relativa y disponibilidad de datos
+   (mercado/indicadores/señales/IA), además de un resumen general (símbolos
+   configurados, símbolos con datos completos, última actualización del
+   sistema) y 4 estados vacíos distintos (base inexistente, sin precios,
+   precios sin señales, señales sin IA).
+2. **Precios** (`mercado.py`) — esqueleto: hoy solo el último precio. En
+   una iteración futura, gráfico de precio histórico (`market_data`)
+   superpuesto con SMA/EMA.
+3. **Indicadores** (`indicadores.py`) — esqueleto: hoy solo el RSI más
+   reciente. En una iteración futura, gráficos de RSI, MACD y Bandas de
+   Bollinger (`market_indicators`).
+4. **Señales** (`senales.py`) — esqueleto: hoy solo `signal_type`/`score`
+   más recientes. En una iteración futura, historial de
    `score`/`confidence`/`signal_type` en el tiempo, y el detalle completo
    de la señal más reciente (`trend`/`ema_signal`/`macd_signal`/
    `rsi_signal`/`bollinger_signal` con su `reason` y `rule_strength`
-   individuales). En 5.2, solo `signal_type`/`score` más recientes.
-5. **Recomendaciones de IA** (`recomendaciones.py`): en 5.3, historial de
-   `recommendation`/`confidence`/`risk_level` en el tiempo, y el detalle
-   completo de la recomendación más reciente (`reasoning`, `advantages`,
-   `risks`, `summary`, `provider`/`model`/`prompt_version`,
-   `processing_time_ms`). En 5.2, solo `recommendation`/`confidence` más
-   recientes.
+   individuales).
+5. **Recomendaciones de IA** (`recomendaciones.py`) — esqueleto: hoy solo
+   `recommendation`/`confidence` más recientes. En una iteración futura,
+   historial de `recommendation`/`confidence`/`risk_level` en el tiempo, y
+   el detalle completo de la recomendación más reciente (`reasoning`,
+   `advantages`, `risks`, `summary`, `provider`/`model`/`prompt_version`,
+   `processing_time_ms`).
 6. **Estado Técnico** (`estado_tecnico.py`): estado de las 4 tablas SQLite
    (existe, cuántas filas, registro más reciente). Ya queda completamente
    funcional desde la Iteración 5.2, porque no depende de gráficos ni de
@@ -144,12 +198,21 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 
 ## Componentes reutilizables
 
-- **Tarjeta KPI**: valor principal + variación/estado, usada en Resumen
-  General y en la cabecera de las demás páginas.
-- **Gráfico de serie temporal**: envoltura común para precio/indicadores/
-  score/confidence a lo largo del tiempo (misma función, distintos datos).
+- **`render_kpi_card`**: valor principal + etiqueta (envuelve `st.metric`).
+- **`render_status_badge`** (5.3): insignia de una línea con color de
+  fondo controlado por `theme.py` (señal, riesgo, recomendación de IA,
+  variación 24h).
+- **`render_data_availability`** (5.3): fila ✅/❌ de las 4 tablas
+  (mercado/indicadores/señales/IA) para un símbolo.
+- **`render_section_header`** (5.3): encabezado de sección reutilizable.
+- **`render_summary_card`** (5.3): la tarjeta completa de un símbolo en
+  "Resumen General", combinando los 4 componentes anteriores.
+- **Gráfico de serie temporal** (`charts.line_chart`): envoltura común
+  para precio/indicadores/score/confidence a lo largo del tiempo —
+  todavía sin usar en ninguna página (pendiente de una iteración futura).
 - **Bloque de razones**: lista de `reason`/`rule_strength` o
-  `advantages`/`risks`, reutilizado en Señales y Recomendaciones de IA.
+  `advantages`/`risks` — pendiente de una iteración futura (Señales y
+  Recomendaciones de IA todavía son esqueletos).
 
 ## Filtros globales
 
@@ -176,8 +239,20 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
   repositorios ya exponen exactamente los métodos de lectura
   (`fetch_latest`/`fetch_history`) que el Dashboard necesita.
 
-## Dependencias que se agregarán en la Iteración 5.2 (no en esta)
+## Dependencias
 
-`streamlit` y, si se decide usar una librería de gráficos más rica que la
-nativa de Streamlit, `plotly` (ambas Python puro, sin servicios
-adicionales). Ninguna se agrega a `requirements.txt` todavía.
+`streamlit` y `plotly` (ambas Python puro, sin servicios adicionales),
+agregadas a `requirements.txt` desde la Iteración 5.2. La Iteración 5.3 no
+agregó ninguna dependencia nueva.
+
+## Estado por iteración
+
+- **5.1** (diseño): alcance y arquitectura documentados, sin código.
+- **5.2** (estructura base): repositorio/servicio/config/helpers/`app.py`
+  funcionando, 6 páginas esqueleto.
+- **5.3** (esta): página "Resumen General" funcional
+  (`DashboardSummaryView`, `get_summary_view()`, `theme.py`, tarjetas de
+  resumen). Las otras 4 páginas de símbolo siguen siendo esqueletos.
+- **Pendiente**: gráficos históricos completos, auto-refresh real,
+  comparación entre símbolos, diseño visual definitivo de toda la
+  aplicación.

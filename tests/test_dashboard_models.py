@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
+from src.ai.recommendation import RecommendationAction, RiskLevel
 from src.dashboard.models import (
     DashboardStatus,
     DashboardSummary,
+    DashboardSummaryView,
     LatestAIRecommendationSnapshot,
     LatestIndicatorSnapshot,
     LatestMarketSnapshot,
@@ -15,6 +17,7 @@ from src.dashboard.models import (
     TableStatus,
 )
 from src.models.market_data import MarketTicker
+from src.signals.enums import ConfidenceLevel, SignalType
 
 
 def _ticker() -> MarketTicker:
@@ -115,3 +118,70 @@ class TestDashboardSummary:
         )
         assert summary.market.ticker is not None
         assert summary.indicators.indicators is None
+
+
+class TestDashboardSummaryView:
+    def test_builds_with_all_fields_present(self):
+        now = datetime.now(timezone.utc)
+        view = DashboardSummaryView(
+            exchange="Binance", symbol="BTCUSDT",
+            price=100.0, price_change_percent_24h=1.5, market_timestamp=now,
+            signal_type=SignalType.BULLISH, signal_score=70.0,
+            signal_confidence=ConfidenceLevel.MEDIUM, signal_timestamp=now,
+            ai_recommendation=RecommendationAction.BUY, ai_confidence=60.0,
+            ai_risk_level=RiskLevel.MEDIUM, ai_timestamp=now,
+            latest_update_timestamp=now,
+            has_market_data=True, has_indicator_data=False,
+            has_signal_data=True, has_ai_data=True,
+        )
+        assert view.price == 100.0
+        assert view.signal_type == SignalType.BULLISH
+        assert view.ai_recommendation == RecommendationAction.BUY
+        assert view.has_indicator_data is False
+
+    def test_builds_with_all_optional_fields_none(self):
+        view = DashboardSummaryView(exchange="Binance", symbol="BTCUSDT")
+
+        assert view.price is None
+        assert view.price_change_percent_24h is None
+        assert view.market_timestamp is None
+        assert view.signal_type is None
+        assert view.signal_score is None
+        assert view.signal_confidence is None
+        assert view.signal_timestamp is None
+        assert view.ai_recommendation is None
+        assert view.ai_confidence is None
+        assert view.ai_risk_level is None
+        assert view.ai_timestamp is None
+        assert view.latest_update_timestamp is None
+        assert view.has_market_data is False
+        assert view.has_indicator_data is False
+        assert view.has_signal_data is False
+        assert view.has_ai_data is False
+
+    def test_rejects_empty_symbol(self):
+        with pytest.raises(ValidationError):
+            DashboardSummaryView(exchange="Binance", symbol="")
+
+    def test_rejects_empty_exchange(self):
+        with pytest.raises(ValidationError):
+            DashboardSummaryView(exchange="", symbol="BTCUSDT")
+
+    @pytest.mark.parametrize("score", [-0.01, 100.01, -50.0, 200.0])
+    def test_rejects_signal_score_outside_valid_range(self, score):
+        with pytest.raises(ValidationError):
+            DashboardSummaryView(exchange="Binance", symbol="BTCUSDT", signal_score=score)
+
+    @pytest.mark.parametrize("confidence", [-0.01, 100.01])
+    def test_rejects_ai_confidence_outside_valid_range(self, confidence):
+        with pytest.raises(ValidationError):
+            DashboardSummaryView(exchange="Binance", symbol="BTCUSDT", ai_confidence=confidence)
+
+    def test_coerces_plain_string_enums(self):
+        view = DashboardSummaryView(
+            exchange="Binance", symbol="BTCUSDT",
+            signal_type="Bullish", ai_recommendation="Buy", ai_risk_level="Medium",
+        )
+        assert view.signal_type == SignalType.BULLISH
+        assert view.ai_recommendation == RecommendationAction.BUY
+        assert view.ai_risk_level == RiskLevel.MEDIUM

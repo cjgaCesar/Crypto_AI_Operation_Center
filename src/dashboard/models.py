@@ -16,10 +16,11 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from src.ai.recommendation import AIRecommendation
+from src.ai.recommendation import AIRecommendation, RecommendationAction, RiskLevel
 from src.models.indicator_data import IndicatorSnapshot
 from src.models.market_data import MarketTicker
 from src.models.signal_data import SignalSnapshot
+from src.signals.enums import ConfidenceLevel, SignalType
 
 
 class TableStatus(BaseModel):
@@ -90,3 +91,44 @@ class DashboardSummary(BaseModel):
     indicators: LatestIndicatorSnapshot
     signal: LatestSignalSnapshot
     ai_recommendation: LatestAIRecommendationSnapshot
+
+
+class DashboardSummaryView(BaseModel):
+    """Vista aplanada de un símbolo para la página 'Resumen General'.
+
+    A diferencia de DashboardSummary (que anida los 4 modelos completos),
+    esta vista expone directamente los campos puntuales que la tarjeta de
+    resumen necesita mostrar (precio, señal, recomendación de IA...), para
+    que la página no tenga que navegar 'summary.signal.signal.score' —
+    pero sin duplicar los modelos de dominio: los tipos de cada campo
+    (SignalType, ConfidenceLevel, RecommendationAction, RiskLevel) son los
+    mismos Enums que ya usan SignalSnapshot/AIRecommendation, no copias.
+
+    Todos los campos que dependen de una tabla que puede no tener datos
+    todavía son Optional (None = "todavía no hay ese dato"), y los 4
+    'has_*_data' dejan explícito qué tabla sí/no tiene datos, sin que la
+    página deba inferirlo revisando si un campo es None."""
+
+    exchange: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+
+    price: Optional[float] = None
+    price_change_percent_24h: Optional[float] = None
+    market_timestamp: Optional[datetime] = None
+
+    signal_type: Optional[SignalType] = None
+    signal_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    signal_confidence: Optional[ConfidenceLevel] = None
+    signal_timestamp: Optional[datetime] = None
+
+    ai_recommendation: Optional[RecommendationAction] = None
+    ai_confidence: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    ai_risk_level: Optional[RiskLevel] = None
+    ai_timestamp: Optional[datetime] = None
+
+    latest_update_timestamp: Optional[datetime] = None
+
+    has_market_data: bool = False
+    has_indicator_data: bool = False
+    has_signal_data: bool = False
+    has_ai_data: bool = False

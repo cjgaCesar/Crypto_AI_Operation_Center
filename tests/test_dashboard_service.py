@@ -36,6 +36,7 @@ class FakeDashboardRepository(DashboardRepository):
         self.ai_history = {}
         self.raise_on_table_status = False
         self.raise_on_latest_market = False
+        self.call_counts = {"market": 0, "indicators": 0, "signal": 0, "ai": 0}
 
     def get_available_symbols(self):
         return self.symbols
@@ -46,17 +47,21 @@ class FakeDashboardRepository(DashboardRepository):
         return self.status
 
     def get_latest_market(self, exchange, symbol):
+        self.call_counts["market"] += 1
         if self.raise_on_latest_market:
             raise RuntimeError("fallo simulado del repositorio")
         return self.latest_market.get((exchange, symbol))
 
     def get_latest_indicators(self, exchange, symbol):
+        self.call_counts["indicators"] += 1
         return self.latest_indicators.get((exchange, symbol))
 
     def get_latest_signal(self, exchange, symbol):
+        self.call_counts["signal"] += 1
         return self.latest_signal.get((exchange, symbol))
 
     def get_latest_ai_recommendation(self, exchange, symbol):
+        self.call_counts["ai"] += 1
         return self.latest_ai.get((exchange, symbol))
 
     def get_market_history(self, exchange, symbol, limit):
@@ -218,3 +223,147 @@ def test_repository_exception_on_latest_market_is_handled_gracefully():
     summary = service.get_symbol_summary("Binance", "BTCUSDT")
 
     assert summary.market.ticker is None
+
+
+class TestGetSummaryView:
+    def test_returns_one_view_per_configured_symbol(self):
+        service = _service()
+        views = service.get_summary_view()
+
+        assert [v.symbol for v in views] == ["BTCUSDT", "ETHUSDT"]
+
+    def test_view_includes_flattened_market_and_signal_fields(self):
+        repository = FakeDashboardRepository()
+        repository.latest_market[("Binance", "BTCUSDT")] = _ticker("BTCUSDT")
+        repository.latest_signal[("Binance", "BTCUSDT")] = _signal("BTCUSDT")
+        service = _service(repository)
+
+        view = service.get_summary_view()[0]
+
+        assert view.price == 100.0
+        assert view.signal_type == SignalType.BULLISH
+        assert view.signal_score == 70.0
+        assert view.signal_confidence == ConfidenceLevel.MEDIUM
+        assert view.has_market_data is True
+        assert view.has_signal_data is True
+        assert view.has_indicator_data is False
+        assert view.has_ai_data is False
+
+    def test_view_includes_ai_fields_when_available(self):
+        repository = FakeDashboardRepository()
+        repository.latest_ai[("Binance", "BTCUSDT")] = _recommendation("BTCUSDT")
+        service = _service(repository)
+
+        view = service.get_summary_view()[0]
+
+        assert view.ai_recommendation == RecommendationAction.BUY
+        assert view.ai_confidence == 60.0
+        assert view.ai_risk_level == RiskLevel.MEDIUM
+        assert view.has_ai_data is True
+
+    def test_latest_update_timestamp_is_the_maximum_of_the_four_sources(self):
+        oldest = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        newest = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        middle = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+        repository = FakeDashboardRepository()
+        repository.latest_market[("Binance", "BTCUSDT")] = MarketTicker(
+            exchange="Binance", symbol="BTCUSDT", price=100.0, volume_24h=1.0,
+            price_change_percent_24h=1.0, queried_at=oldest,
+        )
+        repository.latest_signal[("Binance", "BTCUSDT")] = SignalSnapshot(
+            exchange="Binance", symbol="BTCUSDT",
+            trend=TrendLabel.BULLISH, trend_strength=TrendStrength.MEDIUM,
+            ema_signal=EMALabel.BULLISH, macd_signal=MACDLabel.NEUTRAL,
+            rsi_signal=RSILabel.NEUTRAL, bollinger_signal=BollingerLabel.INSIDE_BANDS,
+            trend_reason="r", ema_reason="r", macd_reason="r", rsi_reason="r", bollinger_reason="r",
+            trend_rule_strength=0.5, ema_rule_strength=0.5, macd_rule_strength=0.0,
+            rsi_rule_strength=0.0, bollinger_rule_strength=0.0,
+            score=70.0, confidence=ConfidenceLevel.MEDIUM, signal_type=SignalType.BULLISH,
+            generated_at=middle,
+        )
+        repository.latest_ai[("Binance", "BTCUSDT")] = AIRecommendation(
+            exchange="Binance", symbol="BTCUSDT", timestamp=newest,
+            recommendation=RecommendationAction.BUY, confidence=60.0, risk_level=RiskLevel.MEDIUM,
+            reasoning="r", advantages=["a"], risks=["b"], summary="s",
+            provider="DummyProvider", model="dummy-v1", prompt_version="v1",
+            processing_time_ms=1.0, raw_response=None,
+        )
+        service = _service(repository)
+
+        view = service.get_summary_view()[0]
+
+        assert view.latest_update_timestamp == newest
+
+    def test_latest_update_timestamp_is_none_without_any_data(self):
+        service = _service()
+        view = service.get_summary_view()[0]
+
+        assert view.latest_update_timestamp is None
+
+    def test_market_available_without_signal(self):
+        repository = FakeDashboardRepository()
+        repository.latest_market[("Binance", "BTCUSDT")] = _ticker("BTCUSDT")
+        service = _service(repository)
+
+        view = service.get_summary_view()[0]
+
+        assert view.has_market_data is True
+        assert view.has_signal_data is False
+        assert view.signal_type is None
+
+    def test_signal_available_without_ai(self):
+        repository = FakeDashboardRepository()
+        repository.latest_signal[("Binance", "BTCUSDT")] = _signal("BTCUSDT")
+        service = _service(repository)
+
+        view = service.get_summary_view()[0]
+
+        assert view.has_signal_data is True
+        assert view.has_ai_data is False
+        assert view.ai_recommendation is None
+
+    def test_view_is_isolated_by_symbol(self):
+        repository = FakeDashboardRepository()
+        repository.latest_market[("Binance", "BTCUSDT")] = _ticker("BTCUSDT", )
+        repository.latest_market[("Binance", "ETHUSDT")] = MarketTicker(
+            exchange="Binance", symbol="ETHUSDT", price=2000.0, volume_24h=1.0,
+            price_change_percent_24h=1.0, queried_at=datetime.now(timezone.utc),
+        )
+        service = _service(repository)
+
+        views = service.get_summary_view()
+
+        assert views[0].symbol == "BTCUSDT" and views[0].price == 100.0
+        assert views[1].symbol == "ETHUSDT" and views[1].price == 2000.0
+
+    def test_view_is_isolated_by_exchange(self):
+        repository = FakeDashboardRepository()
+        repository.latest_market[("Binance", "BTCUSDT")] = _ticker("BTCUSDT")
+        repository.latest_market[("OtroExchange", "BTCUSDT")] = MarketTicker(
+            exchange="OtroExchange", symbol="BTCUSDT", price=999.0, volume_24h=1.0,
+            price_change_percent_24h=1.0, queried_at=datetime.now(timezone.utc),
+        )
+        service = DashboardService(
+            repository=repository, exchange="Binance", symbols=["BTCUSDT"],
+            default_history_limit=100, max_history_limit=1000,
+        )
+
+        view = service.get_summary_view(exchange="Binance")[0]
+        assert view.price == 100.0
+
+        other_view = service.get_summary_view(exchange="OtroExchange")[0]
+        assert other_view.price == 999.0
+
+    def test_does_not_call_repository_more_times_than_necessary(self):
+        repository = FakeDashboardRepository()
+        service = DashboardService(
+            repository=repository, exchange="Binance", symbols=["BTCUSDT", "ETHUSDT"],
+            default_history_limit=100, max_history_limit=1000,
+        )
+
+        service.get_summary_view()
+
+        # Exactamente 1 llamada por símbolo a cada una de las 4 fuentes
+        # (2 símbolos configurados): ninguna llamada repetida ni de más.
+        assert repository.call_counts == {"market": 2, "indicators": 2, "signal": 2, "ai": 2}

@@ -32,6 +32,7 @@ from src.dashboard.filters import normalize_exchange, normalize_symbol, validate
 from src.dashboard.models import (
     DashboardStatus,
     DashboardSummary,
+    DashboardSummaryView,
     LatestAIRecommendationSnapshot,
     LatestIndicatorSnapshot,
     LatestMarketSnapshot,
@@ -105,6 +106,53 @@ class DashboardService:
                     lambda: self.repository.get_latest_ai_recommendation(exchange, symbol)
                 ),
             ),
+        )
+
+    def get_summary_view(self, exchange: Optional[str] = None) -> list[DashboardSummaryView]:
+        """Vista aplanada de get_summary(), una por símbolo configurado,
+        lista para la página 'Resumen General'. Reutiliza get_summary()
+        tal cual (mismas 4 llamadas al repositorio por símbolo, ninguna
+        adicional): solo transforma lo ya obtenido, sin volver a
+        consultar nada ni recalcular indicadores/señales/IA."""
+        return [self._to_summary_view(summary) for summary in self.get_summary(exchange=exchange)]
+
+    @staticmethod
+    def _to_summary_view(summary: DashboardSummary) -> DashboardSummaryView:
+        ticker = summary.market.ticker
+        indicators = summary.indicators.indicators
+        signal = summary.signal.signal
+        recommendation = summary.ai_recommendation.recommendation
+
+        market_timestamp = ticker.queried_at if ticker else None
+        indicator_timestamp = indicators.calculated_at if indicators else None
+        signal_timestamp = signal.generated_at if signal else None
+        ai_timestamp = recommendation.timestamp if recommendation else None
+
+        timestamps = [
+            t for t in (market_timestamp, indicator_timestamp, signal_timestamp, ai_timestamp)
+            if t is not None
+        ]
+        latest_update_timestamp = max(timestamps) if timestamps else None
+
+        return DashboardSummaryView(
+            exchange=summary.exchange,
+            symbol=summary.symbol,
+            price=ticker.price if ticker else None,
+            price_change_percent_24h=ticker.price_change_percent_24h if ticker else None,
+            market_timestamp=market_timestamp,
+            signal_type=signal.signal_type if signal else None,
+            signal_score=signal.score if signal else None,
+            signal_confidence=signal.confidence if signal else None,
+            signal_timestamp=signal_timestamp,
+            ai_recommendation=recommendation.recommendation if recommendation else None,
+            ai_confidence=recommendation.confidence if recommendation else None,
+            ai_risk_level=recommendation.risk_level if recommendation else None,
+            ai_timestamp=ai_timestamp,
+            latest_update_timestamp=latest_update_timestamp,
+            has_market_data=ticker is not None,
+            has_indicator_data=indicators is not None,
+            has_signal_data=signal is not None,
+            has_ai_data=recommendation is not None,
         )
 
     def get_market_view(
