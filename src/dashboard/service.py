@@ -33,6 +33,8 @@ from src.dashboard.models import (
     DashboardStatus,
     DashboardSummary,
     DashboardSummaryView,
+    IndicatorPageView,
+    IndicatorSummaryView,
     LatestAIRecommendationSnapshot,
     LatestIndicatorSnapshot,
     LatestMarketSnapshot,
@@ -234,6 +236,60 @@ class DashboardService:
             latest_timestamp=latest.queried_at,
             record_count=len(history),
             volume=latest.volume_24h,
+        )
+
+    def get_indicators_page(
+        self, exchange: str, symbol: str, limit: Optional[int] = None
+    ) -> IndicatorPageView:
+        """Todo lo que necesita la página 'Indicadores' para un símbolo:
+        reutiliza get_indicator_history() (una sola consulta, igual
+        criterio que get_market_page(): el último snapshot ya es el
+        último elemento del historial) y arma el resumen a partir del
+        mismo resultado, sin recalcular ningún indicador."""
+        resolved_exchange, resolved_symbol, resolved_limit = self._resolve(exchange, symbol, limit)
+
+        history = self._safe_call(
+            lambda: self.repository.get_indicator_history(resolved_exchange, resolved_symbol, resolved_limit),
+            fallback=[],
+        ) or []
+
+        if not history:
+            return IndicatorPageView(
+                symbols=self.symbols,
+                selected_symbol=resolved_symbol,
+                summary=None,
+                history=[],
+                data_available=False,
+                message=f"Todavía no hay indicadores calculados para {resolved_symbol}.",
+            )
+
+        latest = history[-1]
+        summary = IndicatorSummaryView(
+            exchange=resolved_exchange,
+            symbol=resolved_symbol,
+            sma=latest.sma,
+            ema_fast=latest.ema_fast,
+            ema_medium=latest.ema_medium,
+            ema_slow=latest.ema_slow,
+            rsi=latest.rsi,
+            macd_line=latest.macd_line,
+            macd_signal=latest.macd_signal,
+            macd_histogram=latest.macd_histogram,
+            bollinger_upper=latest.bollinger_upper,
+            bollinger_middle=latest.bollinger_middle,
+            bollinger_lower=latest.bollinger_lower,
+            vwap=latest.vwap,
+            calculated_at=latest.calculated_at,
+            has_data=True,
+        )
+
+        return IndicatorPageView(
+            symbols=self.symbols,
+            selected_symbol=resolved_symbol,
+            summary=summary,
+            history=history,
+            data_available=True,
+            message=None,
         )
 
     def get_indicators_view(

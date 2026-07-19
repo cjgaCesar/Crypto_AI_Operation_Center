@@ -1,8 +1,10 @@
 """
 Pruebas de integración entre páginas del Dashboard (Etapa 5, Iteración
-5.4 — cierre): usando streamlit.testing.v1.AppTest, valida que el modo de
-vista responsive ("Vista": Automática/Amplia/Compacta) se comparte entre
-'Resumen General' y 'Mercado' a través de layout.VIEW_MODE_SESSION_KEY,
+5.4 — cierre, ampliada en la 5.5 con 'Indicadores'): usando
+streamlit.testing.v1.AppTest, valida que el modo de vista responsive
+("Vista": Automática/Amplia/Compacta) se comparte entre 'Resumen
+General', 'Mercado' e 'Indicadores' a través de
+layout.VIEW_MODE_SESSION_KEY (vía layout.render_view_mode_selector()),
 en vez de mantenerse por separado en cada página.
 
 El harness reproduce el mismo enrutamiento de src/dashboard/app.py (un
@@ -65,14 +67,16 @@ def _populated_db(tmp_path, symbols=("BTCUSDT", "ETHUSDT")) -> str:
 def _render_app(service, exchange, symbol):
     import streamlit as st
 
-    from src.dashboard.pages import mercado, resumen
+    from src.dashboard.pages import indicadores, mercado, resumen
 
-    page_name = st.sidebar.radio("Pagina", ["Resumen General", "Mercado"])
+    page_name = st.sidebar.radio("Pagina", ["Resumen General", "Mercado", "Indicadores"])
 
     if page_name == "Resumen General":
         resumen.render(service, exchange=exchange)
     elif page_name == "Mercado":
         mercado.render(service, exchange=exchange, symbol=symbol, limit=100)
+    elif page_name == "Indicadores":
+        indicadores.render(service, exchange=exchange, symbol=symbol, limit=100)
 
 
 def _run(service, exchange="Binance", symbol="BTCUSDT", timeout=30):
@@ -176,3 +180,43 @@ def test_full_navigation_flow_has_zero_exceptions(tmp_path):
     for step in steps:
         step()
         assert not at.exception
+
+
+def test_indicadores_loads_and_shares_view_mode(tmp_path):
+    db_path = _populated_db(tmp_path)
+    at = _run(_service_for(db_path))
+
+    # 1. Elegir "Compacta" en Resumen General.
+    _vista(at).select("Compacta").run(timeout=30)
+    assert not at.exception
+
+    # 2. Navegar a Indicadores: debe conservar "Compacta".
+    _radio(at).set_value("Indicadores").run(timeout=30)
+    assert not at.exception
+    assert at.title[0].value == "Indicadores"
+    assert _vista(at).value == "Compacta"
+
+    # 3. Cambiar a "Amplia" en Indicadores.
+    _vista(at).select("Amplia").run(timeout=30)
+    assert not at.exception
+
+    # 4. Navegar a Mercado: debe conservar "Amplia".
+    _radio(at).set_value("Mercado").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Amplia"
+
+    # 5. Volver a Indicadores: sigue en "Amplia".
+    _radio(at).set_value("Indicadores").run(timeout=30)
+    assert not at.exception
+    assert _vista(at).value == "Amplia"
+
+
+def test_only_one_vista_selector_with_three_pages(tmp_path):
+    db_path = _populated_db(tmp_path)
+    at = _run(_service_for(db_path))
+
+    for page in ["Mercado", "Indicadores", "Resumen General"]:
+        _radio(at).set_value(page).run(timeout=30)
+        assert not at.exception
+        vista_selectors = [sb for sb in at.sidebar.selectbox if sb.label == "Vista"]
+        assert len(vista_selectors) == 1

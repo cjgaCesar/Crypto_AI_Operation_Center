@@ -179,3 +179,60 @@ class MarketPageView(BaseModel):
     history: list[MarketHistoryPoint] = Field(default_factory=list)
     data_available: bool = False
     message: Optional[str] = None
+
+
+class IndicatorSummaryView(BaseModel):
+    """Resumen de indicadores técnicos de un símbolo para la página
+    'Indicadores' (Iteración 5.5): el último snapshot de
+    'market_indicators', aplanado, más 'has_data'. Reutiliza los mismos
+    nombres de campo que IndicatorSnapshot (no los duplica con otro
+    significado): cada valor en None significa "todavía no calculado"
+    (ej. ema_slow necesita 200 lecturas de historial), nunca un valor
+    inventado.
+
+    ATR, ADX y Volatilidad NO existen en 'market_indicators' ni en
+    IndicatorSnapshot (ver README: "No calcula ATR ni ADX todavía, "
+    requieren datos de velas que este proyecto no consulta aún"):
+    deliberadamente no se agregan aquí como campos siempre-None, para no
+    fingir que son parte del modelo de datos. La página los declara
+    explícitamente como no implementados en vez de mostrar un campo vacío
+    sin explicación."""
+
+    exchange: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+
+    sma: Optional[float] = None
+    ema_fast: Optional[float] = None
+    ema_medium: Optional[float] = None
+    ema_slow: Optional[float] = None
+    rsi: Optional[float] = None
+    macd_line: Optional[float] = None
+    macd_signal: Optional[float] = None
+    macd_histogram: Optional[float] = None
+    bollinger_upper: Optional[float] = None
+    bollinger_middle: Optional[float] = None
+    bollinger_lower: Optional[float] = None
+    vwap: Optional[float] = None
+    calculated_at: Optional[datetime] = None
+
+    has_data: bool = False
+
+
+class IndicatorPageView(BaseModel):
+    """Todo lo que necesita la página 'Indicadores' para un símbolo: los
+    símbolos configurados, el símbolo elegido, el resumen (None si
+    todavía no hay datos) y el historial para los gráficos.
+
+    El historial reutiliza 'list[IndicatorSnapshot]' directamente en vez
+    de un modelo "IndicatorHistoryPoint" nuevo: a diferencia de Mercado
+    (donde un punto de historial es solo timestamp/precio/volumen),
+    aquí cada punto ya necesita los mismos ~12 campos que
+    IndicatorSnapshot expone — crear una copia idéntica del modelo solo
+    para el historial sería duplicar, no separar, el modelo de dominio."""
+
+    symbols: list[str] = Field(default_factory=list)
+    selected_symbol: str = Field(min_length=1)
+    summary: Optional[IndicatorSummaryView] = None
+    history: list[IndicatorSnapshot] = Field(default_factory=list)
+    data_available: bool = False
+    message: Optional[str] = None

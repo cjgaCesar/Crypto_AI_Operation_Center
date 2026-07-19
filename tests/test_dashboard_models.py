@@ -10,6 +10,8 @@ from src.dashboard.models import (
     DashboardStatus,
     DashboardSummary,
     DashboardSummaryView,
+    IndicatorPageView,
+    IndicatorSummaryView,
     LatestAIRecommendationSnapshot,
     LatestIndicatorSnapshot,
     LatestMarketSnapshot,
@@ -19,6 +21,7 @@ from src.dashboard.models import (
     MarketSummaryView,
     TableStatus,
 )
+from src.models.indicator_data import IndicatorSnapshot
 from src.models.market_data import MarketTicker
 from src.signals.enums import ConfidenceLevel, SignalType
 
@@ -280,3 +283,105 @@ class TestMarketPageView:
     def test_rejects_empty_selected_symbol(self):
         with pytest.raises(ValidationError):
             MarketPageView(selected_symbol="")
+
+
+def _indicator_snapshot() -> IndicatorSnapshot:
+    return IndicatorSnapshot(
+        exchange="Binance", symbol="BTCUSDT", sma=100.0, ema_fast=100.0, ema_medium=100.0,
+        ema_slow=None, rsi=50.0, macd_line=0.0, macd_signal=0.0, macd_histogram=0.0,
+        bollinger_upper=110.0, bollinger_middle=100.0, bollinger_lower=90.0, vwap=100.0,
+        calculated_at=datetime.now(timezone.utc),
+    )
+
+
+class TestIndicatorSummaryView:
+    def test_builds_with_all_fields_present(self):
+        now = datetime.now(timezone.utc)
+        summary = IndicatorSummaryView(
+            exchange="Binance", symbol="BTCUSDT", sma=100.0, ema_fast=100.0, ema_medium=100.0,
+            ema_slow=99.0, rsi=55.0, macd_line=0.1, macd_signal=0.05, macd_histogram=0.05,
+            bollinger_upper=110.0, bollinger_middle=100.0, bollinger_lower=90.0, vwap=100.0,
+            calculated_at=now, has_data=True,
+        )
+        assert summary.rsi == 55.0
+        assert summary.has_data is True
+
+    def test_optional_fields_default_to_none_and_has_data_false(self):
+        summary = IndicatorSummaryView(exchange="Binance", symbol="BTCUSDT")
+
+        assert summary.sma is None
+        assert summary.ema_fast is None
+        assert summary.ema_medium is None
+        assert summary.ema_slow is None
+        assert summary.rsi is None
+        assert summary.macd_line is None
+        assert summary.macd_signal is None
+        assert summary.macd_histogram is None
+        assert summary.bollinger_upper is None
+        assert summary.bollinger_middle is None
+        assert summary.bollinger_lower is None
+        assert summary.vwap is None
+        assert summary.calculated_at is None
+        assert summary.has_data is False
+
+    def test_rejects_empty_symbol(self):
+        with pytest.raises(ValidationError):
+            IndicatorSummaryView(exchange="Binance", symbol="")
+
+    def test_rejects_empty_exchange(self):
+        with pytest.raises(ValidationError):
+            IndicatorSummaryView(exchange="", symbol="BTCUSDT")
+
+    def test_has_no_atr_adx_or_volatility_fields(self):
+        """ATR/ADX/Volatilidad no existen en market_indicators todavía
+        (ver README): el modelo no debe fingir que sí, agregando campos
+        siempre-None."""
+        summary = IndicatorSummaryView(exchange="Binance", symbol="BTCUSDT")
+        assert not hasattr(summary, "atr")
+        assert not hasattr(summary, "adx")
+        assert not hasattr(summary, "volatility")
+
+
+class TestIndicatorPageView:
+    def test_builds_with_data_available(self):
+        summary = IndicatorSummaryView(exchange="Binance", symbol="BTCUSDT", rsi=50.0, has_data=True)
+        history = [_indicator_snapshot()]
+
+        page = IndicatorPageView(
+            symbols=["BTCUSDT", "ETHUSDT"], selected_symbol="BTCUSDT",
+            summary=summary, history=history, data_available=True, message=None,
+        )
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.summary is not None
+        assert len(page.history) == 1
+        assert page.data_available is True
+        assert page.message is None
+
+    def test_builds_with_no_data_available(self):
+        page = IndicatorPageView(
+            symbols=["BTCUSDT"], selected_symbol="BTCUSDT",
+            summary=None, history=[], data_available=False,
+            message="Todavía no hay indicadores calculados para BTCUSDT.",
+        )
+
+        assert page.summary is None
+        assert page.history == []
+        assert page.data_available is False
+        assert "BTCUSDT" in page.message
+
+    def test_symbols_and_history_default_to_empty_list(self):
+        page = IndicatorPageView(selected_symbol="BTCUSDT")
+
+        assert page.symbols == []
+        assert page.history == []
+
+    def test_rejects_empty_selected_symbol(self):
+        with pytest.raises(ValidationError):
+            IndicatorPageView(selected_symbol="")
+
+    def test_history_accepts_real_indicator_snapshots(self):
+        snapshot = _indicator_snapshot()
+        page = IndicatorPageView(selected_symbol="BTCUSDT", history=[snapshot])
+
+        assert page.history[0] is snapshot

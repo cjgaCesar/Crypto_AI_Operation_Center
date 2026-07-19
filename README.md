@@ -29,11 +29,12 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   factores positivos/negativos), persistida en una tabla independiente.
   Hoy usa un proveedor simulado (`DummyProvider`); OpenAI/Claude quedan
   preparados pero sin conectar. Ver [docs/ALCANCE_ETAPA_4.md](docs/ALCANCE_ETAPA_4.md).
-- 📝 **Etapa 5 (en desarrollo, Iteración 5.4 — Resumen General y Mercado
-  funcionales, el resto del Dashboard todavía no está completo)** —
-  Dashboard de solo lectura (Streamlit) sobre las 4 tablas ya generadas
-  por las Etapas 1 a 4. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md)
-  y [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
+- 📝 **Etapa 5 (en desarrollo, Iteración 5.5 — Resumen General, Mercado
+  e Indicadores funcionales, el resto del Dashboard todavía no está
+  completo)** — Dashboard de solo lectura (Streamlit) sobre las 4 tablas
+  ya generadas por las Etapas 1 a 4. Ver
+  [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
+  [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
 
 ## Qué hace el bot hoy
 
@@ -228,7 +229,7 @@ historial (ej. la EMA lenta, que por defecto usa 200 lecturas) no van a
 tener valor todavía en los primeros ciclos — es normal, y se completan
 solos a medida que se acumulan datos.
 
-## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.4 — Resumen General y Mercado funcionales)
+## Cómo ejecutar el Dashboard (Etapa 5, Iteración 5.5 — Resumen General, Mercado e Indicadores funcionales)
 
 Instalar dependencias (incluye `streamlit`/`plotly`, ya en `requirements.txt`):
 
@@ -242,9 +243,9 @@ Ejecutar:
 streamlit run src/dashboard/app.py
 ```
 
-**Estado actual: Iteración 5.4 completada — "Resumen General" y "Mercado"
-ya son funcionales; el resto del Dashboard todavía NO está completo, y la
-Etapa 5 en general tampoco.**
+**Estado actual: Iteración 5.5 completada — "Resumen General", "Mercado"
+e "Indicadores" ya son funcionales; el resto del Dashboard todavía NO
+está completo, y la Etapa 5 en general tampoco.**
 
 "Resumen General" muestra, para cada símbolo configurado
 (`BTCUSDT`/`ETHUSDT`/`SOLUSDT`), una tarjeta con precio, variación 24h,
@@ -262,23 +263,32 @@ disponible, el volumen del último dato, la fecha del último dato, la
 cantidad de registros disponibles (respeta el límite de historial
 elegido en la barra lateral) y un gráfico de línea con el historial de
 precio. No calcula indicadores técnicos, señales ni recomendaciones de
-IA (eso vive en las páginas Indicadores/Señales/Recomendaciones de IA,
-todavía esqueletos).
+IA (eso vive en las páginas Indicadores/Señales/Recomendaciones de IA).
 
-Ambas páginas tienen **diseño responsive**: cada una incluye el selector
+**Indicadores** muestra, para el mismo símbolo elegido, el último valor
+de RSI, MACD (línea/señal/histograma), medias móviles (SMA, EMA rápida/
+media/lenta), Bandas de Bollinger (superior/media/inferior) y VWAP, la
+fecha del último cálculo, y 3 gráficos de historial (RSI, MACD, medias
+móviles). Cada valor todavía no calculado (ej. la EMA lenta, que
+necesita 200 lecturas de historial) se muestra como "N/D", nunca
+inventado. **ATR, ADX y Volatilidad se declaran explícitamente como no
+disponibles**: este proyecto todavía no los calcula en ninguna etapa
+(ver más arriba, "Todavía NO hace lo siguiente").
+
+Las 3 páginas tienen **diseño responsive**: cada una incluye el selector
 **"Vista"** con 3 modos (**Automática**, **Amplia**, **Compacta**) en la
 barra lateral. En "Resumen General" controla cuántas tarjetas se
 muestran por fila (3 en Amplia, 2 en Automática, 1 apilada verticalmente
-en Compacta); en "Mercado" controla si las métricas se muestran en
-columnas o apiladas. **El modo de vista responsive es compartido entre
-las páginas del Dashboard mediante una única clave centralizada de
-st.session_state**: elegir "Compacta" en una página y navegar a la otra
-conserva "Compacta", en vez de resetear a un valor distinto. La
-elección se guarda solo en la sesión del navegador (`st.session_state`),
-nunca en disco ni en `config.yaml`.
+en Compacta); en "Mercado" e "Indicadores" controla si las métricas se
+muestran en columnas o apiladas. **El modo de vista responsive es
+compartido entre las páginas del Dashboard mediante una única clave
+centralizada de st.session_state**: elegir "Compacta" en una página y
+navegar a otra conserva "Compacta", en vez de resetear a un valor
+distinto. La elección se guarda solo en la sesión del navegador
+(`st.session_state`), nunca en disco ni en `config.yaml`.
 
-Las demás páginas (Indicadores, Señales, Recomendaciones de IA) siguen
-siendo esqueletos mínimos — su contenido completo (gráficos históricos,
+Las demás páginas (Señales, Recomendaciones de IA) siguen siendo
+esqueletos mínimos — su contenido completo (gráficos históricos,
 comparaciones) queda para una iteración futura, y la identidad visual
 definitiva de toda la aplicación (más allá de la paleta ya centralizada
 en `theme.py`) también se completará más adelante. "Estado Técnico" ya es
@@ -288,7 +298,7 @@ El diseño responsive se validó mediante pruebas automatizadas (AppTest) y
 revisión de código (sin anchos/altos fijos, sin tablas HTML, sin scroll
 horizontal forzado), pero **todavía no se validó visualmente en un
 navegador real** en ningún tamaño de pantalla — se recomienda hacerlo
-antes de dar por cerrado el diseño responsive de estas dos páginas.
+antes de dar por cerrado el diseño responsive de estas tres páginas.
 
 El Dashboard es de **solo lectura**: nunca escribe en
 `data/crypto_data.db`, no recalcula indicadores ni señales, no genera
@@ -354,25 +364,29 @@ AIRecommendation` —, proveedor simulado `DummyProvider` conectado
 (OpenAI/Claude preparados, sin conectar), tabla independiente
 `ai_recommendations`. Pendiente de tu revisión y aprobación formal.
 
-📝 Etapa 5, Iteración 5.4 (Resumen General y Mercado funcionales, resto
-del Dashboard todavía NO completo): la Iteración 5.3 agregó
-`DashboardSummaryView`, `DashboardService.get_summary_view()`, `theme.py`
-y los componentes de tarjeta/badge de "Resumen General". Esta iteración
-agregó, reutilizando lo anterior sin duplicarlo: `MarketSummaryView`/
-`MarketHistoryPoint`/`MarketPageView` (`models.py`),
-`DashboardService.get_market_page()` (una sola llamada a
-`get_market_history()` ya existente: sin métodos nuevos en
-`repository.py`), 3 formatters nuevos (`format_price_change`/
-`format_volume`/`format_record_count`) y 3 componentes nuevos
-(`render_market_metrics`/`render_market_availability`/
-`render_price_history_chart`, este último reutilizando
-`charts.line_chart()` ya existente desde la 5.2). La página "Mercado"
-(antes "Precios") ya muestra precio, variación, máximo/mínimo del
-período, volumen, fecha del último dato, cantidad de registros y un
-gráfico de historial de precio para el símbolo elegido, con su propio
-selector de vista responsive. Indicadores, Señales y Recomendaciones de
-IA siguen siendo esqueletos (sin gráficos históricos todavía, eso es una
-iteración futura). Pendiente tu auditoría antes de continuar.
+📝 Etapa 5, Iteración 5.5 (Resumen General, Mercado e Indicadores
+funcionales, resto del Dashboard todavía NO completo): la Iteración 5.3
+agregó `DashboardSummaryView`/`get_summary_view()`/`theme.py` y las
+tarjetas de "Resumen General"; la 5.4 agregó `MarketSummaryView`/
+`MarketHistoryPoint`/`MarketPageView`/`get_market_page()` y la página
+"Mercado" (antes "Precios"), además de centralizar el selector "Vista"
+en `layout.render_view_mode_selector()` (compartido entre páginas). Esta
+iteración agregó, reutilizando lo anterior sin duplicarlo:
+`IndicatorSummaryView`/`IndicatorPageView` (`models.py`, el historial
+reutiliza `IndicatorSnapshot` directamente en vez de un modelo nuevo),
+`DashboardService.get_indicators_page()` (una sola llamada a
+`get_indicator_history()` ya existente: sin métodos nuevos en
+`repository.py`), `charts.multi_line_chart()` (series superpuestas,
+para MACD y medias móviles) y 3 componentes nuevos
+(`render_indicator_metrics`/`render_indicator_availability`/
+`render_indicator_history_charts`). La página "Indicadores" ya muestra
+RSI, MACD, medias móviles, Bandas de Bollinger, VWAP, fecha del último
+cálculo y 3 gráficos de historial para el símbolo elegido, con el
+selector de vista responsive compartido; ATR/ADX/Volatilidad se
+declaran explícitamente como no disponibles (no existen en
+`market_indicators`). Señales y Recomendaciones de IA siguen siendo
+esqueletos (sin gráficos históricos todavía, eso es una iteración
+futura). Pendiente tu auditoría antes de continuar.
 
 Pendiente: aprobación formal de la Etapa 4 antes de avanzar a cualquier
 etapa futura (Dashboard, Telegram, paper trading o trading automático, o

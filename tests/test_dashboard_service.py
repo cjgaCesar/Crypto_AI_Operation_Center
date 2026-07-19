@@ -487,3 +487,96 @@ class TestGetMarketPage:
 
         assert page.data_available is False
         assert page.summary is None
+
+
+class TestGetIndicatorsPage:
+    def test_no_history_returns_unavailable_page_with_message(self):
+        service = _service()
+        page = service.get_indicators_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None
+        assert page.history == []
+        assert "BTCUSDT" in page.message
+
+    def test_includes_configured_symbols_and_selected_symbol(self):
+        repository = FakeDashboardRepository()
+        repository.indicator_history[("Binance", "BTCUSDT")] = [_indicators("BTCUSDT")]
+        service = _service(repository)
+
+        page = service.get_indicators_page("Binance", "btcusdt")
+
+        assert page.symbols == ["BTCUSDT", "ETHUSDT"]
+        assert page.selected_symbol == "BTCUSDT"
+
+    def test_summary_reflects_the_latest_snapshot(self):
+        repository = FakeDashboardRepository()
+        older = _indicators("BTCUSDT")
+        newer = IndicatorSnapshot(
+            exchange="Binance", symbol="BTCUSDT", sma=101.0, ema_fast=101.0, ema_medium=101.0,
+            ema_slow=None, rsi=55.0, macd_line=0.1, macd_signal=0.05, macd_histogram=0.05,
+            bollinger_upper=111.0, bollinger_middle=101.0, bollinger_lower=91.0, vwap=101.0,
+            calculated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        repository.indicator_history[("Binance", "BTCUSDT")] = [older, newer]
+        service = _service(repository)
+
+        page = service.get_indicators_page("Binance", "BTCUSDT")
+
+        assert page.data_available is True
+        assert page.summary.has_data is True
+        assert page.summary.rsi == 55.0
+        assert page.summary.sma == 101.0
+        assert page.summary.ema_slow is None
+        assert page.summary.calculated_at == newer.calculated_at
+
+    def test_history_is_the_full_list_from_repository(self):
+        repository = FakeDashboardRepository()
+        history = [_indicators("BTCUSDT"), _indicators("BTCUSDT")]
+        repository.indicator_history[("Binance", "BTCUSDT")] = history
+        service = _service(repository)
+
+        page = service.get_indicators_page("Binance", "BTCUSDT")
+
+        assert page.history == history
+
+    def test_limit_is_resolved_like_other_history_methods(self):
+        repository = FakeDashboardRepository()
+        repository.indicator_history[("Binance", "BTCUSDT")] = [_indicators() for _ in range(5)]
+        service = DashboardService(
+            repository=repository, exchange="Binance", symbols=["BTCUSDT"],
+            default_history_limit=100, max_history_limit=3,
+        )
+
+        page = service.get_indicators_page("Binance", "BTCUSDT", limit=1000)
+        assert len(page.history) <= 3
+
+    def test_view_is_isolated_by_exchange(self):
+        repository = FakeDashboardRepository()
+        repository.indicator_history[("Binance", "BTCUSDT")] = [_indicators("BTCUSDT")]
+        repository.indicator_history[("OtroExchange", "BTCUSDT")] = [
+            IndicatorSnapshot(
+                exchange="OtroExchange", symbol="BTCUSDT", sma=999.0, ema_fast=999.0,
+                ema_medium=999.0, ema_slow=999.0, rsi=99.0, macd_line=9.0, macd_signal=9.0,
+                macd_histogram=9.0, bollinger_upper=999.0, bollinger_middle=999.0,
+                bollinger_lower=999.0, vwap=999.0, calculated_at=datetime.now(timezone.utc),
+            )
+        ]
+        service = _service(repository)
+
+        page = service.get_indicators_page("Binance", "BTCUSDT")
+        other_page = service.get_indicators_page("OtroExchange", "BTCUSDT")
+
+        assert page.summary.sma == 100.0
+        assert other_page.summary.sma == 999.0
+
+    def test_repository_exception_is_handled_gracefully(self):
+        class RaisingRepository(FakeDashboardRepository):
+            def get_indicator_history(self, exchange, symbol, limit):
+                raise RuntimeError("fallo simulado del repositorio")
+
+        service = _service(RaisingRepository())
+        page = service.get_indicators_page("Binance", "BTCUSDT")
+
+        assert page.data_available is False
+        assert page.summary is None

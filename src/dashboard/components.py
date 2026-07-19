@@ -17,7 +17,7 @@ from typing import Optional
 
 import streamlit as st
 
-from src.dashboard.charts import line_chart
+from src.dashboard.charts import line_chart, multi_line_chart
 from src.dashboard.formatters import (
     NOT_AVAILABLE,
     format_confidence,
@@ -34,7 +34,13 @@ from src.dashboard.formatters import (
     format_volume,
 )
 from src.dashboard.layout import render_responsive_metric_group
-from src.dashboard.models import DashboardSummaryView, MarketHistoryPoint, MarketSummaryView
+from src.dashboard.models import (
+    DashboardSummaryView,
+    IndicatorSummaryView,
+    MarketHistoryPoint,
+    MarketSummaryView,
+)
+from src.models.indicator_data import IndicatorSnapshot
 from src.dashboard.theme import (
     COLOR_AI,
     get_change_color,
@@ -216,3 +222,82 @@ def render_price_history_chart(history: list[MarketHistoryPoint], symbol: str) -
     prices = [point.price for point in history]
     figure = line_chart(timestamps, prices, title=f"Precio histórico — {symbol}")
     st.plotly_chart(figure, use_container_width=True)
+
+
+def render_indicator_metrics(summary: IndicatorSummaryView, compact: bool) -> None:
+    """Métricas principales de la página 'Indicadores': RSI, MACD (línea/
+    señal/histograma), medias móviles (SMA, EMA rápida/media/lenta),
+    Bandas de Bollinger (superior/media/inferior) y VWAP. Cada valor
+    ausente (todavía no calculado, ej. EMA lenta necesita 200 lecturas)
+    se muestra como 'N/D' vía formatters — nunca se recalcula ni se
+    inventa aquí."""
+    metrics = [
+        ("RSI", format_price(summary.rsi, decimals=2)),
+        ("MACD", format_price(summary.macd_line, decimals=4)),
+        ("Señal MACD", format_price(summary.macd_signal, decimals=4)),
+        ("Histograma MACD", format_price(summary.macd_histogram, decimals=4)),
+        ("SMA", format_price(summary.sma)),
+        ("EMA rápida", format_price(summary.ema_fast)),
+        ("EMA media", format_price(summary.ema_medium)),
+        ("EMA lenta", format_price(summary.ema_slow)),
+        ("Banda superior", format_price(summary.bollinger_upper)),
+        ("Banda media", format_price(summary.bollinger_middle)),
+        ("Banda inferior", format_price(summary.bollinger_lower)),
+        ("VWAP", format_price(summary.vwap)),
+    ]
+    render_responsive_metric_group(metrics, compact=compact)
+
+
+def render_indicator_availability(summary: Optional[IndicatorSummaryView]) -> None:
+    """Fecha del último cálculo, y una nota explícita de que ATR, ADX y
+    Volatilidad todavía no existen en 'market_indicators' (no se calculan
+    en ninguna etapa de este proyecto, ver README) — se declaran "N/D" en
+    vez de omitirse en silencio, para que quede claro que no es un olvido
+    de esta página sino una limitación real del proyecto."""
+    if summary is None:
+        st.caption("Sin datos disponibles todavía.")
+    else:
+        st.caption(f"Último cálculo: {format_timestamp(summary.calculated_at)}")
+    st.caption(
+        f"ATR: {NOT_AVAILABLE} · ADX: {NOT_AVAILABLE} · Volatilidad: {NOT_AVAILABLE} "
+        "(no calculados todavía en este proyecto)"
+    )
+
+
+def render_indicator_history_charts(history: list[IndicatorSnapshot], symbol: str) -> None:
+    """3 gráficos de historial de indicadores, a ancho completo del
+    contenedor: RSI, MACD (línea/señal/histograma superpuestos) y medias
+    móviles (SMA + EMA rápida/media/lenta superpuestas). Con historial
+    vacío o de un solo registro, charts.line_chart()/multi_line_chart()
+    ya devuelven una figura vacía o de un punto sin fallar; valores None
+    dentro de una serie (indicador todavía sin suficiente historial)
+    dejan un hueco en esa línea en vez de romper el gráfico."""
+    timestamps = [snapshot.calculated_at for snapshot in history]
+
+    rsi_figure = line_chart(
+        timestamps, [snapshot.rsi for snapshot in history], title=f"RSI — {symbol}",
+    )
+    st.plotly_chart(rsi_figure, use_container_width=True)
+
+    macd_figure = multi_line_chart(
+        timestamps,
+        {
+            "MACD": [snapshot.macd_line for snapshot in history],
+            "Señal": [snapshot.macd_signal for snapshot in history],
+            "Histograma": [snapshot.macd_histogram for snapshot in history],
+        },
+        title=f"MACD — {symbol}",
+    )
+    st.plotly_chart(macd_figure, use_container_width=True)
+
+    moving_averages_figure = multi_line_chart(
+        timestamps,
+        {
+            "SMA": [snapshot.sma for snapshot in history],
+            "EMA rápida": [snapshot.ema_fast for snapshot in history],
+            "EMA media": [snapshot.ema_medium for snapshot in history],
+            "EMA lenta": [snapshot.ema_slow for snapshot in history],
+        },
+        title=f"Medias móviles — {symbol}",
+    )
+    st.plotly_chart(moving_averages_figure, use_container_width=True)

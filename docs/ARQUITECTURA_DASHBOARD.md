@@ -2,12 +2,12 @@
 
 > Diseño original de la Iteración 5.1, actualizado en la Iteración 5.2 con
 > la estructura de módulos realmente implementada, en la Iteración 5.3 con
-> la primera página funcional y en la Iteración 5.4 con la página
-> "Mercado" (ver "Nota de implementación" de cada iteración más abajo).
-> "Resumen General" y "Mercado" ya son funcionales; el resto del
-> Dashboard **todavía no está completo**: Indicadores, Señales y
-> Recomendaciones de IA siguen siendo esqueletos mínimos (ver
-> `docs/ALCANCE_ETAPA_5.md`).
+> la primera página funcional, en la Iteración 5.4 con la página
+> "Mercado" y en la Iteración 5.5 con la página "Indicadores" (ver "Nota
+> de implementación" de cada iteración más abajo). "Resumen General",
+> "Mercado" e "Indicadores" ya son funcionales; el resto del Dashboard
+> **todavía no está completo**: Señales y Recomendaciones de IA siguen
+> siendo esqueletos mínimos (ver `docs/ALCANCE_ETAPA_5.md`).
 
 ## Nota de implementación (Iteración 5.2)
 
@@ -253,6 +253,70 @@ todo lo que ya existía sin agregar ninguna dependencia nueva:
   construcción del widget en `layout.render_view_mode_selector()`: ambas
   páginas la llaman exclusivamente, sin key/index/help propios.
 
+## Nota de implementación (Iteración 5.5)
+
+Se implementó la página "Indicadores" (`indicadores.py`), reutilizando
+la infraestructura ya existente sin agregar ninguna dependencia nueva:
+
+- **`repository.py` no ganó ningún método nuevo**: `get_indicator_history()`
+  (ya existente desde la Iteración 5.2) fue suficiente para construir la
+  página completa — mismo criterio que "Mercado" en la 5.4. Antes de
+  escribir código se inspeccionó el esquema real de `market_indicators`
+  (`PRAGMA table_info`): `id, exchange, symbol, sma, ema_fast,
+  ema_medium, ema_slow, rsi, macd_line, macd_signal, macd_histogram,
+  bollinger_upper, bollinger_middle, bollinger_lower, vwap,
+  calculated_at`. No existen columnas de ATR, ADX ni volatilidad — el
+  proyecto todavía no las calcula (ver README, "Todavía NO hace lo
+  siguiente"). `ema_slow` está en `NULL` en el 100% de las 153 filas
+  actuales (necesita 200 lecturas de historial, que todavía no existen).
+- **`DashboardService.get_indicators_page(exchange, symbol, limit)`**
+  (`service.py`): una sola llamada a `get_indicator_history()` (no llama
+  también a `get_latest_indicators()`: el último elemento del historial
+  ya es el snapshot más reciente), igual patrón que `get_market_page()`.
+- **`models.py`** ganó 2 modelos nuevos: `IndicatorSummaryView` (los
+  mismos ~12 campos de `IndicatorSnapshot`, aplanados, más `has_data`) e
+  `IndicatorPageView` (símbolos configurados, símbolo elegido, resumen
+  opcional, historial, disponibilidad y mensaje). El historial reutiliza
+  `list[IndicatorSnapshot]` directamente en vez de un
+  "IndicatorHistoryPoint" nuevo: a diferencia de "Mercado" (un punto de
+  historial de precio son solo 3 campos), cada punto de historial de
+  indicadores ya necesita los mismos ~12 campos que `IndicatorSnapshot`
+  expone — duplicar ese modelo solo para el historial habría sido
+  redundante, no una separación real.
+- **`charts.py`** ganó `multi_line_chart(x, series, title)`: varias
+  series superpuestas en una sola figura (una traza por clave de
+  `series`), reutilizado para MACD (línea/señal/histograma) y medias
+  móviles (SMA + EMA rápida/media/lenta). Sigue sin conocer Streamlit,
+  SQLite ni los modelos del proyecto (recibe listas simples), igual
+  criterio que `line_chart()`.
+- **`components.py`** ganó 3 helpers: `render_indicator_metrics()`
+  (RSI, MACD/Señal/Histograma, SMA, EMA rápida/media/lenta, Bandas de
+  Bollinger, VWAP, vía `layout.render_responsive_metric_group()`),
+  `render_indicator_availability()` (fecha del último cálculo) y
+  `render_indicator_history_charts()` (3 gráficos: RSI, MACD, medias
+  móviles).
+- **ATR, ADX y Volatilidad**: no existen en `market_indicators` ni en
+  `IndicatorSnapshot`, así que **no se agregaron como campos
+  siempre-`None`** en `IndicatorSummaryView` (fingir que son parte del
+  modelo de datos sería peor que omitirlos). En su lugar,
+  `render_indicator_availability()` los declara explícitamente como
+  "N/D" con una nota ("no calculados todavía en este proyecto"), para
+  que quede claro que es una limitación real y conocida, no un olvido de
+  esta página. Cualquier valor de indicador ausente en una fila puntual
+  (ej. `ema_slow` con poco historial) también se muestra como "N/D" vía
+  `formatters.format_price()`, nunca inventado ni recalculado.
+- **Diseño responsive**: la página reutiliza exactamente
+  `layout.render_view_mode_selector()` (misma key/help/comportamiento
+  que "Resumen General" y "Mercado", ver más arriba) y
+  `render_responsive_metric_group()`. Al igual que "Mercado",
+  `get_cards_per_row()`/`render_responsive_grid()` no aplican aquí: la
+  página muestra un único símbolo a la vez, no una colección de tarjetas
+  por símbolo.
+- **Garantía de solo lectura sin cambios**: `indicadores.py` no ejecuta
+  SQL, no importa `sqlite3` ni el Repository directamente, y no
+  recalcula ningún indicador — todo viene de
+  `DashboardService.get_indicators_page()`.
+
 ## Tecnología seleccionada: Streamlit
 
 | Opción | Evaluación |
@@ -307,7 +371,7 @@ Resumido: **Repository → Service → View Model → Components/Layout → Page
   `models.py` cambiarían — solo `components.py`/`layout.py` (capa 100%
   de presentación) dejarían de usarse en ese contexto.
 
-## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3 y 5.4)
+## Estructura de módulos (base en la Iteración 5.2, ampliada en 5.3/5.4/5.5)
 
 ```
 src/dashboard/
@@ -316,16 +380,19 @@ src/dashboard/
 ├── config.py                 # DashboardConfig + build_dashboard_config()
 ├── models.py                   # TableStatus, DashboardStatus, Latest*Snapshot,
 │                                # DashboardSummary, DashboardSummaryView (5.3),
-│                                # MarketSummaryView/MarketHistoryPoint/MarketPageView (5.4)
+│                                # MarketSummaryView/MarketHistoryPoint/MarketPageView (5.4),
+│                                # IndicatorSummaryView/IndicatorPageView (5.5)
 ├── repository.py                 # DashboardRepository (interfaz) + SQLiteDashboardRepository
-│                                  # (sin cambios en 5.4: get_market_history() ya alcanzaba)
+│                                  # (sin cambios en 5.4/5.5: get_market_history()/
+│                                  # get_indicator_history() ya alcanzaban)
 ├── service.py                      # DashboardService (+ get_summary_view() 5.3,
-│                                    # + get_market_page() 5.4)
+│                                    # + get_market_page() 5.4, + get_indicators_page() 5.5)
 ├── filters.py                        # normalize_symbol/normalize_exchange/validate_limit
 ├── formatters.py                       # format_price/percent/timestamp/enum +
 │                                        # format_price_compact/confidence/score/
 │                                        # risk_level/relative_status (5.3) +
 │                                        # format_price_change/volume/record_count (5.4)
+│                                        # (5.5 reutiliza format_price/format_timestamp)
 ├── theme.py                              # Paleta + get_signal_color/get_risk_color/
 │                                         # get_change_color/to_streamlit_color_name (5.3)
 ├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
@@ -333,18 +400,21 @@ src/dashboard/
 │                                          # render_view_mode_selector() (construcción única y
 │                                          # compartida del selector "Vista" entre páginas, 5.4)
 ├── charts.py                             # empty_figure/line_chart (5.2; reutilizado sin
-│                                         # cambios por Mercado en 5.4)
+│                                         # cambios por Mercado en 5.4) +
+│                                         # multi_line_chart() (series superpuestas, 5.5)
 ├── components.py                           # render_not_available/render_kpi_card +
 │                                           # render_section_header/render_status_badge (sin HTML)/
 │                                           # render_data_availability/render_summary_card
 │                                           # (con modo compact, 5.3) +
 │                                           # render_market_metrics/render_market_availability/
-│                                           # render_price_history_chart (5.4)
+│                                           # render_price_history_chart (5.4) +
+│                                           # render_indicator_metrics/render_indicator_availability/
+│                                           # render_indicator_history_charts (5.5)
 └── pages/                                    # Una página por vista
     ├── __init__.py
     ├── resumen.py                             # Funcional desde 5.3 (tarjetas por símbolo)
     ├── mercado.py                             # Funcional desde 5.4 ("Mercado", antes "Precios")
-    ├── indicadores.py                         # Esqueleto
+    ├── indicadores.py                         # Funcional desde 5.5
     ├── senales.py                             # Esqueleto
     ├── recomendaciones.py                     # Esqueleto
     └── estado_tecnico.py                      # Funcional desde 5.2
@@ -391,12 +461,20 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
    con el historial de precio (`charts.line_chart()`, ya existente desde
    la 5.2). Sin indicadores técnicos ni señales superpuestas (eso vive en
    `market_indicators`/`market_signals`, no en `market_data`): quedan
-   para las páginas Indicadores/Señales. Incluye su propio selector de
-   vista responsive (`Vista`, misma mecánica que "Resumen General", clave
-   de sesión independiente `mercado_view_mode`).
-3. **Indicadores** (`indicadores.py`) — esqueleto: hoy solo el RSI más
-   reciente. En una iteración futura, gráficos de RSI, MACD y Bandas de
-   Bollinger (`market_indicators`).
+   para las páginas Indicadores/Señales. Incluye el selector de vista
+   responsive compartido (`Vista`, vía
+   `layout.render_view_mode_selector()`, ver "Diseño responsive" más
+   arriba).
+3. **Indicadores** (`indicadores.py`) — **funcional desde la Iteración
+   5.5**: para el símbolo elegido en la barra lateral
+   (`DashboardService.get_indicators_page()`), muestra el último valor de
+   RSI, MACD (línea/señal/histograma), medias móviles (SMA, EMA rápida/
+   media/lenta), Bandas de Bollinger (superior/media/inferior) y VWAP,
+   la fecha del último cálculo, y 3 gráficos de historial (RSI, MACD,
+   medias móviles). ATR, ADX y Volatilidad se declaran explícitamente
+   como no disponibles (no existen en `market_indicators`, ver "Nota de
+   implementación (Iteración 5.5)" más arriba). Incluye el selector de
+   vista responsive compartido.
 4. **Señales** (`senales.py`) — esqueleto: hoy solo `signal_type`/`score`
    más recientes. En una iteración futura, historial de
    `score`/`confidence`/`signal_type` en el tiempo, y el detalle completo
@@ -440,10 +518,20 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 - **`render_price_history_chart(history, symbol)`** (5.4): envuelve
   `charts.line_chart()` con `st.plotly_chart(..., use_container_width=True)`
   (sin ancho fijo, sin scroll horizontal).
-- **Gráfico de serie temporal** (`charts.line_chart`): envoltura común
-  para precio/indicadores/score/confidence a lo largo del tiempo — en
-  uso desde la 5.4 en "Mercado"; Indicadores/Señales/Recomendaciones de
-  IA lo reutilizarán en una iteración futura.
+- **`render_indicator_metrics(summary, compact)`** (5.5): RSI, MACD
+  (línea/señal/histograma), medias móviles (SMA, EMA rápida/media/lenta),
+  Bandas de Bollinger y VWAP de "Indicadores", vía
+  `render_responsive_metric_group()`.
+- **`render_indicator_availability(summary)`** (5.5): fecha del último
+  cálculo + declaración explícita de ATR/ADX/Volatilidad como no
+  disponibles.
+- **`render_indicator_history_charts(history, symbol)`** (5.5): 3
+  gráficos (RSI, MACD, medias móviles), vía `charts.line_chart()` y
+  `charts.multi_line_chart()`.
+- **Gráfico de serie temporal** (`charts.line_chart`/`charts.multi_line_chart`):
+  envoltura común para precio/indicadores a lo largo del tiempo — en uso
+  desde la 5.4 en "Mercado" y desde la 5.5 en "Indicadores";
+  Señales/Recomendaciones de IA lo reutilizarán en una iteración futura.
 - **Bloque de razones**: lista de `reason`/`rule_strength` o
   `advantages`/`risks` — pendiente de una iteración futura (Señales y
   Recomendaciones de IA todavía son esqueletos).
@@ -475,12 +563,16 @@ responsive, más arriba, para la regla completa de tablas/gráficos.)
   `src/services/`, `src/signals/`, `src/ai/` ni `src/utils/`: los 4
   repositorios ya exponen exactamente los métodos de lectura
   (`fetch_latest`/`fetch_history`) que el Dashboard necesita.
+- No muestra ATR, ADX ni Volatilidad: el proyecto todavía no los calcula
+  en ninguna etapa (ni el bot ni el Dashboard) — "Indicadores" los
+  declara explícitamente como no disponibles en vez de omitirlos en
+  silencio o inventarlos.
 
 ## Dependencias
 
 `streamlit` y `plotly` (ambas Python puro, sin servicios adicionales),
-agregadas a `requirements.txt` desde la Iteración 5.2. Ni la Iteración 5.3
-ni la 5.4 agregaron ninguna dependencia nueva.
+agregadas a `requirements.txt` desde la Iteración 5.2. Ninguna iteración
+posterior (5.3, 5.4, 5.5) agregó ninguna dependencia nueva.
 
 ## Estado por iteración
 
@@ -495,12 +587,17 @@ ni la 5.4 agregaron ninguna dependencia nueva.
   `get_market_page()`, gráfico de historial de precio). Al cerrar la
   iteración se centralizó el selector "Vista" en
   `layout.render_view_mode_selector()` (ver "Diseño responsive" más
-  arriba), compartido por ambas páginas, y se agregó
+  arriba), compartido entre páginas, y se agregó
   `tests/test_dashboard_navigation.py` (pruebas de integración de
-  navegación y estado compartido). Indicadores, Señales y Recomendaciones
-  de IA siguen siendo esqueletos.
-- **Pendiente para la Iteración 5.5**: gráficos históricos completos de
-  Indicadores/Señales/Recomendaciones de IA, auto-refresh real,
-  comparación entre símbolos, diseño visual definitivo de toda la
-  aplicación (identidad visual más allá de la paleta ya centralizada en
-  `theme.py`).
+  navegación y estado compartido).
+- **5.5** (esta): página "Indicadores" funcional
+  (`IndicatorSummaryView`/`IndicatorPageView`, `get_indicators_page()`,
+  `charts.multi_line_chart()`, 3 gráficos de historial). ATR, ADX y
+  Volatilidad declarados explícitamente como no disponibles (no existen
+  en `market_indicators`). `tests/test_dashboard_navigation.py` se
+  amplió para incluir "Indicadores" en la validación de estado
+  compartido. Señales y Recomendaciones de IA siguen siendo esqueletos.
+- **Pendiente para la Iteración 5.6**: gráficos históricos completos de
+  Señales/Recomendaciones de IA, auto-refresh real, comparación entre
+  símbolos, diseño visual definitivo de toda la aplicación (identidad
+  visual más allá de la paleta ya centralizada en `theme.py`).
