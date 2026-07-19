@@ -239,7 +239,10 @@ Esta iteración solo entrega la arquitectura funcionando (repositorio de
 solo lectura, servicio, configuración, navegación y una página por vista),
 con esqueletos mínimos por página — no gráficos históricos completos, no
 comparación entre símbolos, no auto-refresh real, no diseño visual
-definitivo (eso es la Iteración 5.3). El Dashboard es de **solo lectura**:
+definitivo (eso es la Iteración 5.3). En particular, la página **Resumen
+General** hoy solo lista los símbolos configurados: las tarjetas KPI por
+símbolo (precio, señal y recomendación de IA más recientes) se desarrollan
+en la Iteración 5.3. El Dashboard es de **solo lectura**:
 nunca escribe en `data/crypto_data.db`, no recalcula indicadores ni
 señales, no genera recomendaciones de IA ni se conecta a Binance
 directamente — solo lee lo que `python -m src.main` ya guardó. Si la base

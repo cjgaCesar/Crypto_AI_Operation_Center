@@ -105,3 +105,82 @@ def test_dashboard_repository_survives_missing_database_without_creating_it(tmp_
     dashboard_repository.get_latest_market("Binance", "BTCUSDT")
 
     assert not db_path.exists()
+
+
+def test_readonly_connection_actually_rejects_writes(tmp_path):
+    """Confirma que _get_readonly_connection() abre el archivo en modo
+    'mode=ro' de verdad (no solo de nombre): un INTENTO de escritura a
+    través de esa misma conexión debe ser rechazado por SQLite, no solo
+    'nunca usado para escribir' por convención de código."""
+    db_path = str(tmp_path / "readonly_uri.db")
+    market_repository = SQLiteMarketDataRepository(db_path)
+    market_repository.init()
+
+    dashboard_repository = SQLiteDashboardRepository(db_path)
+    conn = dashboard_repository._get_readonly_connection()
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO market_data "
+                "(exchange, symbol, price, volume_24h, price_change_percent_24h, queried_at) "
+                "VALUES ('Binance', 'BTCUSDT', 1.0, 1.0, 1.0, '2026-01-01T00:00:00+00:00')"
+            )
+            conn.commit()
+            wrote_successfully = True
+        except sqlite3.OperationalError:
+            wrote_successfully = False
+    finally:
+        conn.close()
+
+    assert wrote_successfully is False
+
+
+def test_dashboard_never_triggers_a_migration_on_legacy_schema(tmp_path):
+    """Confirma que consultar una tabla con un esquema antiguo (le falta
+    una columna que SQLiteSignalRepository migraría en un ALTER TABLE) a
+    través del Dashboard NO dispara ninguna migración: la columna sigue
+    faltando después, porque SQLiteDashboardRepository nunca llama a
+    init() de ningún repositorio."""
+    db_path = str(tmp_path / "legacy_signals.db")
+    conn = sqlite3.connect(db_path)
+    # Esquema deliberadamente incompleto: sin 'trend_reason' ni las demás
+    # columnas que SQLiteSignalRepository.init() agregaría con su
+    # migración idempotente si se le llamara.
+    conn.execute(
+        """
+        CREATE TABLE market_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            trend TEXT NOT NULL,
+            trend_strength TEXT NOT NULL,
+            ema_signal TEXT NOT NULL,
+            macd_signal TEXT NOT NULL,
+            rsi_signal TEXT NOT NULL,
+            bollinger_signal TEXT NOT NULL,
+            score REAL NOT NULL,
+            confidence TEXT NOT NULL,
+            generated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    columns_before = {
+        row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(market_signals)")
+    }
+    assert "trend_reason" not in columns_before  # confirma el punto de partida "legacy"
+
+    dashboard_repository = SQLiteDashboardRepository(db_path)
+    # Ninguno de estos métodos debe intentar migrar nada; get_latest_signal
+    # puede incluso fallar internamente al reconstruir SignalSnapshot (por
+    # las columnas faltantes) y el propio SQLiteSignalRepository ya la
+    # captura como sqlite3.OperationalError -> None, sin migrar.
+    dashboard_repository.get_table_status()
+    dashboard_repository.get_latest_signal("Binance", "BTCUSDT")
+
+    columns_after = {
+        row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(market_signals)")
+    }
+    assert columns_after == columns_before  # ninguna columna nueva: no hubo migración
