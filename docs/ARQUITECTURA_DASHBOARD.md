@@ -169,12 +169,13 @@ evita que una página diverja de la otra en el futuro.
   `layout.py`: ninguna página debe escribir su propio texto de ayuda para
   este selector.
 
-### Reglas obligatorias para páginas futuras (Indicadores/Señales/Recomendaciones)
+### Reglas obligatorias de responsive (aplicadas a las 6 páginas; vigentes para cualquier página futura)
 
-Cuando se implementen los gráficos históricos e indicadores de esas 3
-páginas (todavía esqueletos; "Mercado" ya sigue estas reglas desde la
-Iteración 5.4), deben ser **responsive desde el inicio**, no revisarse
-después:
+Estas reglas ya se aplicaron a las 6 páginas del Dashboard ("Mercado"
+desde la 5.4, "Indicadores" desde la 5.5, "Señales" desde la 5.6,
+"Recomendaciones de IA" desde la 5.7) y siguen vigentes para cualquier
+página que se agregue en una etapa futura: deben ser **responsive desde
+el inicio**, no revisarse después:
 
 - Tablas con ancho del contenedor: `st.dataframe(..., use_container_width=True)`.
 - Gráficos con ancho del contenedor: Plotly con `use_container_width=True`.
@@ -589,11 +590,11 @@ límite) sin depender de cómo Streamlit auto-descubre archivos.
 > de las 4 tablas SQLite (existe/vacía/con datos) que una vista de solo
 > lectura de `config.yaml`. En la Iteración 5.2 las 6 páginas eran
 > esqueletos mínimos (título + un dato simple + manejo de ausencia de
-> datos). En la Iteración 5.3, "Resumen General" se completó. En la
-> Iteración 5.4, `mercado.py` se completó y su página pasó a llamarse
-> "Mercado" (antes "Precios", para que coincida con el nombre del
-> módulo y de la tabla que consulta); Indicadores/Señales/Recomendaciones
-> de IA siguen como esqueletos, pendientes de una iteración futura.
+> datos); se completaron progresivamente: "Resumen General" en la 5.3,
+> `mercado.py` en la 5.4 (pasó a llamarse "Mercado", antes "Precios",
+> para que coincida con el nombre del módulo y de la tabla que consulta),
+> "Indicadores" en la 5.5, "Señales" en la 5.6 y "Recomendaciones de IA"
+> en la 5.7. **Las 6 páginas del Dashboard ya son funcionales.**
 
 1. **Resumen General** (`resumen.py`) — **funcional desde la Iteración
    5.3**: una tarjeta por símbolo configurado (`DashboardService.get_summary_view()`)
