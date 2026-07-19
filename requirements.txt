@@ -7,3 +7,5 @@ schedule==1.2.2        # Para repetir la consulta automáticamente cada N minuto
 pytest==8.3.4          # Para ejecutar las pruebas automatizadas del proyecto
 pydantic==2.9.2        # Modelos de datos con validación (ej. MarketTicker)
 python-dotenv==1.0.1    # Para leer credenciales desde el archivo .env
+streamlit==1.39.0       # Dashboard de solo lectura (Etapa 5)
+plotly==5.24.1          # Gráficos del Dashboard (Etapa 5)

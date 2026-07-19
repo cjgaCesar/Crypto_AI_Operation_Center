@@ -1,8 +1,40 @@
 # Arquitectura del Dashboard (Etapa 5)
 
-> Diseño de la Iteración 5.1. No hay código todavía: este documento es la
-> base para la implementación de la Iteración 5.2, pendiente de
-> aprobación.
+> Diseño original de la Iteración 5.1, actualizado en la Iteración 5.2 con
+> la estructura de módulos realmente implementada (ver "Nota de
+> implementación" más abajo). El Dashboard tiene su estructura base
+> funcionando, pero **todavía no está completo**: las páginas son
+> esqueletos mínimos (ver `docs/ALCANCE_ETAPA_5.md`).
+
+## Nota de implementación (Iteración 5.2)
+
+El diseño original de la Iteración 5.1 proponía una única capa de
+consulta (`data_access.py`). Al implementarla, se dividió en dos módulos
+más pequeños y con responsabilidades más claras — sin cambiar el
+principio de diseño (separar consulta de presentación), solo su
+granularidad:
+
+- **`repository.py`**: `DashboardRepository` (interfaz) +
+  `SQLiteDashboardRepository`. Reemplaza a `data_access.py`: es la única
+  pieza que abre conexiones SQLite (reutilizando los 4 repositorios
+  existentes para `fetch_latest`/`fetch_history`, y una conexión propia
+  en modo solo lectura para los 2 métodos que no tienen equivalente:
+  `get_available_symbols()`, `get_table_status()`).
+- **`service.py`**: `DashboardService`. No estaba en el diseño original
+  como un módulo separado; se agregó para que las páginas no llamen
+  directamente al repositorio, sino a una capa que arma los modelos de
+  presentación (`models.py`) y resuelve normalización/límites
+  (`filters.py`). Esto deja `repository.py` enfocado solo en SQL.
+- **`models.py`**, **`config.py`**, **`filters.py`**, **`formatters.py`**:
+  no estaban explícitos en el diseño de la Iteración 5.1; se agregaron
+  porque el principio "no contener diccionarios sin tipar como contrato
+  principal" y "validar límites/normalizar símbolos" necesitaban un lugar
+  propio, en vez de mezclarse dentro de `data_access.py` o de las páginas.
+
+El principio de fondo (consulta separada de presentación, migrable a una
+futura API sin reescribirse) **no cambió**: sigue siendo válido reemplazar
+"`data_access.py`" por "`repository.py` + `service.py`" en el diagrama de
+abajo.
 
 ## Tecnología seleccionada: Streamlit
 
@@ -22,67 +54,93 @@ futuro sin reescribir la lógica de consulta:
 ```
 SQLite (4 repositorios ya existentes, solo lectura)
     ↓
-src/dashboard/data_access.py   (capa de consulta, reutiliza los repos)
+src/dashboard/repository.py   (DashboardRepository / SQLiteDashboardRepository)
     ↓
-src/dashboard/pages/*.py       (una página Streamlit por vista)
+src/dashboard/service.py        (DashboardService: arma modelos de presentación)
+    ↓
+src/dashboard/pages/*.py          (una página Streamlit por vista)
     ↓
 Streamlit (renderiza en el navegador)
 ```
 
-- **`data_access.py`** es la única pieza que sabe instanciar
+- **`repository.py`** es la única pieza que sabe instanciar
   `SQLiteMarketDataRepository`, `SQLiteIndicatorRepository`,
   `SQLiteSignalRepository` y `SQLiteAIRepository`, y solo llama a sus
-  métodos `fetch_latest`/`fetch_history` (nunca `save()`). Expone
-  funciones simples (ej. `get_latest_signal(symbol)`,
-  `get_price_history(symbol, limit)`) que no saben nada de Streamlit.
-- **Las páginas** (`src/dashboard/pages/`) solo llaman a `data_access.py`
-  y renderizan el resultado (tablas, gráficos, tarjetas KPI). No abren
-  conexiones a SQLite directamente.
+  métodos `fetch_latest`/`fetch_history` (nunca `save()`).
+- **`service.py`** llama a `repository.py` y arma los modelos de
+  `models.py` (ej. `DashboardSummary`); no sabe nada de Streamlit.
+- **Las páginas** (`src/dashboard/pages/`) solo llaman a `service.py` y
+  renderizan el resultado. No abren conexiones a SQLite directamente.
 - **Migración futura a FastAPI**: si se decide exponer una API, sus
-  endpoints llamarían a las mismas funciones de `data_access.py` que hoy
-  usa Streamlit. Ni los repositorios ni la capa de consulta cambiarían.
+  endpoints llamarían a las mismas funciones de `service.py` que hoy usa
+  Streamlit. Ni los repositorios ni `repository.py`/`service.py`
+  cambiarían.
 
-## Estructura de módulos propuesta (a crear en la Iteración 5.2)
+## Estructura de módulos (implementada en la Iteración 5.2)
 
 ```
 src/dashboard/
-├── __init__.py           # (ya existe, reservado)
+├── __init__.py
 ├── app.py                  # Punto de entrada: streamlit run src/dashboard/app.py
-├── data_access.py            # Capa de consulta de solo lectura (reutiliza los 4 repos)
-├── components.py                # Helpers de presentación reutilizables (tarjeta KPI, gráfico de líneas)
-└── pages/                          # Una página por vista (convención multipágina de Streamlit)
-    ├── 1_Resumen_General.py
-    ├── 2_Precios_e_Indicadores.py
-    ├── 3_Senales.py
-    ├── 4_Recomendaciones_IA.py
-    └── 5_Configuracion.py
+├── config.py                 # DashboardConfig + build_dashboard_config()
+├── models.py                   # TableStatus, DashboardStatus, Latest*Snapshot, DashboardSummary
+├── repository.py                 # DashboardRepository (interfaz) + SQLiteDashboardRepository
+├── service.py                      # DashboardService
+├── filters.py                        # normalize_symbol/normalize_exchange/validate_limit
+├── formatters.py                       # format_price/format_percent/format_timestamp/format_enum
+├── charts.py                             # empty_figure/line_chart (mínimos; completos en 5.3)
+├── components.py                           # render_not_available/render_kpi_card
+└── pages/                                    # Una página por vista (esqueletos en 5.2)
+    ├── __init__.py
+    ├── resumen.py
+    ├── mercado.py
+    ├── indicadores.py
+    ├── senales.py
+    ├── recomendaciones.py
+    └── estado_tecnico.py
 ```
 
-Nada de esto se crea todavía en esta iteración (ver
-`docs/ALCANCE_ETAPA_5.md`, "Explícitamente fuera de la Iteración 5.1").
+No se usa la convención automática de nombres numerados de páginas de
+Streamlit (`1_...py`, `2_...py`): la navegación queda centralizada en
+`app.py` (una barra lateral con `st.sidebar.radio`), a propósito, para
+tener control total sobre qué se le pasa a cada página (servicio, símbolo,
+límite) sin depender de cómo Streamlit auto-descubre archivos.
 
 ## Páginas
 
-1. **Resumen General**: una tarjeta KPI por símbolo configurado (precio
-   actual, variación 24h, `signal_type` más reciente, `recommendation` de
-   IA más reciente con su `confidence`). Vista de "un vistazo" a los 3
-   símbolos a la vez.
-2. **Precios e Indicadores**: para el símbolo seleccionado (filtro
-   global), gráfico de precio histórico (`market_data`) superpuesto con
-   SMA/EMA, y gráficos separados para RSI, MACD y Bollinger
-   (`market_indicators`).
-3. **Señales**: historial de `score`/`confidence`/`signal_type`
-   (`market_signals`) en el tiempo, y el detalle completo de la señal más
-   reciente: `trend`/`ema_signal`/`macd_signal`/`rsi_signal`/`bollinger_signal`
-   con su `reason` y `rule_strength` individuales.
-4. **Recomendaciones de IA**: historial de `recommendation`/`confidence`/
-   `risk_level` (`ai_recommendations`) en el tiempo, y el detalle completo
-   de la recomendación más reciente: `reasoning`, `advantages`, `risks`,
-   `summary`, `provider`/`model`/`prompt_version`, `processing_time_ms`.
-5. **Configuración**: vista de solo lectura de los valores relevantes de
-   `config.yaml` (símbolos, intervalo, umbrales de `signals`/`ai`), para
-   transparencia sobre qué configuración generó los datos que se están
-   viendo. No permite editar nada.
+> Nota de implementación: la página "Precios e Indicadores" del diseño
+> original se dividió en dos páginas separadas (`mercado.py` /
+> `indicadores.py`), y "Configuración" se reemplazó por "Estado Técnico"
+> (`estado_tecnico.py`), que resultó más útil para diagnosticar el estado
+> de las 4 tablas SQLite (existe/vacía/con datos) que una vista de solo
+> lectura de `config.yaml`. En la Iteración 5.2 las 6 páginas son
+> esqueletos mínimos (título + un dato simple + manejo de ausencia de
+> datos); el contenido completo de cada una es la Iteración 5.3.
+
+1. **Resumen General** (`resumen.py`): en 5.3, una tarjeta KPI por símbolo
+   configurado (precio actual, variación 24h, `signal_type` más reciente,
+   `recommendation` de IA más reciente con su `confidence`). En 5.2, solo
+   lista los símbolos configurados.
+2. **Precios** (`mercado.py`): en 5.3, gráfico de precio histórico
+   (`market_data`) superpuesto con SMA/EMA. En 5.2, solo el último precio.
+3. **Indicadores** (`indicadores.py`): en 5.3, gráficos de RSI, MACD y
+   Bandas de Bollinger (`market_indicators`). En 5.2, solo el RSI más
+   reciente.
+4. **Señales** (`senales.py`): en 5.3, historial de
+   `score`/`confidence`/`signal_type` en el tiempo, y el detalle completo
+   de la señal más reciente (`trend`/`ema_signal`/`macd_signal`/
+   `rsi_signal`/`bollinger_signal` con su `reason` y `rule_strength`
+   individuales). En 5.2, solo `signal_type`/`score` más recientes.
+5. **Recomendaciones de IA** (`recomendaciones.py`): en 5.3, historial de
+   `recommendation`/`confidence`/`risk_level` en el tiempo, y el detalle
+   completo de la recomendación más reciente (`reasoning`, `advantages`,
+   `risks`, `summary`, `provider`/`model`/`prompt_version`,
+   `processing_time_ms`). En 5.2, solo `recommendation`/`confidence` más
+   recientes.
+6. **Estado Técnico** (`estado_tecnico.py`): estado de las 4 tablas SQLite
+   (existe, cuántas filas, registro más reciente). Ya queda completamente
+   funcional desde la Iteración 5.2, porque no depende de gráficos ni de
+   un símbolo específico.
 
 ## Componentes reutilizables
 
