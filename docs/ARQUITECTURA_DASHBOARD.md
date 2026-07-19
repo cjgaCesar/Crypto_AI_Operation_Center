@@ -97,9 +97,18 @@ Streamlit no expone el ancho real del viewport del navegador (no hay
 breakpoints dinámicos nativos), y este proyecto explícitamente no agrega
 detección de viewport vía JavaScript ni paquetes de terceros para
 lograrlo. La estrategia adoptada es un selector manual en la barra
-lateral de "Resumen General" (`Vista: Automática/Amplia/Compacta`),
-guardado únicamente en `st.session_state` (nunca en disco ni en
-`config.yaml`):
+lateral (`Vista: Automática/Amplia/Compacta`), presente en "Resumen
+General" (desde la 5.3) y en "Mercado" (desde la 5.4), guardado
+únicamente en `st.session_state` (nunca en disco ni en `config.yaml`).
+
+**El modo de vista responsive es compartido entre las páginas del
+Dashboard mediante una única clave centralizada de st.session_state**
+(`layout.VIEW_MODE_SESSION_KEY`): elegir "Compacta" en una página y
+navegar a la otra conserva "Compacta", en vez de que cada página
+mantenga su propio modo por separado (lo que habría sido una
+experiencia inconsistente y no documentada). Esto se descubrió y
+corrigió al cerrar la Iteración 5.4: hasta entonces, cada página usaba
+su propia key (`resumen_view_mode` / `mercado_view_mode`).
 
 - **`src/dashboard/layout.py`** (nuevo): `get_cards_per_row(view_mode)`
   (Amplia=3, Automática=2, Compacta=1, cualquier valor desconocido cae en
@@ -131,6 +140,17 @@ guardado únicamente en `st.session_state` (nunca en disco ni en
   con lo que ya provee Streamlit (`st.container`, `st.columns`,
   `st.metric`, sintaxis de markdown coloreado); no se agregó ningún
   paquete a `requirements.txt` para esto.
+- **Hallazgo verificado sobre widgets con `key` compartida entre
+  páginas**: compartir la misma `key` de `st.session_state` no basta por
+  sí solo. Streamlit solo conserva el valor guardado si el resto de los
+  argumentos de construcción del widget (en particular `help`) también
+  coinciden entre una página y otra; si difieren, trata la instancia
+  como un widget distinto y resetea al `index` por defecto (comportamiento
+  reproducido de forma aislada y confirmado con pruebas automatizadas en
+  `tests/test_dashboard_navigation.py`). Por eso `VIEW_MODE_HELP_TEXT`
+  (además de `VIEW_MODE_SESSION_KEY`) también vive centralizado en
+  `layout.py`: ninguna página debe escribir su propio texto de ayuda para
+  este selector.
 
 ### Reglas obligatorias para páginas futuras (Indicadores/Señales/Recomendaciones)
 
@@ -208,6 +228,14 @@ todo lo que ya existía sin agregar ninguna dependencia nueva:
   Con un único registro, `previous_price`/`absolute_change`/
   `percentage_change` quedan en `None` ("N/D"), pero el precio actual y
   el máximo/mínimo (iguales al único precio disponible) sí se muestran.
+- **Cierre de la iteración**: al revisar el estado responsive compartido
+  entre "Resumen General" y "Mercado" se encontró que cada página usaba
+  su propia key de `st.session_state` (`resumen_view_mode` /
+  `mercado_view_mode`), por lo que elegir un modo en una página no se
+  conservaba al navegar a la otra. Se unificó en
+  `layout.VIEW_MODE_SESSION_KEY`, y se descubrió en el proceso que
+  compartir la key no alcanza por sí sola (ver "Diseño responsive" más
+  arriba): también se unificó `layout.VIEW_MODE_HELP_TEXT`.
 
 ## Tecnología seleccionada: Streamlit
 
@@ -285,7 +313,9 @@ src/dashboard/
 ├── theme.py                              # Paleta + get_signal_color/get_risk_color/
 │                                         # get_change_color/to_streamlit_color_name (5.3)
 ├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
-│                                          # render_responsive_metric_group (responsive, 5.3)
+│                                          # render_responsive_metric_group (responsive, 5.3) +
+│                                          # VIEW_MODE_SESSION_KEY/VIEW_MODE_HELP_TEXT
+│                                          # (key y help compartidos entre páginas, 5.4)
 ├── charts.py                             # empty_figure/line_chart (5.2; reutilizado sin
 │                                         # cambios por Mercado en 5.4)
 ├── components.py                           # render_not_available/render_kpi_card +
@@ -444,11 +474,15 @@ ni la 5.4 agregaron ninguna dependencia nueva.
 - **5.3**: página "Resumen General" funcional (`DashboardSummaryView`,
   `get_summary_view()`, `theme.py`, `layout.py`/diseño responsive,
   tarjetas de resumen sin HTML).
-- **5.4** (esta): página "Mercado" funcional (antes "Precios";
+- **5.4**: página "Mercado" funcional (antes "Precios";
   `MarketSummaryView`/`MarketHistoryPoint`/`MarketPageView`,
-  `get_market_page()`, gráfico de historial de precio, selector de vista
-  responsive propio). Indicadores, Señales y Recomendaciones de IA siguen
-  siendo esqueletos.
+  `get_market_page()`, gráfico de historial de precio). Al cerrar la
+  iteración se unificó el modo de vista responsive entre páginas
+  (`VIEW_MODE_SESSION_KEY`/`VIEW_MODE_HELP_TEXT` en `layout.py`, ver
+  "Diseño responsive" más arriba) y se agregó
+  `tests/test_dashboard_navigation.py` (pruebas de integración de
+  navegación y estado compartido). Indicadores, Señales y Recomendaciones
+  de IA siguen siendo esqueletos.
 - **Pendiente para la Iteración 5.5**: gráficos históricos completos de
   Indicadores/Señales/Recomendaciones de IA, auto-refresh real,
   comparación entre símbolos, diseño visual definitivo de toda la

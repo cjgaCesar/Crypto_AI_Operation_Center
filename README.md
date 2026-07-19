@@ -265,13 +265,17 @@ precio. No calcula indicadores técnicos, señales ni recomendaciones de
 IA (eso vive en las páginas Indicadores/Señales/Recomendaciones de IA,
 todavía esqueletos).
 
-Ambas páginas tienen **diseño responsive**: cada una incluye su propio
-selector **"Vista"** con 3 modos (**Automática**, **Amplia**,
-**Compacta**) en la barra lateral. En "Resumen General" controla cuántas
-tarjetas se muestran por fila (3 en Amplia, 2 en Automática, 1 apilada
-verticalmente en Compacta); en "Mercado" controla si las métricas se
-muestran en columnas o apiladas. La elección se guarda solo en la sesión
-del navegador (`st.session_state`), nunca en disco ni en `config.yaml`.
+Ambas páginas tienen **diseño responsive**: cada una incluye el selector
+**"Vista"** con 3 modos (**Automática**, **Amplia**, **Compacta**) en la
+barra lateral. En "Resumen General" controla cuántas tarjetas se
+muestran por fila (3 en Amplia, 2 en Automática, 1 apilada verticalmente
+en Compacta); en "Mercado" controla si las métricas se muestran en
+columnas o apiladas. **El modo de vista responsive es compartido entre
+las páginas del Dashboard mediante una única clave centralizada de
+st.session_state**: elegir "Compacta" en una página y navegar a la otra
+conserva "Compacta", en vez de resetear a un valor distinto. La
+elección se guarda solo en la sesión del navegador (`st.session_state`),
+nunca en disco ni en `config.yaml`.
 
 Las demás páginas (Indicadores, Señales, Recomendaciones de IA) siguen
 siendo esqueletos mínimos — su contenido completo (gráficos históricos,

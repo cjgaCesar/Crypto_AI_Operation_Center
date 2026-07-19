@@ -27,6 +27,30 @@ VIEW_MODE_COMPACT = "Compacta"
 
 VIEW_MODES = [VIEW_MODE_AUTO, VIEW_MODE_WIDE, VIEW_MODE_COMPACT]
 
+# Clave única de st.session_state para el selector "Vista", compartida por
+# todas las páginas que lo usen (hoy: 'Resumen General' y 'Mercado'). Cada
+# rerun de app.py solo renderiza una página a la vez (nunca dos
+# selectboxes con esta misma key simultáneamente), así que reutilizar la
+# misma key entre páginas es seguro y es precisamente lo que hace que el
+# modo elegido se conserve al navegar entre ellas: Streamlit ignora el
+# 'index' inicial de un widget si su key ya tiene un valor en
+# session_state (de una página anterior), y usa ese valor existente en su
+# lugar. Ninguna página debe escribir el nombre de esta key directamente.
+VIEW_MODE_SESSION_KEY = "dashboard_view_mode"
+
+# Texto de ayuda del selector "Vista", también compartido a propósito:
+# Streamlit solo conserva el valor guardado en session_state para un
+# widget con key repetida si el resto de sus argumentos de construcción
+# (incluido 'help') coinciden entre una página y otra. Si cada página
+# usara su propio texto de ayuda, el modo elegido se resetearía a
+# 'Automática' cada vez que la key se "reconstruye" con un help distinto
+# (comportamiento verificado). Ninguna página debe escribir su propio
+# texto de ayuda para este selector.
+VIEW_MODE_HELP_TEXT = (
+    "Automática: distribución conservadora. Amplia: más columnas/métricas "
+    "por fila. Compacta: apilada (ideal para pantallas angostas)."
+)
+
 # Tarjetas por fila según el modo de vista. Nunca 0, nunca más de 3.
 # 'Automática' usa un valor conservador intermedio (2): ni tan ancho como
 # para verse apretado en una pantalla mediana, ni tan angosto como para

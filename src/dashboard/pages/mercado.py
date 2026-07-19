@@ -23,7 +23,13 @@ from src.dashboard.components import (
     render_not_available,
     render_price_history_chart,
 )
-from src.dashboard.layout import VIEW_MODE_AUTO, VIEW_MODES, is_compact
+from src.dashboard.layout import (
+    VIEW_MODE_AUTO,
+    VIEW_MODE_HELP_TEXT,
+    VIEW_MODE_SESSION_KEY,
+    VIEW_MODES,
+    is_compact,
+)
 from src.dashboard.service import DashboardService
 
 
@@ -31,12 +37,13 @@ def render(service: DashboardService, exchange: str, symbol: str, limit: int) ->
     st.title("Mercado")
     st.caption(f"Historial de precio y disponibilidad de datos para {symbol}.")
 
-    # Selector de vista responsive: el mismo mecanismo que 'Resumen
-    # General' (ver src/dashboard/layout.py) — solo vive en
+    # Selector de vista responsive: comparte VIEW_MODE_SESSION_KEY y
+    # VIEW_MODE_HELP_TEXT con 'Resumen General' (ver src/dashboard/layout.py)
+    # — el modo elegido se conserva al navegar entre páginas. Solo vive en
     # st.session_state, nunca en disco ni en config.yaml.
     view_mode = st.sidebar.selectbox(
-        "Vista", VIEW_MODES, index=VIEW_MODES.index(VIEW_MODE_AUTO), key="mercado_view_mode",
-        help="Automática y Amplia: métricas en columnas. Compacta: apiladas (ideal para móvil).",
+        "Vista", VIEW_MODES, index=VIEW_MODES.index(VIEW_MODE_AUTO), key=VIEW_MODE_SESSION_KEY,
+        help=VIEW_MODE_HELP_TEXT,
     )
     compact = is_compact(view_mode)
 
