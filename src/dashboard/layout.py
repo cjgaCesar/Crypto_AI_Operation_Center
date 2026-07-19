@@ -64,6 +64,32 @@ _CARDS_PER_ROW = {
 T = TypeVar("T")
 
 
+def render_view_mode_selector() -> str:
+    """Único punto donde se construye el selectbox "Vista"
+    (Automática/Amplia/Compacta), reutilizado por todas las páginas que lo
+    necesiten (hoy: 'Resumen General' y 'Mercado'). Ninguna página debe
+    llamar a st.sidebar.selectbox() por su cuenta para esto: si cada una
+    construyera su propia instancia (aunque comparta VIEW_MODE_SESSION_KEY),
+    cualquier diferencia futura entre ellas — un 'help' distinto, un
+    'index' calculado de otra forma — volvería a romper la persistencia
+    del modo elegido al navegar entre páginas (ver docs/ARQUITECTURA_DASHBOARD.md).
+
+    Inicializa st.session_state[VIEW_MODE_SESSION_KEY] solo si todavía no
+    existe (primera carga de la sesión) y lo corrige a VIEW_MODE_AUTO si
+    contuviera un valor que ya no es válido (ej. tras un cambio de código).
+    Deliberadamente NO pasa 'index' ni 'value': con la key ya inicializada
+    en session_state, Streamlit usa ese valor existente sin necesidad de
+    reconciliarlo con un índice calculado en cada rerun."""
+    if VIEW_MODE_SESSION_KEY not in st.session_state:
+        st.session_state[VIEW_MODE_SESSION_KEY] = VIEW_MODE_AUTO
+    elif st.session_state[VIEW_MODE_SESSION_KEY] not in VIEW_MODES:
+        st.session_state[VIEW_MODE_SESSION_KEY] = VIEW_MODE_AUTO
+
+    return st.sidebar.selectbox(
+        "Vista", VIEW_MODES, key=VIEW_MODE_SESSION_KEY, help=VIEW_MODE_HELP_TEXT,
+    )
+
+
 def get_cards_per_row(view_mode: str) -> int:
     """Cuántas tarjetas mostrar por fila según el modo de vista. Un modo
     desconocido (incluyendo None) cae en el mismo valor que 'Automática'

@@ -110,12 +110,25 @@ experiencia inconsistente y no documentada). Esto se descubrió y
 corrigió al cerrar la Iteración 5.4: hasta entonces, cada página usaba
 su propia key (`resumen_view_mode` / `mercado_view_mode`).
 
+El selector en sí se construye en un único lugar:
+**`layout.render_view_mode_selector()`**. Ninguna página llama a
+`st.sidebar.selectbox("Vista", ...)` por su cuenta — ambas ("Resumen
+General" y "Mercado") llaman exclusivamente a esta función, que:
+inicializa `st.session_state[VIEW_MODE_SESSION_KEY]` en `VIEW_MODE_AUTO`
+solo si todavía no existe, corrige el valor a `VIEW_MODE_AUTO` si
+contuviera algo fuera de `VIEW_MODES` (ej. tras un cambio de código), y
+renderiza el `selectbox` sin pasar `index` (con la key ya inicializada,
+Streamlit usa ese valor existente directamente). Que la construcción del
+widget viva en un único lugar —no solo la key y el `help`— es lo que
+evita que una página diverja de la otra en el futuro.
+
 - **`src/dashboard/layout.py`** (nuevo): `get_cards_per_row(view_mode)`
   (Amplia=3, Automática=2, Compacta=1, cualquier valor desconocido cae en
   Automática — nunca 0, nunca más de 3), `is_compact(view_mode)`,
   `render_responsive_grid()` (distribuye tarjetas en filas de N columnas,
-  o de corrido si N<=1) y `render_responsive_metric_group()` (columnas o
-  apilado según el modo).
+  o de corrido si N<=1), `render_responsive_metric_group()` (columnas o
+  apilado según el modo) y `render_view_mode_selector()` (construcción
+  única y compartida del selector "Vista", ver arriba).
 - **`render_summary_card(view, compact=False)`** se refactorizó en 4
   secciones internas (`_render_market_section`,
   `_render_signal_section`, `_render_ai_section`,
@@ -232,10 +245,13 @@ todo lo que ya existía sin agregar ninguna dependencia nueva:
   entre "Resumen General" y "Mercado" se encontró que cada página usaba
   su propia key de `st.session_state` (`resumen_view_mode` /
   `mercado_view_mode`), por lo que elegir un modo en una página no se
-  conservaba al navegar a la otra. Se unificó en
-  `layout.VIEW_MODE_SESSION_KEY`, y se descubrió en el proceso que
-  compartir la key no alcanza por sí sola (ver "Diseño responsive" más
-  arriba): también se unificó `layout.VIEW_MODE_HELP_TEXT`.
+  conservaba al navegar a la otra. Un primer intento unificó solo
+  `layout.VIEW_MODE_SESSION_KEY` (y, tras un segundo hallazgo, también
+  `layout.VIEW_MODE_HELP_TEXT`, ver "Diseño responsive" más arriba), pero
+  cada página seguía construyendo su propio `st.sidebar.selectbox(...)`
+  por separado. La solución definitiva centralizó también la
+  construcción del widget en `layout.render_view_mode_selector()`: ambas
+  páginas la llaman exclusivamente, sin key/index/help propios.
 
 ## Tecnología seleccionada: Streamlit
 
@@ -314,8 +330,8 @@ src/dashboard/
 │                                         # get_change_color/to_streamlit_color_name (5.3)
 ├── layout.py                              # get_cards_per_row/is_compact/render_responsive_grid/
 │                                          # render_responsive_metric_group (responsive, 5.3) +
-│                                          # VIEW_MODE_SESSION_KEY/VIEW_MODE_HELP_TEXT
-│                                          # (key y help compartidos entre páginas, 5.4)
+│                                          # render_view_mode_selector() (construcción única y
+│                                          # compartida del selector "Vista" entre páginas, 5.4)
 ├── charts.py                             # empty_figure/line_chart (5.2; reutilizado sin
 │                                         # cambios por Mercado en 5.4)
 ├── components.py                           # render_not_available/render_kpi_card +
@@ -477,9 +493,9 @@ ni la 5.4 agregaron ninguna dependencia nueva.
 - **5.4**: página "Mercado" funcional (antes "Precios";
   `MarketSummaryView`/`MarketHistoryPoint`/`MarketPageView`,
   `get_market_page()`, gráfico de historial de precio). Al cerrar la
-  iteración se unificó el modo de vista responsive entre páginas
-  (`VIEW_MODE_SESSION_KEY`/`VIEW_MODE_HELP_TEXT` en `layout.py`, ver
-  "Diseño responsive" más arriba) y se agregó
+  iteración se centralizó el selector "Vista" en
+  `layout.render_view_mode_selector()` (ver "Diseño responsive" más
+  arriba), compartido por ambas páginas, y se agregó
   `tests/test_dashboard_navigation.py` (pruebas de integración de
   navegación y estado compartido). Indicadores, Señales y Recomendaciones
   de IA siguen siendo esqueletos.
