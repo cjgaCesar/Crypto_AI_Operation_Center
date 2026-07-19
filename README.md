@@ -127,7 +127,7 @@ Crypto_AI_Operation_Center/
 │   ├── utils/                           # Configuración y logging
 │   │   ├── config.py                      # Lee config.yaml + .env
 │   │   └── logger.py                      # Configuración de logs
-│   ├── dashboard/                         # Reservado para el dashboard (etapa futura)
+│   ├── dashboard/                         # Dashboard Streamlit (Etapa 5, en desarrollo — ver docs/ARQUITECTURA_DASHBOARD.md)
 │   ├── alerts/                            # Reservado para alertas (etapa futura)
 │   └── telegram/                          # Reservado para Telegram (etapa futura)
 ├── data/
@@ -267,6 +267,12 @@ Estado Técnico) siguen siendo esqueletos mínimos — su contenido completo
 (gráficos históricos, comparaciones) queda para una iteración futura, y
 la identidad visual definitiva de toda la aplicación (más allá de la
 paleta ya centralizada en `theme.py`) también se completará más adelante.
+
+El diseño responsive se validó mediante pruebas automatizadas (AppTest) y
+revisión de código (sin anchos/altos fijos, sin tablas HTML, sin scroll
+horizontal forzado), pero **todavía no se validó visualmente en un
+navegador real** en ningún tamaño de pantalla — se recomienda hacerlo
+antes de dar por cerrado el diseño responsive de esta iteración.
 
 El Dashboard es de **solo lectura**: nunca escribe en
 `data/crypto_data.db`, no recalcula indicadores ni señales, no genera
