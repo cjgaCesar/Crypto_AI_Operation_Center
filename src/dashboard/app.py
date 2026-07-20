@@ -18,12 +18,16 @@ from src.dashboard.pages import (
     estado_tecnico,
     indicadores,
     mercado,
+    paper_trading,
     recomendaciones,
     resumen,
     senales,
 )
+from src.dashboard.paper_trading_repository import RepositoryPaperTradingDashboardRepository
+from src.dashboard.paper_trading_service import PaperTradingDashboardService
 from src.dashboard.repository import SQLiteDashboardRepository
 from src.dashboard.service import DashboardService
+from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 from src.utils.config import load_settings
 
 _PAGE_RESUMEN = "Resumen General"
@@ -32,6 +36,7 @@ _PAGE_INDICADORES = "Indicadores"
 _PAGE_SENALES = "Señales"
 _PAGE_RECOMENDACIONES = "Recomendaciones de IA"
 _PAGE_ESTADO_TECNICO = "Estado Técnico"
+_PAGE_PAPER_TRADING = "Paper Trading"
 
 _PAGE_NAMES = [
     _PAGE_RESUMEN,
@@ -40,13 +45,17 @@ _PAGE_NAMES = [
     _PAGE_SENALES,
     _PAGE_RECOMENDACIONES,
     _PAGE_ESTADO_TECNICO,
+    _PAGE_PAPER_TRADING,
 ]
 
 # Páginas que no necesitan un selector de símbolo/límite en la barra lateral.
-_PAGES_WITHOUT_SYMBOL_FILTER = {_PAGE_RESUMEN, _PAGE_ESTADO_TECNICO}
+# 'Paper Trading' tiene su propio conjunto de filtros (exchange/símbolo/
+# estado de orden/límite/incluir FLAT, ver pages/paper_trading.py), distinto
+# del selector de símbolo de mercado que comparten el resto de páginas.
+_PAGES_WITHOUT_SYMBOL_FILTER = {_PAGE_RESUMEN, _PAGE_ESTADO_TECNICO, _PAGE_PAPER_TRADING}
 
 
-def _build_service_and_config() -> tuple[DashboardService, DashboardConfig]:
+def _build_service_and_config() -> tuple[DashboardService, DashboardConfig, PaperTradingDashboardService]:
     settings = load_settings()
     # "Binance" es, hoy, el único exchange implementado (ver
     # BinanceExchangeClient.exchange_name en src/market/binance.py); igual
@@ -61,14 +70,33 @@ def _build_service_and_config() -> tuple[DashboardService, DashboardConfig]:
         default_history_limit=config.default_history_limit,
         max_history_limit=config.max_history_limit,
     )
-    return service, config
+
+    # Deliberadamente NO se llama build_paper_trading_context() aquí: esa
+    # función ejecuta repository.init() y siembra el capital inicial (Etapa
+    # 6.5), efectos que este Dashboard de solo lectura nunca debe producir
+    # (ver Paso 21 de la Etapa 6.6). Se construye únicamente el repositorio
+    # de escritura sin llamar a ningún método de escritura, envuelto en el
+    # adaptador de solo lectura de esta etapa.
+    paper_trading_repository = SQLitePaperTradingRepository(settings.paper_trading.database_path)
+    paper_trading_dashboard_repository = RepositoryPaperTradingDashboardRepository(
+        paper_trading_repository, settings.paper_trading.database_path,
+    )
+    paper_trading_service = PaperTradingDashboardService(
+        repository=paper_trading_dashboard_repository,
+        enabled=settings.paper_trading.enabled,
+        currency=settings.paper_trading.currency,
+        default_history_limit=config.default_history_limit,
+        max_history_limit=config.max_history_limit,
+    )
+
+    return service, config, paper_trading_service
 
 
 def main() -> None:
     st.set_page_config(page_title="Crypto AI Operation Center — Dashboard", layout="wide")
 
     try:
-        service, config = _build_service_and_config()
+        service, config, paper_trading_service = _build_service_and_config()
     except Exception as exc:
         st.error(f"No se pudo cargar la configuración del proyecto: {exc}")
         return
@@ -115,6 +143,8 @@ def main() -> None:
             senales.render(service, exchange=config.exchange, symbol=symbol, limit=limit)
         elif page_name == _PAGE_RECOMENDACIONES:
             recomendaciones.render(service, exchange=config.exchange, symbol=symbol, limit=limit)
+        elif page_name == _PAGE_PAPER_TRADING:
+            paper_trading.render(paper_trading_service)
     except Exception as exc:
         st.error(f"Ocurrió un error al mostrar esta página: {exc}")
 

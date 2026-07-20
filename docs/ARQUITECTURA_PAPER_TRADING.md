@@ -1,21 +1,78 @@
 # Arquitectura de Paper Trading (Etapa 6.0 — diseño; implementación en curso desde 6.1)
 
-> **Este documento sigue siendo la referencia de diseño.** El Dashboard
-> de Paper Trading descrito aquí **todavía no existe** en el código
-> (llega en la Etapa 6.6 en adelante). Lo que **sí existe ya**,
-> implementado y con pruebas, es el dominio (`src/paper_trading/
-> models.py`, `enums.py`, `validators.py`, `exceptions.py`, Etapa 6.1),
-> los motores puros (`fill_engine.py`, `position_engine.py`,
-> `pnl_engine.py`, `risk_engine.py`, Etapa 6.2), la persistencia SQLite
-> (`base.py`, `sqlite_repository.py`, `postgres_repository.py`,
-> `serialization.py`, Etapa 6.3), la capa de servicio
-> (`service.py`/`PaperTradingService`, `service_results.py`, Etapa 6.4)
-> y la Composition Root con integración manual controlada
+> **Este documento sigue siendo la referencia de diseño.** Lo que **sí
+> existe ya**, implementado y con pruebas, es el dominio
+> (`src/paper_trading/models.py`, `enums.py`, `validators.py`,
+> `exceptions.py`, Etapa 6.1), los motores puros (`fill_engine.py`,
+> `position_engine.py`, `pnl_engine.py`, `risk_engine.py`, Etapa 6.2), la
+> persistencia SQLite (`base.py`, `sqlite_repository.py`,
+> `postgres_repository.py`, `serialization.py`, Etapa 6.3), la capa de
+> servicio (`service.py`/`PaperTradingService`, `service_results.py`,
+> Etapa 6.4), la Composition Root con integración manual controlada
 > (`composition.py`, `application.py`, `price_provider.py`,
 > `runtime.py`, más una sección `paper_trading:` en `config.yaml` y una
-> integración mínima en `main.py`, Etapa 6.5) — ver las notas de
-> implementación justo debajo. No hay compra ni
-> venta real (con dinero real) en ninguna etapa de Paper Trading.
+> integración mínima en `main.py`, Etapa 6.5) y el Dashboard read-only
+> (`src/dashboard/paper_trading_models.py`, `paper_trading_repository.py`,
+> `paper_trading_service.py`, `pages/paper_trading.py`, Etapa 6.6) — ver
+> las notas de implementación justo debajo. No hay compra ni venta real
+> (con dinero real) en ninguna etapa de Paper Trading.
+
+> **Nota de implementación (Etapa 6.6 — Dashboard read-only)**: la
+> página "Paper Trading" del Dashboard (Streamlit) es estrictamente de
+> consulta -- no existe ningún botón, formulario ni acción que pueda
+> ejecutar, crear, cancelar o modificar una orden.
+> - **Fuente de datos**: `RepositoryPaperTradingDashboardRepository`
+>   envuelve `PaperTradingRepository` (Etapa 6.3) reutilizando
+>   únicamente sus métodos de lectura (`get_cash_balance`,
+>   `fetch_positions`, `fetch_orders`, `fetch_executions`, `fetch_trades`,
+>   `fetch_portfolio_history`, `fetch_pnl_history`,
+>   `calculate_realized_pnl`, `check_position_pnl_consistency`) — nunca
+>   llama a `save_*`, `save_fill_transaction`, `seed_initial_cash_balance`
+>   ni `.init()`. `get_status()` es la única consulta SQL propia (una
+>   introspección `mode=ro` de `sqlite_master`, igual que
+>   `SQLiteDashboardRepository.get_table_status()` de la Etapa 5),
+>   necesaria para distinguir "nunca inicializado" de "inicializado pero
+>   vacío".
+> - **Sin `build_paper_trading_context()`**: el Dashboard construye
+>   `SQLitePaperTradingRepository(database_path)` directamente, sin
+>   llamar a ningún método de escritura — nunca siembra `CashBalance`
+>   (verificado con una prueba dedicada, ver
+>   `tests/test_paper_trading_dashboard_readonly.py`).
+> - **Métricas del resumen**: `available_balance = total_balance -
+>   reserved_balance`; `positions_value`/`total_equity`/
+>   `unrealized_pnl_total`/`realized_pnl_cumulative` provienen siempre
+>   del último `PortfolioSnapshot` persistido (nunca se recalculan); si
+>   no existe ningún snapshot, esos campos quedan en `None` ("N/D" en
+>   pantalla) — nunca se inventa un valor ni se consulta un precio
+>   externo.
+> - **Auditoría de PnL**: por cada `(exchange, symbol)` con `Position` y/o
+>   `Trade`, se informa `Consistente`/`Inconsistente`/`Sin posición`/
+>   `Sin trades`, comparando `Position.realized_pnl_to_date` contra
+>   `calculate_realized_pnl()` (`SUM(Trade.net_pnl)` exacto en Decimal).
+>   El indicador global solo se marca "Existen inconsistencias" ante una
+>   fila explícitamente `Inconsistente` — un error real, detectado y
+>   corregido durante esta etapa, contaba erróneamente `Sin trades` como
+>   inconsistencia. El Dashboard nunca corrige una inconsistencia.
+> - **Gráficos**: patrimonio/PnL realizado acumulado/PnL no realizado
+>   provienen de la serie histórica de `PortfolioSnapshot` (no de
+>   `PnLSnapshot`, que solo se usa para un detalle opcional por símbolo);
+>   la distribución de PnL neto por símbolo suma `Trade.net_pnl` con
+>   Decimal. `Decimal` se mantiene en toda la capa de servicio;
+>   `float(...)` solo se aplica en la última línea antes de pasarle los
+>   datos a Plotly.
+> - **`enabled=false`**: se muestra una advertencia clara, pero los datos
+>   históricos ya existentes se siguen mostrando con normalidad (nunca se
+>   ocultan) — ningún control operacional aparece en ningún caso.
+> - **Base sin tablas**: `get_status()` reporta `initialized=False`; la
+>   página muestra "Paper Trading aún no ha sido inicializado" y no
+>   intenta leer nada más, sin stacktrace.
+> - **Automatización sigue sin existir**: `src/signals/`, `src/ai/` y el
+>   resto del Dashboard no referencian `paper_trading` en absoluto
+>   (auditoría de imports); `run_full_cycle()`/el scheduler de `main.py`
+>   no cambiaron.
+> - **Pendiente**: reserva real de `CashBalance.reserved_balance`/
+>   `Position.reserved_quantity` (sigue en 0); cualquier ejecución desde
+>   el Dashboard, Signals o IA; migración PostgreSQL real.
 
 > **Nota de implementación (Etapa 6.5 — Composition Root e integración
 > controlada)**: Paper Trading tiene, desde esta etapa, una forma real

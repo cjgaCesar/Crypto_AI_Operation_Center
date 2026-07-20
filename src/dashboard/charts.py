@@ -54,3 +54,15 @@ def multi_line_chart(x: list, series: dict, title: str = "") -> go.Figure:
             figure.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name))
     figure.update_layout(title=title)
     return figure
+
+
+def bar_chart(labels: list, values: list, title: str = "") -> go.Figure:
+    """Gráfico de barras genérico: una barra por (label, value) -- ej.
+    distribución de PnL neto por símbolo (Etapa 6.6). Si no hay datos,
+    devuelve empty_figure() en vez de un gráfico vacío confuso."""
+    if not labels or not values:
+        return empty_figure()
+
+    figure = go.Figure(data=go.Bar(x=labels, y=values))
+    figure.update_layout(title=title)
+    return figure
