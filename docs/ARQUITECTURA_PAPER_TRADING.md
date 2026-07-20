@@ -1,14 +1,54 @@
 # Arquitectura de Paper Trading (Etapa 6.0 — diseño; implementación en curso desde 6.1)
 
-> **Este documento sigue siendo la referencia de diseño.** Las tablas,
-> el repositorio, el servicio, `config.yaml` y el Dashboard descritos
-> aquí **todavía no existen** en el código (llegan en las Etapas 6.3 en
-> adelante). Lo que **sí existe ya**, implementado y con pruebas, es el
-> dominio (`src/paper_trading/models.py`, `enums.py`, `validators.py`,
-> `exceptions.py`, Etapa 6.1) y los motores puros (`fill_engine.py`,
-> `position_engine.py`, `pnl_engine.py`, `risk_engine.py`, Etapa 6.2) —
-> ver la nota de implementación justo debajo. No hay compra ni venta
-> real (con dinero real) en ninguna etapa de Paper Trading.
+> **Este documento sigue siendo la referencia de diseño.** El servicio,
+> `config.yaml` y el Dashboard descritos aquí **todavía no existen** en
+> el código (llegan en la Etapa 6.4 en adelante). Lo que **sí existe
+> ya**, implementado y con pruebas, es el dominio (`src/paper_trading/
+> models.py`, `enums.py`, `validators.py`, `exceptions.py`, Etapa 6.1),
+> los motores puros (`fill_engine.py`, `position_engine.py`,
+> `pnl_engine.py`, `risk_engine.py`, Etapa 6.2) y la persistencia
+> SQLite (`base.py`, `sqlite_repository.py`, `postgres_repository.py`,
+> `serialization.py`, Etapa 6.3) — ver las notas de implementación
+> justo debajo. No hay compra ni venta real (con dinero real) en
+> ninguna etapa de Paper Trading.
+
+> **Nota de implementación (Etapa 6.3 — persistencia)**: las 7 tablas
+> (`paper_trading_orders`, `_executions`, `_trades`, `_positions`,
+> `_cash_balances`, `_portfolio_snapshots`, `_pnl_snapshots`, ver §12)
+> quedaron implementadas exactamente como se diseñó en §12.1, con estas
+> confirmaciones concretas de código:
+> - **Decimal como `TEXT`.** Todo campo monetario/cantidad se guarda con
+>   `str(value)` y se reconstruye con `Decimal(value)`
+>   (`serialization.py`) — nunca `REAL`, que perdería precisión.
+> - **Históricos vía `INSERT`; estado actual vía `UPSERT`.**
+>   `Execution`/`Trade`/`PortfolioSnapshot`/`PnLSnapshot` son
+>   append-only (una colisión de PK falla con `IntegrityError`, nunca se
+>   oculta con `OR REPLACE`/`OR IGNORE`); `Order`/`Position`/
+>   `CashBalance` usan `INSERT ... ON CONFLICT DO UPDATE`
+>   (`Order.created_at` nunca se sobrescribe en el upsert).
+> - **`PRAGMA foreign_keys = ON`** en cada conexión; FK reales de
+>   `paper_trading_executions.order_id` y
+>   `paper_trading_trades.exit_execution_id`.
+> - **`save_fill_transaction()`** implementa la Unit of Work de §12.2:
+>   una única conexión, orden Order → Execution → Position →
+>   CashBalance → Trade → PortfolioSnapshot → PnLSnapshot, un solo
+>   `commit()` final, `rollback()` completo ante cualquier excepción
+>   (verificado con pruebas que fuerzan una `Execution`/`Trade`
+>   duplicada a mitad de la transacción).
+> - **Fuente de verdad del PnL realizado confirmada en código**:
+>   `paper_trading_trades` es la fuente histórica;
+>   `Position.realized_pnl_to_date` es un estado materializado para
+>   lectura rápida. `calculate_realized_pnl()` sólo lee `net_pnl` como
+>   texto y suma con `Decimal` en Python (nunca `SUM()` en SQL sobre una
+>   columna `TEXT`, que SQLite convertiría a `REAL`).
+>   `check_position_pnl_consistency()` compara ambas fuentes sin
+>   modificar ninguna; **no se recalcula automáticamente en cada
+>   lectura** — cuándo reconciliar es decisión de un futuro Service
+>   (Etapa 6.4).
+> - **`PostgresPaperTradingRepository` sigue siendo un stub** (`NotImplementedError`
+>   en los 21 métodos de la interfaz), sin ninguna dependencia nueva.
+> - Persistencia implementada; **el `Service` que coordine motores +
+>   repositorio todavía no existe** (Etapa 6.4).
 
 > **Nota de implementación (Etapas 6.1 y 6.2)**: dos decisiones de esta
 > sección quedaron implementadas de forma distinta a lo que este

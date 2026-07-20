@@ -1,0 +1,824 @@
+"""
+Implementación de PaperTradingRepository usando SQLite (Etapa 6.3).
+
+Guarda el dominio de Paper Trading en 7 tablas nuevas e independientes,
+todas con el prefijo `paper_trading_`, sin modificar `market_data`,
+`market_indicators`, `market_signals` ni `ai_recommendations`. Sigue el
+mismo patrón de conexión que el resto del proyecto (una conexión nueva
+por llamada, `try/finally: conn.close()`, `CREATE TABLE IF NOT EXISTS`
++ `PRAGMA table_info` para migraciones aditivas) — ver
+src/ai/sqlite_repository.py y src/signals/sqlite_repository.py.
+
+Decisiones de esta etapa (documentadas también en
+docs/ARQUITECTURA_PAPER_TRADING.md):
+
+- **Decimal como TEXT.** Todo campo monetario/cantidad/PnL se guarda
+  como `str(value)` y se reconstruye con `Decimal(value)` (ver
+  serialization.py) -- nunca `REAL`, que perdería precisión al
+  convertir a binario de punto flotante.
+- **INSERT vs UPSERT.** `Execution`, `Trade`, `PortfolioSnapshot` y
+  `PnLSnapshot` son históricos e inmutables: se insertan, nunca se
+  actualizan ni se reemplazan (`INSERT` simple, sin `OR REPLACE` ni
+  `OR IGNORE` -- una colisión de clave primaria debe fallar de forma
+  ruidosa, nunca ocultarse). `Order`, `Position` y `CashBalance` son
+  estado actual: usan `INSERT ... ON CONFLICT DO UPDATE` (upsert
+  explícito de SQLite), preservando su identidad (`Order.created_at`
+  nunca se sobrescribe en un upsert).
+- **`save_fill_transaction` es la única operación multi-tabla.** Abre
+  una única conexión, ejecuta los helpers privados `_upsert_*`/
+  `_insert_*` (que reciben la conexión ya abierta, sin abrir la suya
+  propia) en el orden Order -> Execution -> Position -> CashBalance ->
+  Trade -> PortfolioSnapshot -> PnLSnapshot, y hace un único `commit()`
+  al final. Cualquier excepción dispara `rollback()` antes de
+  relanzarla: no puede quedar un estado parcial. Los métodos públicos
+  `save_order`/`save_execution`/etc. usan los mismos helpers privados,
+  pero cada uno abre y cierra su propia conexión (para poder usarse de
+  forma independiente fuera de una transacción de fill).
+- **Fuente de verdad del PnL realizado.** `paper_trading_trades` es la
+  fuente primaria histórica; `Position.realized_pnl_to_date` es un
+  estado materializado para lectura rápida (lo mantiene el motor,
+  Etapa 6.2). `calculate_realized_pnl()` sólo lee `net_pnl` como TEXT y
+  suma con `Decimal` en Python (nunca `SUM(net_pnl)` en SQL: SQLite
+  convertiría la columna TEXT a `REAL` y perdería precisión).
+  `check_position_pnl_consistency()` compara ambas fuentes sin
+  modificar ninguna -- la reconciliación real (si alguna vez difieren)
+  es decisión de un futuro Service (Etapa 6.4), no de este repositorio.
+"""
+
+from pathlib import Path
+import sqlite3
+from decimal import Decimal
+from typing import Optional
+
+from src.paper_trading.base import PaperTradingRepository
+from src.paper_trading.enums import OrderStatus, PositionSide
+from src.paper_trading.models import (
+    CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
+)
+from src.paper_trading.serialization import (
+    datetime_to_text, decimal_to_text, optional_datetime_to_text, optional_decimal_to_text,
+    optional_text_to_datetime, optional_text_to_decimal, text_to_datetime, text_to_decimal,
+)
+
+_ORDER_COLUMNS = (
+    "id", "exchange", "symbol", "side", "order_type", "quantity", "limit_price", "status",
+    "filled_quantity", "average_fill_price", "source", "linked_recommendation_id",
+    "rejection_reason", "cancellation_reason", "created_at", "updated_at", "expires_at",
+)
+_EXECUTION_COLUMNS = ("id", "order_id", "exchange", "symbol", "quantity", "price", "fee", "executed_at")
+_TRADE_COLUMNS = (
+    "id", "exchange", "symbol", "side", "quantity", "entry_price", "exit_price",
+    "gross_pnl", "fees", "net_pnl", "opened_at", "closed_at", "exit_execution_id",
+)
+_POSITION_COLUMNS = (
+    "exchange", "symbol", "side", "quantity", "reserved_quantity",
+    "average_entry_price", "realized_pnl_to_date", "opened_at", "updated_at",
+)
+_CASH_BALANCE_COLUMNS = ("currency", "total_balance", "reserved_balance", "updated_at")
+_PORTFOLIO_SNAPSHOT_COLUMNS = (
+    "id", "timestamp", "cash_balance", "positions_value",
+    "total_equity", "unrealized_pnl_total", "realized_pnl_cumulative",
+)
+_PNL_SNAPSHOT_COLUMNS = (
+    "id", "timestamp", "exchange", "symbol",
+    "position_quantity", "unrealized_pnl", "realized_pnl_cumulative",
+)
+
+
+class SQLitePaperTradingRepository(PaperTradingRepository):
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def _get_connection(self) -> sqlite3.Connection:
+        path = Path(self.db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    # --- init / migraciones -----------------------------------------------
+
+    def init(self) -> None:
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_orders (
+                    id TEXT PRIMARY KEY,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    limit_price TEXT,
+                    status TEXT NOT NULL,
+                    filled_quantity TEXT NOT NULL,
+                    average_fill_price TEXT,
+                    source TEXT NOT NULL,
+                    linked_recommendation_id TEXT,
+                    rejection_reason TEXT,
+                    cancellation_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_executions (
+                    id TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    fee TEXT NOT NULL,
+                    executed_at TEXT NOT NULL,
+                    FOREIGN KEY(order_id) REFERENCES paper_trading_orders(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_trades (
+                    id TEXT PRIMARY KEY,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    entry_price TEXT NOT NULL,
+                    exit_price TEXT NOT NULL,
+                    gross_pnl TEXT NOT NULL,
+                    fees TEXT NOT NULL,
+                    net_pnl TEXT NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT NOT NULL,
+                    exit_execution_id TEXT NOT NULL,
+                    FOREIGN KEY(exit_execution_id) REFERENCES paper_trading_executions(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_positions (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    reserved_quantity TEXT NOT NULL,
+                    average_entry_price TEXT,
+                    realized_pnl_to_date TEXT NOT NULL,
+                    opened_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(exchange, symbol)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_cash_balances (
+                    currency TEXT PRIMARY KEY,
+                    total_balance TEXT NOT NULL,
+                    reserved_balance TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_portfolio_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    cash_balance TEXT NOT NULL,
+                    positions_value TEXT NOT NULL,
+                    total_equity TEXT NOT NULL,
+                    unrealized_pnl_total TEXT NOT NULL,
+                    realized_pnl_cumulative TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_pnl_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    position_quantity TEXT NOT NULL,
+                    unrealized_pnl TEXT NOT NULL,
+                    realized_pnl_cumulative TEXT NOT NULL
+                )
+                """
+            )
+            self._create_indexes(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _create_indexes(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_orders_lookup "
+            "ON paper_trading_orders(exchange, symbol, status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_executions_order "
+            "ON paper_trading_executions(order_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_executions_lookup "
+            "ON paper_trading_executions(exchange, symbol, executed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_trades_lookup "
+            "ON paper_trading_trades(exchange, symbol, closed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_portfolio_snapshots_timestamp "
+            "ON paper_trading_portfolio_snapshots(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_pnl_snapshots_lookup "
+            "ON paper_trading_pnl_snapshots(exchange, symbol, timestamp)"
+        )
+
+    @staticmethod
+    def _validate_limit(limit: Optional[int]) -> None:
+        if limit is not None and limit <= 0:
+            raise ValueError("limit debe ser un entero positivo, o None para no limitar.")
+
+    # --- Order ------------------------------------------------------------
+
+    def save_order(self, order: Order) -> None:
+        conn = self._get_connection()
+        try:
+            self._upsert_order(conn, order)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _upsert_order(conn: sqlite3.Connection, order: Order) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_orders ({', '.join(_ORDER_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_ORDER_COLUMNS))})
+            ON CONFLICT(id) DO UPDATE SET
+                exchange=excluded.exchange, symbol=excluded.symbol, side=excluded.side,
+                order_type=excluded.order_type, quantity=excluded.quantity,
+                limit_price=excluded.limit_price, status=excluded.status,
+                filled_quantity=excluded.filled_quantity,
+                average_fill_price=excluded.average_fill_price, source=excluded.source,
+                linked_recommendation_id=excluded.linked_recommendation_id,
+                rejection_reason=excluded.rejection_reason,
+                cancellation_reason=excluded.cancellation_reason,
+                updated_at=excluded.updated_at, expires_at=excluded.expires_at
+            """,
+            (
+                order.id, order.exchange, order.symbol, order.side.value, order.order_type.value,
+                decimal_to_text(order.quantity), optional_decimal_to_text(order.limit_price),
+                order.status.value, decimal_to_text(order.filled_quantity),
+                optional_decimal_to_text(order.average_fill_price), order.source.value,
+                order.linked_recommendation_id, order.rejection_reason, order.cancellation_reason,
+                datetime_to_text(order.created_at), datetime_to_text(order.updated_at),
+                optional_datetime_to_text(order.expires_at),
+            ),
+        )
+
+    def get_order(self, order_id: str) -> Optional[Order]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_ORDER_COLUMNS)} FROM paper_trading_orders WHERE id = ?",
+                (order_id,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_order(row) if row else None
+
+    def fetch_orders(
+        self,
+        exchange: Optional[str] = None,
+        symbol: Optional[str] = None,
+        status: Optional[OrderStatus] = None,
+        limit: Optional[int] = None,
+    ) -> list[Order]:
+        self._validate_limit(limit)
+        conditions = []
+        params: list = []
+        if exchange is not None:
+            conditions.append("exchange = ?")
+            params.append(exchange)
+        if symbol is not None:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status.value)
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_ORDER_COLUMNS)} FROM paper_trading_orders "
+                f"{where_sql} ORDER BY created_at DESC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_order(row) for row in rows]
+
+    @staticmethod
+    def _row_to_order(row) -> Order:
+        return Order(
+            id=row[0], exchange=row[1], symbol=row[2], side=row[3], order_type=row[4],
+            quantity=text_to_decimal(row[5]), limit_price=optional_text_to_decimal(row[6]),
+            status=row[7], filled_quantity=text_to_decimal(row[8]),
+            average_fill_price=optional_text_to_decimal(row[9]), source=row[10],
+            linked_recommendation_id=row[11], rejection_reason=row[12], cancellation_reason=row[13],
+            created_at=text_to_datetime(row[14]), updated_at=text_to_datetime(row[15]),
+            expires_at=optional_text_to_datetime(row[16]),
+        )
+
+    # --- Execution ----------------------------------------------------------
+
+    def save_execution(self, execution: Execution) -> None:
+        conn = self._get_connection()
+        try:
+            self._insert_execution(conn, execution)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_execution(conn: sqlite3.Connection, execution: Execution) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_executions ({', '.join(_EXECUTION_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_EXECUTION_COLUMNS))})
+            """,
+            (
+                execution.id, execution.order_id, execution.exchange, execution.symbol,
+                decimal_to_text(execution.quantity), decimal_to_text(execution.price),
+                decimal_to_text(execution.fee), datetime_to_text(execution.executed_at),
+            ),
+        )
+
+    def fetch_executions_by_order(self, order_id: str) -> list[Execution]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_EXECUTION_COLUMNS)} FROM paper_trading_executions "
+                "WHERE order_id = ? ORDER BY executed_at ASC",
+                (order_id,),
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_execution(row) for row in rows]
+
+    def fetch_executions(
+        self,
+        exchange: Optional[str] = None,
+        symbol: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[Execution]:
+        self._validate_limit(limit)
+        conditions = []
+        params: list = []
+        if exchange is not None:
+            conditions.append("exchange = ?")
+            params.append(exchange)
+        if symbol is not None:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_EXECUTION_COLUMNS)} FROM paper_trading_executions "
+                f"{where_sql} ORDER BY executed_at DESC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_execution(row) for row in rows]
+
+    @staticmethod
+    def _row_to_execution(row) -> Execution:
+        return Execution(
+            id=row[0], order_id=row[1], exchange=row[2], symbol=row[3],
+            quantity=text_to_decimal(row[4]), price=text_to_decimal(row[5]),
+            fee=text_to_decimal(row[6]), executed_at=text_to_datetime(row[7]),
+        )
+
+    # --- Trade --------------------------------------------------------------
+
+    def save_trade(self, trade: Trade) -> None:
+        conn = self._get_connection()
+        try:
+            self._insert_trade(conn, trade)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_trade(conn: sqlite3.Connection, trade: Trade) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_trades ({', '.join(_TRADE_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_TRADE_COLUMNS))})
+            """,
+            (
+                trade.id, trade.exchange, trade.symbol, trade.side.value,
+                decimal_to_text(trade.quantity), decimal_to_text(trade.entry_price),
+                decimal_to_text(trade.exit_price), decimal_to_text(trade.gross_pnl),
+                decimal_to_text(trade.fees), decimal_to_text(trade.net_pnl),
+                datetime_to_text(trade.opened_at), datetime_to_text(trade.closed_at),
+                trade.exit_execution_id,
+            ),
+        )
+
+    def fetch_trades(
+        self,
+        exchange: Optional[str] = None,
+        symbol: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[Trade]:
+        self._validate_limit(limit)
+        conditions = []
+        params: list = []
+        if exchange is not None:
+            conditions.append("exchange = ?")
+            params.append(exchange)
+        if symbol is not None:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_TRADE_COLUMNS)} FROM paper_trading_trades "
+                f"{where_sql} ORDER BY closed_at DESC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_trade(row) for row in rows]
+
+    @staticmethod
+    def _row_to_trade(row) -> Trade:
+        return Trade(
+            id=row[0], exchange=row[1], symbol=row[2], side=row[3],
+            quantity=text_to_decimal(row[4]), entry_price=text_to_decimal(row[5]),
+            exit_price=text_to_decimal(row[6]), gross_pnl=text_to_decimal(row[7]),
+            fees=text_to_decimal(row[8]), net_pnl=text_to_decimal(row[9]),
+            opened_at=text_to_datetime(row[10]), closed_at=text_to_datetime(row[11]),
+            exit_execution_id=row[12],
+        )
+
+    # --- Position -------------------------------------------------------
+
+    def save_position(self, position: Position) -> None:
+        conn = self._get_connection()
+        try:
+            self._upsert_position(conn, position)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _upsert_position(conn: sqlite3.Connection, position: Position) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_positions ({', '.join(_POSITION_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_POSITION_COLUMNS))})
+            ON CONFLICT(exchange, symbol) DO UPDATE SET
+                side=excluded.side, quantity=excluded.quantity,
+                reserved_quantity=excluded.reserved_quantity,
+                average_entry_price=excluded.average_entry_price,
+                realized_pnl_to_date=excluded.realized_pnl_to_date,
+                opened_at=excluded.opened_at, updated_at=excluded.updated_at
+            """,
+            (
+                position.exchange, position.symbol, position.side.value,
+                decimal_to_text(position.quantity), decimal_to_text(position.reserved_quantity),
+                optional_decimal_to_text(position.average_entry_price),
+                decimal_to_text(position.realized_pnl_to_date),
+                optional_datetime_to_text(position.opened_at),
+                datetime_to_text(position.updated_at),
+            ),
+        )
+
+    def get_position(self, exchange: str, symbol: str) -> Optional[Position]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_POSITION_COLUMNS)} FROM paper_trading_positions "
+                "WHERE exchange = ? AND symbol = ?",
+                (exchange, symbol),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_position(row) if row else None
+
+    def fetch_positions(self, include_flat: bool = True) -> list[Position]:
+        conn = self._get_connection()
+        try:
+            if include_flat:
+                cursor = conn.execute(
+                    f"SELECT {', '.join(_POSITION_COLUMNS)} FROM paper_trading_positions "
+                    "ORDER BY exchange ASC, symbol ASC"
+                )
+            else:
+                cursor = conn.execute(
+                    f"SELECT {', '.join(_POSITION_COLUMNS)} FROM paper_trading_positions "
+                    "WHERE side != ? ORDER BY exchange ASC, symbol ASC",
+                    (PositionSide.FLAT.value,),
+                )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_position(row) for row in rows]
+
+    @staticmethod
+    def _row_to_position(row) -> Position:
+        return Position(
+            exchange=row[0], symbol=row[1], side=row[2], quantity=text_to_decimal(row[3]),
+            reserved_quantity=text_to_decimal(row[4]),
+            average_entry_price=optional_text_to_decimal(row[5]),
+            realized_pnl_to_date=text_to_decimal(row[6]),
+            opened_at=optional_text_to_datetime(row[7]), updated_at=text_to_datetime(row[8]),
+        )
+
+    # --- CashBalance ------------------------------------------------------
+
+    def save_cash_balance(self, cash_balance: CashBalance) -> None:
+        conn = self._get_connection()
+        try:
+            self._upsert_cash_balance(conn, cash_balance)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _upsert_cash_balance(conn: sqlite3.Connection, cash_balance: CashBalance) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_cash_balances ({', '.join(_CASH_BALANCE_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_CASH_BALANCE_COLUMNS))})
+            ON CONFLICT(currency) DO UPDATE SET
+                total_balance=excluded.total_balance, reserved_balance=excluded.reserved_balance,
+                updated_at=excluded.updated_at
+            """,
+            (
+                cash_balance.currency, decimal_to_text(cash_balance.total_balance),
+                decimal_to_text(cash_balance.reserved_balance), datetime_to_text(cash_balance.updated_at),
+            ),
+        )
+
+    def get_cash_balance(self, currency: str = "USDT") -> Optional[CashBalance]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_CASH_BALANCE_COLUMNS)} FROM paper_trading_cash_balances "
+                "WHERE currency = ?",
+                (currency,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_cash_balance(row) if row else None
+
+    @staticmethod
+    def _row_to_cash_balance(row) -> CashBalance:
+        return CashBalance(
+            currency=row[0], total_balance=text_to_decimal(row[1]),
+            reserved_balance=text_to_decimal(row[2]), updated_at=text_to_datetime(row[3]),
+        )
+
+    # --- PortfolioSnapshot --------------------------------------------------
+
+    def save_portfolio_snapshot(self, snapshot: PortfolioSnapshot) -> None:
+        conn = self._get_connection()
+        try:
+            self._insert_portfolio_snapshot(conn, snapshot)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_portfolio_snapshot(conn: sqlite3.Connection, snapshot: PortfolioSnapshot) -> None:
+        conn.execute(
+            """
+            INSERT INTO paper_trading_portfolio_snapshots
+                (timestamp, cash_balance, positions_value, total_equity,
+                 unrealized_pnl_total, realized_pnl_cumulative)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime_to_text(snapshot.timestamp), decimal_to_text(snapshot.cash_balance),
+                decimal_to_text(snapshot.positions_value), decimal_to_text(snapshot.total_equity),
+                decimal_to_text(snapshot.unrealized_pnl_total),
+                decimal_to_text(snapshot.realized_pnl_cumulative),
+            ),
+        )
+
+    def fetch_portfolio_history(self, limit: Optional[int] = None) -> list[PortfolioSnapshot]:
+        self._validate_limit(limit)
+        limit_sql = ""
+        params: list = []
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_PORTFOLIO_SNAPSHOT_COLUMNS)} FROM paper_trading_portfolio_snapshots "
+                f"ORDER BY timestamp DESC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_portfolio_snapshot(row) for row in rows]
+
+    @staticmethod
+    def _row_to_portfolio_snapshot(row) -> PortfolioSnapshot:
+        return PortfolioSnapshot(
+            id=row[0], timestamp=text_to_datetime(row[1]), cash_balance=text_to_decimal(row[2]),
+            positions_value=text_to_decimal(row[3]), total_equity=text_to_decimal(row[4]),
+            unrealized_pnl_total=text_to_decimal(row[5]), realized_pnl_cumulative=text_to_decimal(row[6]),
+        )
+
+    # --- PnLSnapshot ------------------------------------------------------
+
+    def save_pnl_snapshot(self, snapshot: PnLSnapshot) -> None:
+        conn = self._get_connection()
+        try:
+            self._insert_pnl_snapshot(conn, snapshot)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_pnl_snapshot(conn: sqlite3.Connection, snapshot: PnLSnapshot) -> None:
+        conn.execute(
+            """
+            INSERT INTO paper_trading_pnl_snapshots
+                (timestamp, exchange, symbol, position_quantity, unrealized_pnl, realized_pnl_cumulative)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime_to_text(snapshot.timestamp), snapshot.exchange, snapshot.symbol,
+                decimal_to_text(snapshot.position_quantity), decimal_to_text(snapshot.unrealized_pnl),
+                decimal_to_text(snapshot.realized_pnl_cumulative),
+            ),
+        )
+
+    def fetch_pnl_history(
+        self, exchange: str, symbol: str, limit: Optional[int] = None,
+    ) -> list[PnLSnapshot]:
+        self._validate_limit(limit)
+        limit_sql = ""
+        params: list = [exchange, symbol]
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_PNL_SNAPSHOT_COLUMNS)} FROM paper_trading_pnl_snapshots "
+                f"WHERE exchange = ? AND symbol = ? ORDER BY timestamp DESC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_pnl_snapshot(row) for row in rows]
+
+    @staticmethod
+    def _row_to_pnl_snapshot(row) -> PnLSnapshot:
+        return PnLSnapshot(
+            id=row[0], timestamp=text_to_datetime(row[1]), exchange=row[2], symbol=row[3],
+            position_quantity=text_to_decimal(row[4]), unrealized_pnl=text_to_decimal(row[5]),
+            realized_pnl_cumulative=text_to_decimal(row[6]),
+        )
+
+    # --- Transacción atómica de fill --------------------------------------
+
+    def save_fill_transaction(
+        self,
+        order: Order,
+        execution: Execution,
+        position: Position,
+        cash_balance: CashBalance,
+        trade: Optional[Trade] = None,
+        portfolio_snapshot: Optional[PortfolioSnapshot] = None,
+        pnl_snapshot: Optional[PnLSnapshot] = None,
+    ) -> None:
+        self._validate_fill_consistency(order, execution, position, trade, pnl_snapshot)
+
+        conn = self._get_connection()
+        try:
+            self._upsert_order(conn, order)
+            self._insert_execution(conn, execution)
+            self._upsert_position(conn, position)
+            self._upsert_cash_balance(conn, cash_balance)
+            if trade is not None:
+                self._insert_trade(conn, trade)
+            if portfolio_snapshot is not None:
+                self._insert_portfolio_snapshot(conn, portfolio_snapshot)
+            if pnl_snapshot is not None:
+                self._insert_pnl_snapshot(conn, pnl_snapshot)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _validate_fill_consistency(
+        order: Order,
+        execution: Execution,
+        position: Position,
+        trade: Optional[Trade],
+        pnl_snapshot: Optional[PnLSnapshot],
+    ) -> None:
+        """Validaciones de consistencia relacional (Paso 15): no es lógica de
+        negocio (no recalcula fee/PnL/cantidad), solo confirma que las
+        entidades recibidas realmente pertenecen entre sí antes de escribir
+        nada."""
+        if execution.order_id != order.id:
+            raise ValueError("execution.order_id no coincide con order.id.")
+        if execution.exchange != order.exchange or execution.symbol != order.symbol:
+            raise ValueError("execution.exchange/symbol no coincide con order.exchange/symbol.")
+        if position.exchange != order.exchange or position.symbol != order.symbol:
+            raise ValueError("position.exchange/symbol no coincide con order.exchange/symbol.")
+        if trade is not None:
+            if trade.exchange != order.exchange or trade.symbol != order.symbol:
+                raise ValueError("trade.exchange/symbol no coincide con order.exchange/symbol.")
+            if trade.exit_execution_id != execution.id:
+                raise ValueError("trade.exit_execution_id no coincide con execution.id.")
+        if pnl_snapshot is not None:
+            if pnl_snapshot.exchange != order.exchange or pnl_snapshot.symbol != order.symbol:
+                raise ValueError("pnl_snapshot.exchange/symbol no coincide con order.exchange/symbol.")
+
+    # --- PnL realizado: fuente de verdad y reconciliación ------------------
+
+    def calculate_realized_pnl(
+        self, exchange: Optional[str] = None, symbol: Optional[str] = None,
+    ) -> Decimal:
+        conditions = []
+        params: list = []
+        if exchange is not None:
+            conditions.append("exchange = ?")
+            params.append(exchange)
+        if symbol is not None:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT net_pnl FROM paper_trading_trades {where_sql}", params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        total = Decimal("0")
+        for (net_pnl_text,) in rows:
+            total += text_to_decimal(net_pnl_text)
+        return total
+
+    def check_position_pnl_consistency(self, exchange: str, symbol: str) -> bool:
+        position = self.get_position(exchange, symbol)
+        if position is None:
+            return False
+        recalculated = self.calculate_realized_pnl(exchange=exchange, symbol=symbol)
+        return position.realized_pnl_to_date == recalculated
