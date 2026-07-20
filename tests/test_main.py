@@ -18,12 +18,13 @@ import yaml
 from src.ai.service import AIService
 from src.database.sqlite_indicator_repository import SQLiteIndicatorRepository
 from src.database.sqlite_repository import SQLiteMarketDataRepository
-from src.main import build_services, run_full_cycle
+from src.main import build_paper_trading, build_services, run_full_cycle
+from src.paper_trading.composition import PaperTradingContext
 from src.signals.sqlite_repository import SQLiteSignalRepository
 from src.utils.config import load_settings
 
 
-def _base_config(sqlite_path: str, ai_enabled: bool) -> dict:
+def _base_config(sqlite_path: str, ai_enabled: bool, paper_trading_enabled: bool = False) -> dict:
     return {
         "symbols": ["BTCUSDT"],
         "interval_minutes": 5,
@@ -56,12 +57,26 @@ def _base_config(sqlite_path: str, ai_enabled: bool) -> dict:
             "system_prompt": "Eres un analista de mercado.",
             "dummy_delay": 0,
         },
+        "paper_trading": {
+            "enabled": paper_trading_enabled,
+            "database_path": sqlite_path,
+            "initial_capital": "10000",
+            "currency": "USDT",
+            "fee_rate": "0.001",
+            "max_order_value": "1000",
+            "max_position_value": "5000",
+            "rules_version": "v1",
+        },
     }
 
 
-def _write_config(tmp_path: Path, ai_enabled: bool, sqlite_path: str) -> Path:
+def _write_config(
+    tmp_path: Path, ai_enabled: bool, sqlite_path: str, paper_trading_enabled: bool = False,
+) -> Path:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.safe_dump(_base_config(sqlite_path, ai_enabled)), encoding="utf-8")
+    config_path.write_text(
+        yaml.safe_dump(_base_config(sqlite_path, ai_enabled, paper_trading_enabled)), encoding="utf-8",
+    )
     return config_path
 
 
@@ -152,3 +167,66 @@ def test_run_full_cycle_with_ai_enabled_generates_recommendations(mock_get, tmp_
     from src.ai.sqlite_repository import SQLiteAIRepository
     ai_repository = SQLiteAIRepository(db_path)
     assert ai_repository.fetch_latest("Binance", "BTCUSDT") is not None
+
+
+def test_build_paper_trading_returns_none_when_disabled(tmp_path):
+    """paper_trading.enabled=false (el default): no se instancia nada, ni
+    siquiera el repositorio -- mismo criterio que ai_engine.enabled=false."""
+    db_path = str(tmp_path / "pt_disabled.db")
+    config_path = _write_config(tmp_path, ai_enabled=False, sqlite_path=db_path, paper_trading_enabled=False)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    context = build_paper_trading(settings)
+
+    assert context is None
+    import os
+    assert not os.path.exists(db_path)
+
+
+def test_build_paper_trading_builds_context_when_enabled(tmp_path):
+    db_path = str(tmp_path / "pt_enabled.db")
+    config_path = _write_config(tmp_path, ai_enabled=False, sqlite_path=db_path, paper_trading_enabled=True)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    context = build_paper_trading(settings)
+
+    assert context is not None
+    assert isinstance(context, PaperTradingContext)
+    assert context.repository.get_cash_balance("USDT").total_balance == settings.paper_trading.initial_capital
+
+
+def test_build_paper_trading_does_not_execute_any_order(tmp_path):
+    """Construir el contexto no debe, por sí solo, someter ninguna orden:
+    ninguna Order/Execution debe existir todavía."""
+    db_path = str(tmp_path / "pt_enabled.db")
+    config_path = _write_config(tmp_path, ai_enabled=False, sqlite_path=db_path, paper_trading_enabled=True)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    context = build_paper_trading(settings)
+
+    assert context.repository.fetch_orders() == []
+    assert context.repository.fetch_positions() == []
+
+
+@patch("src.market.binance.requests.get")
+def test_main_cycle_does_not_touch_paper_trading_when_disabled(mock_get, tmp_path):
+    """run_full_cycle() (el ciclo automático real) nunca somete una orden de
+    Paper Trading, independientemente del estado de paper_trading.enabled."""
+    prices = iter([100.0 + i for i in range(10)])
+    mock_get.side_effect = lambda url, params, timeout: _fake_response(params["symbol"], next(prices))
+
+    db_path = str(tmp_path / "cycle.db")
+    config_path = _write_config(tmp_path, ai_enabled=False, sqlite_path=db_path, paper_trading_enabled=True)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    market_data_service, indicator_service, signal_service, ai_service = build_services(settings)
+    paper_trading_context = build_paper_trading(settings)
+    assert paper_trading_context is not None
+
+    for _ in range(3):
+        run_full_cycle(market_data_service, indicator_service, signal_service, ai_service)
+
+    # El ciclo automático (precios/indicadores/señales/IA) no crea ninguna
+    # orden de Paper Trading: build_paper_trading() solo deja el contexto
+    # disponible, run_full_cycle() nunca lo invoca.
+    assert paper_trading_context.repository.fetch_orders() == []

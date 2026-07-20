@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
 
@@ -271,6 +272,37 @@ class AIEngineSettings:
 
 
 @dataclass(frozen=True)
+class PaperTradingConfig:
+    """Configuración de Paper Trading (Etapa 6.5).
+
+    Distinta del resto de las secciones de Settings: todos los campos
+    monetarios/de cantidad usan Decimal (nunca float), siguiendo la
+    misma decisión ya tomada en todo el dominio de Paper Trading desde
+    la Etapa 6.1 (ver docs/ARQUITECTURA_PAPER_TRADING.md). Por eso
+    config.yaml -> paper_trading escribe esos valores entre comillas
+    (como texto): así llegan a Python como `str` y se convierten
+    directamente con `Decimal(value)`, nunca pasando por `float` primero
+    (evitando el error de precisión de convertir un float ya impreciso).
+
+    'enabled' es `false` por defecto (ver config.yaml): el repositorio,
+    el servicio y la aplicación de Paper Trading pueden construirse y
+    probarse sin que eso implique ejecutar ninguna orden real. Ninguna
+    parte del proyecto activa Paper Trading automáticamente todavía (sin
+    Strategy Engine, sin señales/IA ejecutando órdenes -- ver
+    src/paper_trading/application.py).
+    """
+
+    enabled: bool
+    database_path: str
+    initial_capital: Decimal
+    currency: str
+    fee_rate: Decimal
+    max_order_value: Decimal
+    max_position_value: Decimal
+    rules_version: str
+
+
+@dataclass(frozen=True)
 class Settings:
     symbols: list[str]
     interval_minutes: float
@@ -284,6 +316,7 @@ class Settings:
     indicators: IndicatorSettings
     signals: SignalSettings
     ai_engine: AIEngineSettings
+    paper_trading: PaperTradingConfig
 
 
 def _load_yaml_config(config_path: Path) -> dict:
@@ -308,7 +341,7 @@ _INDICATOR_INT_FIELDS = [
 def _validate_yaml_config(config: dict) -> None:
     required_keys = [
         "symbols", "interval_minutes", "database", "logging", "binance",
-        "alerts", "indicators", "signals", "ai",
+        "alerts", "indicators", "signals", "ai", "paper_trading",
     ]
     missing = [key for key in required_keys if key not in config]
     if missing:
@@ -331,6 +364,7 @@ def _validate_yaml_config(config: dict) -> None:
     _validate_indicators_config(config["indicators"])
     _validate_signals_config(config["signals"])
     _validate_ai_config(config["ai"])
+    _validate_paper_trading_config(config["paper_trading"])
 
 
 def _validate_indicators_config(indicators_cfg: dict) -> None:
@@ -433,6 +467,70 @@ def _validate_ai_config(ai_cfg: dict) -> None:
     _require_numeric(ai_cfg, "dummy_delay", "ai")
     if ai_cfg["dummy_delay"] < 0:
         raise ValueError("'ai.dummy_delay' no puede ser negativo.")
+
+
+def _require_decimal_string(container: dict, field: str, path: str) -> Decimal:
+    """Exige que container[field] sea un str parseable como Decimal.
+
+    Se guardan como texto en config.yaml (entre comillas) a propósito:
+    así se leen directamente como Decimal, nunca pasando por float (ver
+    PaperTradingConfig).
+    """
+    value = container.get(field)
+    if field not in container or not isinstance(value, str):
+        raise ValueError(
+            f"'{path}.{field}' debe existir y ser un texto entre comillas (ej. \"100.0\"), "
+            "no un número YAML sin comillas."
+        )
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        raise ValueError(f"'{path}.{field}' debe ser un valor decimal válido (ej. \"100.0\").")
+
+
+def _validate_paper_trading_config(pt_cfg: dict) -> None:
+    required_fields = [
+        "enabled", "database_path", "initial_capital", "currency",
+        "fee_rate", "max_order_value", "max_position_value", "rules_version",
+    ]
+    missing = [f for f in required_fields if f not in pt_cfg]
+    if missing:
+        raise ValueError(
+            f"Faltan campos obligatorios en config.yaml -> paper_trading: {', '.join(missing)}"
+        )
+
+    if not isinstance(pt_cfg["enabled"], bool):
+        raise ValueError("'paper_trading.enabled' debe ser verdadero o falso (true/false).")
+
+    if not isinstance(pt_cfg["database_path"], str) or not pt_cfg["database_path"]:
+        raise ValueError("'paper_trading.database_path' debe ser un texto no vacío.")
+
+    if not isinstance(pt_cfg["currency"], str) or not pt_cfg["currency"]:
+        raise ValueError("'paper_trading.currency' debe ser un texto no vacío.")
+
+    if not isinstance(pt_cfg["rules_version"], str) or not pt_cfg["rules_version"]:
+        raise ValueError("'paper_trading.rules_version' debe ser un texto no vacío.")
+
+    initial_capital = _require_decimal_string(pt_cfg, "initial_capital", "paper_trading")
+    if initial_capital <= 0:
+        raise ValueError("'paper_trading.initial_capital' debe ser mayor a 0.")
+
+    fee_rate = _require_decimal_string(pt_cfg, "fee_rate", "paper_trading")
+    if fee_rate < 0:
+        raise ValueError("'paper_trading.fee_rate' no puede ser negativo.")
+
+    max_order_value = _require_decimal_string(pt_cfg, "max_order_value", "paper_trading")
+    if max_order_value <= 0:
+        raise ValueError("'paper_trading.max_order_value' debe ser mayor a 0.")
+
+    max_position_value = _require_decimal_string(pt_cfg, "max_position_value", "paper_trading")
+    if max_position_value <= 0:
+        raise ValueError("'paper_trading.max_position_value' debe ser mayor a 0.")
+
+    if max_position_value < max_order_value:
+        raise ValueError(
+            "'paper_trading.max_position_value' debe ser mayor o igual a 'paper_trading.max_order_value'."
+        )
 
 
 def load_settings(
@@ -544,5 +642,15 @@ def load_settings(
             system_prompt=config["ai"]["system_prompt"],
             dummy_delay=config["ai"]["dummy_delay"],
             future_api_key=os.getenv("AI_FUTURE_API_KEY") or None,
+        ),
+        paper_trading=PaperTradingConfig(
+            enabled=config["paper_trading"]["enabled"],
+            database_path=config["paper_trading"]["database_path"],
+            initial_capital=Decimal(config["paper_trading"]["initial_capital"]),
+            currency=config["paper_trading"]["currency"],
+            fee_rate=Decimal(config["paper_trading"]["fee_rate"]),
+            max_order_value=Decimal(config["paper_trading"]["max_order_value"]),
+            max_position_value=Decimal(config["paper_trading"]["max_position_value"]),
+            rules_version=config["paper_trading"]["rules_version"],
         ),
     )

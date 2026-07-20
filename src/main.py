@@ -48,6 +48,9 @@ from src.ai.providers.dummy_provider import DummyProvider
 from src.ai.providers.openai_provider import OpenAIProvider
 from src.ai.service import AIService
 from src.ai.sqlite_repository import SQLiteAIRepository
+from src.paper_trading.composition import PaperTradingContext, build_paper_trading_context
+from src.paper_trading.price_provider import RepositoryMarketPriceProvider
+from src.paper_trading.runtime import SystemClock, UUIDIdGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +158,38 @@ def build_services(
     return market_data_service, indicator_service, signal_service, ai_service
 
 
+def build_paper_trading(settings: Settings) -> Optional[PaperTradingContext]:
+    """Construye el contexto de Paper Trading (Etapa 6.5) si está habilitado.
+
+    Mismo criterio que build_services() ya usa para settings.ai_engine.enabled:
+    si settings.paper_trading.enabled es False, no se instancia absolutamente
+    nada (ni siquiera el repositorio) -- una desactivación real, no solo un
+    'if' que se salta en el ciclo. El repositorio de mercado que alimenta a
+    RepositoryMarketPriceProvider es una instancia propia (no la que usa
+    MarketDataService dentro de build_services()), igual que ya sucede entre
+    los distintos repositorios SQLite del proyecto: cada uno abre su propia
+    conexión por llamada, así que instanciar otro apuntando al mismo archivo
+    es seguro.
+
+    El contexto devuelto queda disponible para uso manual/futuro
+    (context.application.submit_manual_market_order(...)) -- esta función
+    nunca ejecuta ninguna orden por su cuenta.
+    """
+    if not settings.paper_trading.enabled:
+        logger.info("Paper Trading deshabilitado (paper_trading.enabled=false).")
+        return None
+
+    market_repository = SQLiteMarketDataRepository(settings.database.sqlite_path)
+    market_repository.init()
+
+    return build_paper_trading_context(
+        config=settings.paper_trading,
+        clock=SystemClock(),
+        id_generator=UUIDIdGenerator(),
+        market_price_provider=RepositoryMarketPriceProvider(market_repository),
+    )
+
+
 def run_full_cycle(
     market_data_service: MarketDataService,
     indicator_service: IndicatorService,
@@ -183,6 +218,10 @@ def main() -> None:
     logger.info("Intervalo de consulta: cada %s minutos", settings.interval_minutes)
 
     market_data_service, indicator_service, signal_service, ai_service = build_services(settings)
+
+    # Disponible para uso manual/futuro (context.application.submit_manual_market_order()).
+    # Ningún ciclo, señal ni recomendación de IA lo invoca todavía (Etapa 6.5).
+    paper_trading_context = build_paper_trading(settings)
 
     # Primera ejecución inmediata, sin esperar el primer intervalo.
     run_full_cycle(market_data_service, indicator_service, signal_service, ai_service)

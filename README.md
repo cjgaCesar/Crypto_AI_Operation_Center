@@ -35,12 +35,16 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   Estado Técnico), diseño responsive con selector de vista compartido y
   centralizado. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
   [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
-- 📝 **Etapa 6.0 (diseño, sin código todavía)** — Preparación de la
-  arquitectura para Paper Trading (compra/venta simulada, sin dinero
-  real): modelo de dominio (órdenes, posiciones, cartera, PnL), estados
-  de una orden, reglas de riesgo, diseño de persistencia e integración
-  futura con el Dashboard y con la IA — **todo documentado, nada
-  implementado todavía**. Ver
+- 🛠️ **Etapas 6.0-6.5 (implementación en curso)** — Paper Trading
+  (compra/venta simulada, sin dinero real, sin conexión a un exchange
+  para operar): dominio (`src/paper_trading/models.py`), motores puros
+  (fill/position/PnL/risk), persistencia SQLite propia
+  (`paper_trading_*`), `PaperTradingService` y una Composition Root con
+  `PaperTradingApplication` para someter una orden manual — todo con
+  pruebas automatizadas. `config.yaml -> paper_trading.enabled` es
+  `false` por defecto: **ninguna orden se ejecuta automáticamente**
+  (sin Strategy Engine, sin señales ni IA ejecutando órdenes, sin
+  Dashboard de Paper Trading todavía). Ver
   [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
   [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
 
@@ -402,24 +406,29 @@ las 5 páginas que lo usan (`layout.render_view_mode_selector()`). Ver
 [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md) para el
 detalle completo de cada iteración.
 
-📝 **Etapa 6.0 (diseño, sin código todavía)**: preparación de la
-arquitectura para Paper Trading (compra/venta simulada, sin dinero
-real). Esta sub-etapa **no implementa ninguna funcionalidad**: solo
-documenta el modelo de dominio (`Order`, `Position`, `Portfolio`,
-`Trade`, `Execution`, `CashBalance`, `OrderBook` simulado, `RiskLimits`,
-`PortfolioSnapshot`, `PnLSnapshot`), los estados de una orden y sus
-transiciones válidas/inválidas, las reglas de riesgo, el diseño de
-persistencia (tablas propuestas, sin crearlas), la integración futura
-con el Dashboard (solo lectura, sin páginas nuevas) y con la IA
-(`AIRecommendation` ya existente, sin que la IA ejecute órdenes
-directamente), y la estrategia de pruebas. Se confirmó, con una búsqueda
-exhaustiva en todo `src/`, que no existe ningún código previo de
-órdenes/posiciones/cartera/riesgo/PnL: es un módulo enteramente nuevo.
-Ver [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
+🛠️ **Etapas 6.0-6.5 (implementación en curso)**: Paper Trading (compra/
+venta simulada, sin dinero real, sin conexión a un exchange para
+operar). 6.0 diseñó la arquitectura (auditada en 6.0.1); desde entonces
+se implementó, con pruebas automatizadas en cada paso: **6.1** dominio
+(`Order`, `Execution`, `Trade`, `Position`, `CashBalance`,
+`PortfolioSnapshot`, `PnLSnapshot`, `RiskValidationResult` — sin
+`OrderBook`, eliminado por redundante con `MarketTicker`); **6.2**
+motores puros (`FillEngine`, `PositionEngine`, `PnLEngine`, `RiskEngine`,
+solo MARKET/LONG); **6.3** persistencia SQLite propia (tablas
+`paper_trading_*`, Decimal como TEXT, transacción atómica de fill);
+**6.4** `PaperTradingService`, única capa que orquesta motores +
+persistencia; **6.5** Composition Root (`src/paper_trading/
+composition.py`) + `PaperTradingApplication` para someter una orden
+manual, con `config.yaml -> paper_trading` (`enabled: false` por
+defecto) e integración mínima en `main.py`. **Ninguna orden se ejecuta
+automáticamente todavía**: sin Strategy Engine, sin señales ni IA
+ejecutando órdenes, sin Dashboard de Paper Trading. Ver
+[docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
 [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
-Pendiente tu aprobación de esta arquitectura antes de escribir la
-primera línea de código de Paper Trading.
+Pendiente tu auditoría y aprobación formal de la Etapa 6.5 antes de
+continuar.
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
-de conectar un proveedor de IA real; aprobación de esta Etapa 6.0 antes
-de iniciar la implementación de Paper Trading.
+de conectar un proveedor de IA real; aprobación de la Etapa 6.5 antes de
+continuar con Paper Trading (Dashboard, reservas de capital/cantidad,
+automatización).

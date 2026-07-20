@@ -145,3 +145,25 @@ ai:
   # Segundos que DummyProvider espera antes de responder, para simular la
   # latencia de un proveedor real en pruebas manuales (0 = instantáneo).
   dummy_delay: 0
+
+# Configuración de Paper Trading (Etapas 6.1-6.5).
+# Simulación de compra/venta con dinero ficticio: sin conexión real a
+# ningún exchange para operar, sin ejecución automática desde señales o
+# IA. Ver docs/ARQUITECTURA_PAPER_TRADING.md.
+paper_trading:
+  # Si es false (valor por defecto), ninguna orden de Paper Trading se
+  # ejecuta: ni automática, ni manual a través de PaperTradingApplication
+  # (ver src/paper_trading/application.py, PaperTradingDisabledError).
+  enabled: false
+  # Misma base SQLite que el resto del proyecto, en tablas nuevas y
+  # separadas (prefijo paper_trading_, ver ARQUITECTURA_PAPER_TRADING.md).
+  database_path: data/crypto_data.db
+  # Los siguientes 4 valores van entre comillas (como texto) a propósito:
+  # se leen directamente como Decimal, nunca como float, para no perder
+  # precisión (ver docs/ARQUITECTURA_PAPER_TRADING.md).
+  initial_capital: "10000"
+  currency: USDT
+  fee_rate: "0.001"
+  max_order_value: "1000"
+  max_position_value: "5000"
+  rules_version: "v1"

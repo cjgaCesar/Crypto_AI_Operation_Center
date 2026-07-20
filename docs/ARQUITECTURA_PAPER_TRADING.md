@@ -1,17 +1,75 @@
 # Arquitectura de Paper Trading (Etapa 6.0 — diseño; implementación en curso desde 6.1)
 
-> **Este documento sigue siendo la referencia de diseño.** `config.yaml`,
-> `main.py` y el Dashboard descritos aquí **todavía no existen** en el
-> código (llegan en la Etapa 6.5 en adelante). Lo que **sí existe ya**,
+> **Este documento sigue siendo la referencia de diseño.** El Dashboard
+> de Paper Trading descrito aquí **todavía no existe** en el código
+> (llega en la Etapa 6.6 en adelante). Lo que **sí existe ya**,
 > implementado y con pruebas, es el dominio (`src/paper_trading/
 > models.py`, `enums.py`, `validators.py`, `exceptions.py`, Etapa 6.1),
 > los motores puros (`fill_engine.py`, `position_engine.py`,
 > `pnl_engine.py`, `risk_engine.py`, Etapa 6.2), la persistencia SQLite
 > (`base.py`, `sqlite_repository.py`, `postgres_repository.py`,
-> `serialization.py`, Etapa 6.3) y la capa de servicio
+> `serialization.py`, Etapa 6.3), la capa de servicio
 > (`service.py`/`PaperTradingService`, `service_results.py`, Etapa 6.4)
-> — ver las notas de implementación justo debajo. No hay compra ni
+> y la Composition Root con integración manual controlada
+> (`composition.py`, `application.py`, `price_provider.py`,
+> `runtime.py`, más una sección `paper_trading:` en `config.yaml` y una
+> integración mínima en `main.py`, Etapa 6.5) — ver las notas de
+> implementación justo debajo. No hay compra ni
 > venta real (con dinero real) en ninguna etapa de Paper Trading.
+
+> **Nota de implementación (Etapa 6.5 — Composition Root e integración
+> controlada)**: Paper Trading tiene, desde esta etapa, una forma real
+> (aunque manual) de ejecutarse, sin que eso active nada automático.
+> - **`PaperTradingConfig`** (`src/utils/config.py`, siguiendo el mismo
+>   patrón `@dataclass(frozen=True)` que el resto de `Settings`) agrega
+>   `config.yaml -> paper_trading` (`enabled`, `database_path`,
+>   `initial_capital`, `currency`, `fee_rate`, `max_order_value`,
+>   `max_position_value`, `rules_version`). Los 4 campos monetarios se
+>   escriben **entre comillas** en el YAML a propósito: se leen como
+>   `str` y se convierten con `Decimal(value)` directamente, nunca
+>   pasando por `float` (evitando el error de precisión de convertir un
+>   float ya impreciso). `enabled: false` es el valor por defecto.
+> - **`build_paper_trading_context()`** (`src/paper_trading/
+>   composition.py`) es la única función autorizada para construir
+>   `SQLitePaperTradingRepository`/`PaperTradingService`/
+>   `PaperTradingApplication` concretos: llama `repository.init()`,
+>   siembra el capital inicial (`seed_initial_cash_balance()`, idempotente
+>   -- nunca resetea ni duplica un saldo ya existente) y devuelve un
+>   `PaperTradingContext` (repository + service + application + config).
+>   No mantiene conexiones abiertas ni usa singletons.
+> - **`Clock`/`IdGenerator`** (`src/paper_trading/runtime.py`, protocolos)
+>   reemplazan `datetime.now()`/`uuid.uuid4()` directos dentro de
+>   `application.py`/`composition.py`; `SystemClock`/`UUIDIdGenerator`
+>   son las únicas implementaciones que sí los usan, inyectadas desde
+>   `main.py`.
+> - **`MarketPriceProvider`** (`src/paper_trading/price_provider.py`,
+>   protocolo) + `RepositoryMarketPriceProvider` (adaptador real):
+>   reutiliza `MarketDataRepository` ya existente (Etapa 1) para leer el
+>   último `MarketTicker`, convirtiéndolo con `Decimal(str(value))`
+>   (nunca `Decimal(value)` sobre un float). Sin conexión nueva a
+>   Binance; falla explícitamente si no hay precio o si es ≤ 0.
+> - **`PaperTradingApplication.submit_manual_market_order()`**
+>   (`src/paper_trading/application.py`) es el único caso de uso de
+>   aplicación: valida `enabled` primero (antes de precios/IDs/Order/
+>   Service — `PaperTradingDisabledError`, definida en `application.py`,
+>   no en `exceptions.py`, porque es un error de disponibilidad de caso
+>   de uso, no un invariante de dominio), arma `Order(status=NEW,
+>   order_type=MARKET)`, obtiene precios de todas las posiciones
+>   abiertas no-FLAT más el símbolo operado, y delega el resto a
+>   `PaperTradingService.submit_market_order()` sin recalcular nada.
+> - **Integración con `main.py`**: `build_paper_trading(settings)` sigue
+>   exactamente el criterio ya usado para `ai_engine.enabled` — si
+>   `paper_trading.enabled` es `false`, no se instancia absolutamente
+>   nada (ni el repositorio). El contexto devuelto queda disponible en
+>   `main()` para uso manual/futuro; **ningún ciclo, señal ni
+>   recomendación de IA lo invoca todavía** (confirmado por auditoría de
+>   imports: `src/signals/`, `src/ai/` y `src/dashboard/` no referencian
+>   `paper_trading` en absoluto).
+> - **Pendiente para una etapa futura**: página de Dashboard de Paper
+>   Trading; reserva real de `CashBalance.reserved_balance`/
+>   `Position.reserved_quantity` (sigue en 0); scheduler o ejecución
+>   automática desde señales/IA; migración real a PostgreSQL (el stub
+>   sigue sin implementar).
 
 > **Nota de implementación (Etapa 6.4 — servicio)**: `PaperTradingService`
 > (`src/paper_trading/service.py`) es, desde esta etapa, **la única capa

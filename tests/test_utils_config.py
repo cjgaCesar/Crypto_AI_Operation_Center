@@ -57,6 +57,16 @@ def _valid_yaml() -> dict:
             "system_prompt": "Eres un analista de mercado.",
             "dummy_delay": 0,
         },
+        "paper_trading": {
+            "enabled": False,
+            "database_path": "data/crypto_data.db",
+            "initial_capital": "10000",
+            "currency": "USDT",
+            "fee_rate": "0.001",
+            "max_order_value": "1000",
+            "max_position_value": "5000",
+            "rules_version": "v1",
+        },
     }
 
 
