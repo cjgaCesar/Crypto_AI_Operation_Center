@@ -1,10 +1,45 @@
-# Arquitectura de Paper Trading (Etapa 6.0 — diseño, sin implementar)
+# Arquitectura de Paper Trading (Etapa 6.0 — diseño; implementación en curso desde 6.1)
 
-> **Este documento es exclusivamente de diseño.** Ninguna clase, tabla,
-> archivo de configuración ni prueba descrita aquí existe todavía en el
-> código. Todo nombre de archivo, clase o tabla mencionado es una
-> **propuesta**, sujeta a tu aprobación antes de implementarse. No hay
-> compra ni venta, simulada o real, en esta etapa.
+> **Este documento sigue siendo la referencia de diseño.** Las tablas,
+> el repositorio, el servicio, `config.yaml` y el Dashboard descritos
+> aquí **todavía no existen** en el código (llegan en las Etapas 6.3 en
+> adelante). Lo que **sí existe ya**, implementado y con pruebas, es el
+> dominio (`src/paper_trading/models.py`, `enums.py`, `validators.py`,
+> `exceptions.py`, Etapa 6.1) y los motores puros (`fill_engine.py`,
+> `position_engine.py`, `pnl_engine.py`, `risk_engine.py`, Etapa 6.2) —
+> ver la nota de implementación justo debajo. No hay compra ni venta
+> real (con dinero real) en ninguna etapa de Paper Trading.
+
+> **Nota de implementación (Etapas 6.1 y 6.2)**: dos decisiones de esta
+> sección quedaron implementadas de forma distinta a lo que este
+> documento recomendaba, por decisión explícita del usuario al aprobar
+> cada etapa (no por corrección de un error de la auditoría 6.0.1):
+> - **Precisión numérica: `Decimal`, no `float`.** El punto 1 de
+>   ["Decisiones aprobables antes de Etapa 6.1"](#20-decisiones-aprobables-antes-de-la-etapa-61)
+>   recomendaba `float` con recomputo desde la fuente. El usuario
+>   decidió `Decimal` en todo el dominio para la implementación real
+>   (Etapa 6.1). Esto también hace irrelevante, en la práctica, el
+>   riesgo de "deriva de redondeo" que motivaba evitar `+=` incremental
+>   en `Position.realized_pnl_to_date` (§2.4): con `Decimal`, la suma
+>   incremental es exacta. Aun así, `PositionEngine.apply_execution`
+>   (Etapa 6.2) actualiza `realized_pnl_to_date` de forma incremental
+>   **solo porque todavía no existe ningún repositorio** del cual
+>   recalcularlo vía `SUM(Trade.net_pnl)` (§12.2) — cuando la Etapa 6.3
+>   agregue persistencia, recalcular desde la fuente sigue siendo la
+>   estrategia preferida y no exige cambiar esta función.
+> - **`RiskEngine` no reserva nada.** §8 ya decía que el motor de riesgo
+>   es puro; la Etapa 6.2 lo confirma en código: `RiskEngine.validate_order()`
+>   no modifica `CashBalance.reserved_balance` ni
+>   `Position.reserved_quantity` — devuelve únicamente un
+>   `RiskValidationResult`. Reservar capital/cantidad al aceptar una
+>   orden es responsabilidad de un futuro servicio (Etapa 6.4), todavía
+>   sin construir.
+>
+> El resto de las decisiones de implementación de 6.1-6.2 (solo MARKET,
+> solo LONG/FLAT, llenado del 100% del remanente en una sola ejecución,
+> `Trade.fees` = solo la comisión de cierre, comisión de apertura no
+> reasignada retroactivamente) coinciden exactamente con lo ya descrito
+> en las secciones de abajo — no fue necesario cambiarlas.
 
 > **Nota de revisión (Etapa 6.0.1 — auditoría de arquitectura)**: tras la
 > versión original de este documento, se hizo una auditoría exhaustiva
