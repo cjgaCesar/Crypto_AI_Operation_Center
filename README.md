@@ -29,12 +29,20 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   factores positivos/negativos), persistida en una tabla independiente.
   Hoy usa un proveedor simulado (`DummyProvider`); OpenAI/Claude quedan
   preparados pero sin conectar. Ver [docs/ALCANCE_ETAPA_4.md](docs/ALCANCE_ETAPA_4.md).
-- 📝 **Etapa 5 (en desarrollo, Iteración 5.7 — las 6 páginas del
-  Dashboard ya son funcionales: Resumen General, Mercado, Indicadores,
-  Señales, Recomendaciones de IA y Estado Técnico)** — Dashboard de solo
-  lectura (Streamlit) sobre las 4 tablas ya generadas por las Etapas 1 a
-  4. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
+- ✅ **Etapa 5 aprobada** — Dashboard de solo lectura (Streamlit) sobre
+  las 4 tablas ya generadas por las Etapas 1 a 4: 6 páginas funcionales
+  (Resumen General, Mercado, Indicadores, Señales, Recomendaciones de IA,
+  Estado Técnico), diseño responsive con selector de vista compartido y
+  centralizado. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
   [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
+- 📝 **Etapa 6.0 (diseño, sin código todavía)** — Preparación de la
+  arquitectura para Paper Trading (compra/venta simulada, sin dinero
+  real): modelo de dominio (órdenes, posiciones, cartera, PnL), estados
+  de una orden, reglas de riesgo, diseño de persistencia e integración
+  futura con el Dashboard y con la IA — **todo documentado, nada
+  implementado todavía**. Ver
+  [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
+  [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 ## Qué hace el bot hoy
 
@@ -384,29 +392,34 @@ AIRecommendation` —, proveedor simulado `DummyProvider` conectado
 (OpenAI/Claude preparados, sin conectar), tabla independiente
 `ai_recommendations`. Pendiente de tu revisión y aprobación formal.
 
-📝 Etapa 5, Iteración 5.7 (las 6 páginas del Dashboard ya son
-funcionales; la Etapa 5 en general todavía NO está cerrada): las
-Iteraciones 5.3-5.6 agregaron `DashboardSummaryView`/`MarketSummaryView`/
-`IndicatorSummaryView`/`SignalSummaryView` y sus páginas, además de
-centralizar el selector "Vista" en `layout.render_view_mode_selector()`
-(compartido entre páginas). Esta iteración agregó, reutilizando lo
-anterior sin duplicarlo: `AIRecommendationSummaryView`/
-`AIRecommendationPageView` (`models.py`, el historial reutiliza
-`AIRecommendation` directamente en vez de un modelo nuevo),
-`DashboardService.get_ai_recommendations_page()` (una sola llamada a
-`get_ai_history()` ya existente: sin métodos nuevos en `repository.py`,
-sin llamar a `DecisionEngine` ni a ningún `AIProvider`) y 6 componentes
-nuevos (`render_ai_status`/`render_ai_metrics`/`render_ai_explanation`/
-`render_ai_availability`/`render_ai_history_chart`/
-`render_ai_history_table`). La página "Recomendaciones de IA" ya muestra
-la recomendación actual, confianza, riesgo, resumen y razonamiento
-completo (con ventajas/riesgos en un panel expandible), fecha de
-generación, un gráfico de confianza y una tabla cronológica para el
-símbolo elegido, con el selector de vista responsive compartido; declara
-explícitamente que el proveedor (`DummyProvider`) sigue siendo simulado.
-Pendiente tu auditoría antes de continuar.
+✅ **Etapa 5 aprobada**: Dashboard de solo lectura (Streamlit) con 6
+páginas funcionales (Resumen General, Mercado, Indicadores, Señales,
+Recomendaciones de IA, Estado Técnico), construidas incrementalmente en
+las Iteraciones 5.1-5.7 sobre las 4 tablas ya generadas por las Etapas
+1-4, sin recalcular ni escribir ningún dato. Selector de vista
+responsive (Automática/Amplia/Compacta) centralizado y compartido entre
+las 5 páginas que lo usan (`layout.render_view_mode_selector()`). Ver
+[docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md) para el
+detalle completo de cada iteración.
 
-Pendiente: aprobación formal de la Etapa 4 antes de avanzar a cualquier
-etapa futura (Telegram, paper trading o trading automático, o conectar
-un proveedor de IA real); aprobación formal de esta Iteración 5.7 y de
-la Etapa 5 en general antes de cualquier refinamiento visual definitivo.
+📝 **Etapa 6.0 (diseño, sin código todavía)**: preparación de la
+arquitectura para Paper Trading (compra/venta simulada, sin dinero
+real). Esta sub-etapa **no implementa ninguna funcionalidad**: solo
+documenta el modelo de dominio (`Order`, `Position`, `Portfolio`,
+`Trade`, `Execution`, `CashBalance`, `OrderBook` simulado, `RiskLimits`,
+`PortfolioSnapshot`, `PnLSnapshot`), los estados de una orden y sus
+transiciones válidas/inválidas, las reglas de riesgo, el diseño de
+persistencia (tablas propuestas, sin crearlas), la integración futura
+con el Dashboard (solo lectura, sin páginas nuevas) y con la IA
+(`AIRecommendation` ya existente, sin que la IA ejecute órdenes
+directamente), y la estrategia de pruebas. Se confirmó, con una búsqueda
+exhaustiva en todo `src/`, que no existe ningún código previo de
+órdenes/posiciones/cartera/riesgo/PnL: es un módulo enteramente nuevo.
+Ver [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
+[docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
+Pendiente tu aprobación de esta arquitectura antes de escribir la
+primera línea de código de Paper Trading.
+
+Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
+de conectar un proveedor de IA real; aprobación de esta Etapa 6.0 antes
+de iniciar la implementación de Paper Trading.
