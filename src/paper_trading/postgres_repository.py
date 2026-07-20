@@ -120,6 +120,16 @@ class PostgresPaperTradingRepository(PaperTradingRepository):
     ) -> None:
         raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
 
+    def save_order_acceptance_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def save_order_cancellation_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
     def calculate_realized_pnl(
         self, exchange: Optional[str] = None, symbol: Optional[str] = None,
     ) -> Decimal:

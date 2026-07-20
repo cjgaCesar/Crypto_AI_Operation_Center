@@ -147,6 +147,58 @@ class TestInit:
 
         assert repo.get_order("order-1") is not None
 
+    def test_migrates_legacy_schema_without_reservation_columns(self, tmp_path):
+        """Base creada antes de la Etapa 6.7 (sin las 4 columnas de
+        reserva en paper_trading_orders): init() debe agregarlas sin
+        perder ni alterar ningún registro existente."""
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE paper_trading_orders (
+                id TEXT PRIMARY KEY,
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                limit_price TEXT,
+                status TEXT NOT NULL,
+                filled_quantity TEXT NOT NULL,
+                average_fill_price TEXT,
+                source TEXT NOT NULL,
+                linked_recommendation_id TEXT,
+                rejection_reason TEXT,
+                cancellation_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO paper_trading_orders "
+            "(id, exchange, symbol, side, order_type, quantity, status, filled_quantity, source, created_at, updated_at) "
+            "VALUES ('legacy-1', 'Binance', 'BTCUSDT', 'BUY', 'MARKET', '0.1', 'NEW', '0', 'MANUAL', "
+            "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        columns_before = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(paper_trading_orders)")}
+        assert "reserved_price" not in columns_before
+
+        repo = SQLitePaperTradingRepository(db_path)
+        repo.init()
+
+        columns_after = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(paper_trading_orders)")}
+        assert {"reserved_price", "reserved_notional", "reserved_fee", "reserved_quantity"}.issubset(columns_after)
+
+        legacy_order = repo.get_order("legacy-1")
+        assert legacy_order is not None
+        assert legacy_order.quantity == Decimal("0.1")
+        assert legacy_order.reserved_price is None
+
     def test_connections_have_foreign_keys_enabled(self, tmp_path):
         repo = _repo(tmp_path)
         conn = repo._get_connection()
@@ -628,6 +680,139 @@ class TestSaveFillTransaction:
         assert repo.get_cash_balance("USDT").total_balance == Decimal("9995")
         assert repo.fetch_executions_by_order("order-1") == [execution]
         assert repo.fetch_trades() == [trade]
+
+
+# --- TRANSACCIONES DE RESERVA (Etapa 6.7) ---------------------------------
+
+class TestSaveOrderAcceptanceTransaction:
+    def test_persists_buy_acceptance_atomically(self, tmp_path):
+        repo = _repo(tmp_path)
+        cash = _cash_balance(total_balance=Decimal("10000"))
+        repo.save_cash_balance(cash)
+        order = _order(
+            status=OrderStatus.PENDING, reserved_price=Decimal("50000"),
+            reserved_notional=Decimal("5000"), reserved_fee=Decimal("5"),
+        )
+        reserved_cash = CashBalance(**{**cash.model_dump(), "reserved_balance": Decimal("5005")})
+        position = _flat_position()
+
+        repo.save_order_acceptance_transaction(order, reserved_cash, position)
+
+        fetched_order = repo.get_order("order-1")
+        assert fetched_order.status == OrderStatus.PENDING
+        assert fetched_order.reserved_notional == Decimal("5000")
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("5005")
+
+    def test_persists_sell_acceptance_atomically(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance())
+        position = _position(reserved_quantity=Decimal("0"))
+        repo.save_position(position)
+
+        order = _order(side=OrderSide.SELL, status=OrderStatus.PENDING, reserved_price=Decimal("54000"), reserved_quantity=Decimal("0.1"))
+        reserved_position = Position(**{**position.model_dump(), "reserved_quantity": Decimal("0.1")})
+
+        repo.save_order_acceptance_transaction(order, repo.get_cash_balance("USDT"), reserved_position)
+
+        assert repo.get_order("order-1").status == OrderStatus.PENDING
+        assert repo.get_position("Binance", "BTCUSDT").reserved_quantity == Decimal("0.1")
+
+    def test_rollback_on_symbol_mismatch(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance())
+        order = _order(
+            status=OrderStatus.PENDING, reserved_price=Decimal("50000"),
+            reserved_notional=Decimal("5000"), reserved_fee=Decimal("5"),
+        )
+        mismatched_position = _flat_position(symbol="ETHUSDT")
+
+        with pytest.raises(ValueError):
+            repo.save_order_acceptance_transaction(order, repo.get_cash_balance("USDT"), mismatched_position)
+
+        assert repo.get_order("order-1") is None
+
+    def test_rollback_leaves_no_partial_state(self, tmp_path):
+        """Un id de orden duplicado (colisión con una fila ya existente por
+        otro motivo) no debe dejar CashBalance/Position modificados."""
+        repo = _repo(tmp_path)
+        cash = _cash_balance(total_balance=Decimal("10000"))
+        repo.save_cash_balance(cash)
+        position = _flat_position()
+        repo.save_position(position)
+
+        # Simula un fallo forzando una excepción dentro de la transacción:
+        # una Position con exchange/symbol distinto del de la Order.
+        order = _order(
+            status=OrderStatus.PENDING, reserved_price=Decimal("50000"),
+            reserved_notional=Decimal("5000"), reserved_fee=Decimal("5"),
+        )
+        bad_position = Position(**{**position.model_dump(), "symbol": "ETHUSDT"})
+        bad_cash = CashBalance(**{**cash.model_dump(), "reserved_balance": Decimal("5005")})
+
+        with pytest.raises(ValueError):
+            repo.save_order_acceptance_transaction(order, bad_cash, bad_position)
+
+        assert repo.get_order("order-1") is None
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("0")
+        assert repo.get_position("Binance", "BTCUSDT").quantity == Decimal("0")
+
+
+class TestSaveOrderCancellationTransaction:
+    def test_persists_buy_cancellation_atomically(self, tmp_path):
+        repo = _repo(tmp_path)
+        cash = _cash_balance(total_balance=Decimal("10000"), reserved_balance=Decimal("5005"))
+        repo.save_cash_balance(cash)
+        order = _order(
+            status=OrderStatus.PENDING, reserved_price=Decimal("50000"),
+            reserved_notional=Decimal("5000"), reserved_fee=Decimal("5"),
+        )
+        repo.save_order(order)
+
+        cancelled_order = Order(**{**order.model_dump(), "status": OrderStatus.CANCELLED, "cancellation_reason": "test"})
+        released_cash = CashBalance(**{**cash.model_dump(), "reserved_balance": Decimal("0")})
+        position = _flat_position()
+
+        repo.save_order_cancellation_transaction(cancelled_order, released_cash, position)
+
+        assert repo.get_order("order-1").status == OrderStatus.CANCELLED
+        assert repo.get_order("order-1").cancellation_reason == "test"
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("0")
+
+    def test_persists_sell_cancellation_atomically(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance())
+        position = _position(reserved_quantity=Decimal("0.1"))
+        repo.save_position(position)
+        order = _order(side=OrderSide.SELL, status=OrderStatus.PENDING, reserved_price=Decimal("54000"), reserved_quantity=Decimal("0.1"))
+        repo.save_order(order)
+
+        cancelled_order = Order(**{**order.model_dump(), "status": OrderStatus.CANCELLED, "cancellation_reason": "test"})
+        released_position = Position(**{**position.model_dump(), "reserved_quantity": Decimal("0")})
+
+        repo.save_order_cancellation_transaction(cancelled_order, repo.get_cash_balance("USDT"), released_position)
+
+        assert repo.get_order("order-1").status == OrderStatus.CANCELLED
+        assert repo.get_position("Binance", "BTCUSDT").reserved_quantity == Decimal("0")
+
+    def test_rollback_on_symbol_mismatch(self, tmp_path):
+        repo = _repo(tmp_path)
+        cash = _cash_balance(reserved_balance=Decimal("5005"))
+        repo.save_cash_balance(cash)
+        order = _order(
+            status=OrderStatus.PENDING, reserved_price=Decimal("50000"),
+            reserved_notional=Decimal("5000"), reserved_fee=Decimal("5"),
+        )
+        repo.save_order(order)
+
+        cancelled_order = Order(**{**order.model_dump(), "status": OrderStatus.CANCELLED, "cancellation_reason": "test"})
+        mismatched_position = _flat_position(symbol="ETHUSDT")
+        released_cash = CashBalance(**{**cash.model_dump(), "reserved_balance": Decimal("0")})
+
+        with pytest.raises(ValueError):
+            repo.save_order_cancellation_transaction(cancelled_order, released_cash, mismatched_position)
+
+        assert repo.get_order("order-1").status == OrderStatus.PENDING
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("5005")
 
 
 # --- PNL ------------------------------------------------------------------

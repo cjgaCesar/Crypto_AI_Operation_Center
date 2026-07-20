@@ -147,6 +147,24 @@ class PaperTradingRepository(ABC):
         ninguna de las demás queda aplicada.
         """
 
+    # --- Transacciones atómicas de aceptación/cancelación (Etapa 6.7) ------
+
+    @abstractmethod
+    def save_order_acceptance_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        """Persiste atómicamente una Order recién aceptada (PENDING, con
+        reserva) junto con el CashBalance/Position que la reserva afectó.
+        """
+
+    @abstractmethod
+    def save_order_cancellation_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        """Persiste atómicamente una Order cancelada (CANCELLED, reserva ya
+        liberada) junto con el CashBalance/Position ya actualizados.
+        """
+
     # --- PnL realizado: fuente de verdad y reconciliación ------------------
 
     @abstractmethod

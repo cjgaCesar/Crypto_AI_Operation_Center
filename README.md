@@ -35,20 +35,23 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   Estado Técnico), diseño responsive con selector de vista compartido y
   centralizado. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
   [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
-- 🛠️ **Etapas 6.0-6.6 (implementación en curso)** — Paper Trading
+- 🛠️ **Etapas 6.0-6.7 (implementación en curso)** — Paper Trading
   (compra/venta simulada, sin dinero real, sin conexión a un exchange
   para operar): dominio (`src/paper_trading/models.py`), motores puros
-  (fill/position/PnL/risk), persistencia SQLite propia
+  (fill/position/PnL/risk/**reservation**), persistencia SQLite propia
   (`paper_trading_*`), `PaperTradingService` y una Composition Root con
   `PaperTradingApplication` para someter una orden manual, más una
   página de Dashboard **estrictamente de solo lectura** ("Paper
   Trading": saldo, patrimonio, posiciones, órdenes, trades, gráficos y
   auditoría de consistencia del PnL, sin ningún botón ni formulario de
-  operación) — todo con pruebas automatizadas. `config.yaml ->
-  paper_trading.enabled` es `false` por defecto: **ninguna orden se
-  ejecuta automáticamente ni desde el Dashboard** (sin Strategy Engine,
-  sin señales ni IA ejecutando órdenes). Ver
-  [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
+  operación) — todo con pruebas automatizadas. **6.7** introdujo el
+  ciclo de vida explícito de una orden MARKET con reservas reales
+  (`NEW → PENDING con reserva → FILLED/CANCELLED con liberación`), vía
+  `ReservationEngine` (motor puro) y transacciones atómicas nuevas en el
+  repositorio. `config.yaml -> paper_trading.enabled` es `false` por
+  defecto: **ninguna orden se ejecuta automáticamente ni desde el
+  Dashboard** (sin Strategy Engine, sin señales ni IA ejecutando
+  órdenes). Ver [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
   [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 ## Qué hace el bot hoy
@@ -409,7 +412,7 @@ las 5 páginas que lo usan (`layout.render_view_mode_selector()`). Ver
 [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md) para el
 detalle completo de cada iteración.
 
-🛠️ **Etapas 6.0-6.6 (implementación en curso)**: Paper Trading (compra/
+🛠️ **Etapas 6.0-6.7 (implementación en curso)**: Paper Trading (compra/
 venta simulada, sin dinero real, sin conexión a un exchange para
 operar). 6.0 diseñó la arquitectura (auditada en 6.0.1); desde entonces
 se implementó, con pruebas automatizadas en cada paso: **6.1** dominio
@@ -427,15 +430,24 @@ defecto) e integración mínima en `main.py`; **6.6** página de Dashboard
 "Paper Trading" **estrictamente de solo lectura** (saldo, patrimonio,
 posiciones, órdenes, ejecuciones, trades, evolución del patrimonio/PnL
 y auditoría de consistencia — sin ningún botón, formulario ni acción
-que ejecute/cree/cancele una orden). **Ninguna orden se ejecuta
-automáticamente todavía**: sin Strategy Engine, sin señales ni IA
-ejecutando órdenes. Ver
+que ejecute/cree/cancele una orden); **6.7** ciclo de vida explícito de
+una orden MARKET con reservas reales de capital/cantidad
+(`NEW → PENDING con reserva → FILLED/CANCELLED con liberación`, o
+`NEW → REJECTED` sin reservar nada), mediante un nuevo motor puro
+`ReservationEngine` (reserva/libera `CashBalance.reserved_balance` en
+BUY y `Position.reserved_quantity` en SELL, guardado en 4 campos nuevos
+del propio `Order`) y nuevas transacciones atómicas del repositorio
+(`save_order_acceptance_transaction`/`save_order_cancellation_transaction`);
+`submit_market_order`/`submit_manual_market_order` se conservan como
+fachadas de compatibilidad. **Ninguna orden se ejecuta automáticamente
+todavía**: sin Strategy Engine, sin señales ni IA ejecutando órdenes,
+sin cambios en el Dashboard (sigue de solo lectura). Ver
 [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
 [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
-Pendiente tu auditoría y aprobación formal de la Etapa 6.6 antes de
+Pendiente tu auditoría y aprobación formal de la Etapa 6.7 antes de
 continuar.
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
-de conectar un proveedor de IA real; aprobación de la Etapa 6.6 antes de
-continuar con Paper Trading (reservas de capital/cantidad,
-automatización, migración PostgreSQL real).
+de conectar un proveedor de IA real; aprobación de la Etapa 6.7 antes de
+continuar con Paper Trading (automatización, migración PostgreSQL
+real).

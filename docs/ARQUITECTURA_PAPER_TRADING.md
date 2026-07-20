@@ -1641,3 +1641,223 @@ requieren confirmación explícita del usuario antes de iniciar 6.1:
     puros → 6.3 Persistencia → 6.4 Servicio y Composition Root → 6.5
     Dashboard read-only → 6.6 diferido (SHORT/margen, LIMIT, stop-loss/
     take-profit) — ver §19.
+
+## 21. Ciclo de vida de órdenes con reservas (Etapa 6.7 — diseño previo a implementar)
+
+Hasta la Etapa 6.6, `PaperTradingService.submit_market_order()` pasaba
+una orden de `NEW` a `FILLED` dentro de una sola llamada, sin persistir
+nunca un estado `PENDING` real ni tocar `CashBalance.reserved_balance`/
+`Position.reserved_quantity` (ver nota de implementación de la Etapa
+6.4). La Etapa 6.7 separa **aceptar** (reservar) de **llenar** (liquidar)
+y agrega **cancelar** (liberar sin liquidar) como una tercera transición
+explícita, con reservas reales.
+
+### 21.1 Matriz de estados
+
+| Estado | Puede... | No puede... |
+|---|---|---|
+| `NEW` | aceptarse (→ `PENDING`, con reserva); rechazarse (→ `REJECTED`, sin reserva) | llenarse directamente; cancelarse (nunca fue aceptada) |
+| `PENDING` | llenarse (→ `FILLED`, libera reserva y liquida); cancelarse (→ `CANCELLED`, libera reserva sin liquidar) | aceptarse de nuevo; rechazarse |
+| `FILLED` | — (terminal) | cancelarse; llenarse de nuevo; mantener reserva activa |
+| `REJECTED` | — (terminal) | — (nunca tuvo reserva) |
+| `CANCELLED` | — (terminal) | crear `Execution`/`Trade`; mantener reserva activa |
+| `PARTIALLY_FILLED` | fuera de alcance: `FillEngine` sigue llenando el 100% del remanente en una única `Execution` (§9, sin cambios); este estado no se produce en 6.7 |
+
+### 21.2 Fuente de verdad de la reserva: campos en `Order`, no una entidad nueva
+
+Se evaluaron 3 alternativas (Paso 13 de la Etapa 6.7):
+
+- **A. Entidad `OrderReservation` persistida aparte** (con su propio
+  ciclo `ACTIVE`/`RELEASED`/`CANCELLED`).
+- **B. Campos de reserva directamente en `Order`.**
+- **C. Reconstruir la reserva desde el precio actual al liberar.**
+
+**C se descarta de plano**: el enunciado lo prohíbe explícitamente
+("no confiar en el precio actual para liberar una reserva histórica") y
+es incorrecto en general (el precio pudo cambiar entre aceptar y
+liberar).
+
+**Se elige B sobre A** porque la relación entre una `Order` y su
+reserva es exactamente 1:1 y coextensiva con el propio ciclo de vida de
+la orden: una reserva nace exactamente cuando la orden pasa a `PENDING`
+y muere exactamente cuando la orden deja `PENDING` (hacia `FILLED` o
+`CANCELLED`) — nunca se comparte entre órdenes, nunca sobrevive a la
+orden, nunca tiene un ciclo propio distinto del de la orden que la
+originó. Modelarla como una entidad aparte (opción A) introduciría una
+tabla, una FK y un enum de estado (`ACTIVE`/`RELEASED`/`CANCELLED`) que
+solo espejarían, con más piezas, exactamente lo que `Order.status` ya
+expresa. Se agregan 4 campos opcionales a `Order`:
+
+| Campo | Tipo | Aplica a | Significado |
+|---|---|---|---|
+| `reserved_price` | `Optional[Decimal]` | BUY y SELL | Precio de mercado usado al aceptar -- ver §21.3, política de "llenar al precio aceptado". |
+| `reserved_notional` | `Optional[Decimal]` | Solo BUY | `quantity × reserved_price` reservado de `CashBalance.reserved_balance`. |
+| `reserved_fee` | `Optional[Decimal]` | Solo BUY | `reserved_notional × fee_rate` reservado junto al notional. |
+| `reserved_quantity` | `Optional[Decimal]` | Solo SELL | `quantity` reservada de `Position.reserved_quantity`. |
+
+**Corrección durante esta misma auditoría de diseño**: la primera
+versión de este documento proponía un invariante estricto en `Order`
+("estos 4 campos son `None` si y solo si `status` nunca fue aceptado").
+Al implementarlo como `@model_validator`, la regresión completa saltó
+de 0 a **135 pruebas rotas**: decenas de pruebas ya aprobadas de
+`fill_engine`/`position_engine`/`risk_engine`/`service`/
+`sqlite_repository` construyen órdenes `PENDING`/`FILLED`/`CANCELLED`
+directamente (para probar fills, posiciones o riesgo, no reservas) sin
+poblar estos 4 campos nuevos. Imponer el invariante a nivel de modelo
+habría exigido modificar esa gran cantidad de pruebas estables solo
+para satisfacer un campo que no ejercitan, violando el principio 12
+("no modificar módulos estables salvo necesidad demostrada") en la
+dirección contraria: la necesidad demostrada era **no** tocarlas.
+
+Se aplica entonces la salida que el propio enunciado de la Etapa 6.7
+preveía (Paso 23: "si estas invariantes no pueden vivir en modelos
+aislados, aplicar las relacionales en Service/repositorio"): `Order`
+solo valida que el campo de reserva **del lado equivocado** nunca se
+use (`reserved_quantity` en una BUY, o `reserved_notional`/`reserved_fee`
+en una SELL, siempre rechazados) — una comprobación barata, nunca
+disparada por una orden que simplemente no usa reservas. La garantía
+"una orden `PENDING` real (creada por `ReservationEngine`) siempre tiene
+sus campos de reserva poblados" se sostiene **por construcción**
+(`reserve_for_order()` los puebla siempre, ver §21.4), no por un
+invariante de Pydantic que rechazaría datos de prueba legítimos y
+anteriores a esta funcionalidad.
+
+### 21.3 Política de precio: "MARKET se llena al precio aceptado"
+
+Si el precio de mercado cambiara entre aceptar y llenar, ¿a qué precio
+se llena la orden? Se decide que **la ejecución usa siempre
+`order.reserved_price`**, nunca un precio nuevo consultado al momento de
+llenar. Consecuencias:
+
+- `fill_pending_order()` no recibe `market_price` como parámetro: lo lee
+  de `order.reserved_price`, garantizando exactitud matemática (mismo
+  precio, misma `quantity`, mismo `fee_rate` ⇒ el `fee` de la
+  `Execution` resultante coincide exactamente con `order.reserved_fee`,
+  sin redondeos ni aproximaciones).
+- Esto también simplifica `PaperTradingApplication.fill_manual_pending_order()`:
+  no consulta `MarketPriceProvider` (Paso 18 lo pide explícitamente).
+
+### 21.4 Motor puro de reservas: `ReservationEngine`
+
+Nuevo módulo `src/paper_trading/reservation_engine.py` (+
+`reservation_results.py`), con el mismo perfil de pureza que
+`fill_engine.py`/`position_engine.py`/`risk_engine.py`/`pnl_engine.py`:
+sin repositorio, sin `sqlite3`, sin `logging`, sin `datetime.now()`/
+`uuid.uuid4()`, sin Application/Service.
+
+- `reserve_for_order(order, cash_balance, position, market_price, fee_rate, timestamp) -> ReservationResult`:
+  exige `order.status == NEW`; para BUY calcula `reserved_notional`/
+  `reserved_fee` y aumenta `cash_balance.reserved_balance`; para SELL
+  exige `position.side == LONG` y `quantity <= available_quantity`, y
+  aumenta `position.reserved_quantity`. Devuelve la `Order` ya en
+  `PENDING` con los 4 campos de reserva poblados, más el `CashBalance`/
+  `Position` actualizados (el que no cambia se devuelve tal cual, sin
+  mutar). Como `RiskEngine.validate_order()` ya se llamó antes y aprobó,
+  un fallo de reserva aquí (saldo/cantidad insuficiente) es un estado
+  imposible/carrera, no un rechazo normal: lanza
+  `InsufficientReservedCashError`/`InsufficientReservedQuantityError`.
+- `release_for_order(order, cash_balance, position, timestamp) -> ReservationReleaseResult`:
+  exige `order.status == PENDING`; lee `order.reserved_notional`/
+  `reserved_fee`/`reserved_quantity` (nunca recibe estos valores como
+  parámetro aparte: ya viven en `order`, evitando que quien llama pase
+  un valor reservado distinto por error) y disminuye
+  `reserved_balance`/`reserved_quantity` exactamente por esa cantidad.
+  Nunca deja un valor reservado negativo (`ReservationAlreadyReleasedError`
+  si lo haría). Se usa **tanto para llenar como para cancelar**: liberar
+  la reserva es idéntico en ambos casos; lo que difiere es qué pasa
+  *después* de liberar (liquidar vs. no hacer nada más).
+
+### 21.5 Persistencia: transacciones nuevas, reutilización de `save_fill_transaction`
+
+- `save_order_acceptance_transaction(order, cash_balance, position)`:
+  UPSERT atómico de los 3 (Order en `PENDING` + reserva; CashBalance o
+  Position, el que cambió; el otro se re-guarda sin cambios, operación
+  barata e inocua).
+- `save_order_cancellation_transaction(order, cash_balance, position)`:
+  misma forma exacta que la anterior (UPSERT atómico de los 3), pero con
+  `Order` en `CANCELLED`. Ambos métodos públicos delegan a un mismo
+  helper privado (`_save_order_and_balances_transaction`): la operación
+  SQL es idéntica; solo cambia semánticamente qué transición representa,
+  y se mantienen dos nombres públicos distintos por claridad en el punto
+  de llamada del Service.
+- **`save_pending_fill_transaction` no se crea como método nuevo**: es
+  exactamente `save_fill_transaction()` ya existente (Etapa 6.3) --
+  UPSERT de Order a `FILLED` + INSERT de Execution + UPSERT de Position/
+  CashBalance + INSERT opcional de Trade/snapshots. La operación SQL no
+  distingue si la `Order` venía de `NEW` (flujo de compatibilidad) o de
+  `PENDING` con reserva (flujo nuevo): en ambos casos es "escribir el
+  estado final de un fill", así que reutilizar el método existente evita
+  duplicar código sin perder claridad (principio 12: no modificar
+  módulos estables salvo necesidad demostrada -- aquí, no hace falta).
+
+### 21.6 Idempotencia
+
+- **Aceptar dos veces la misma orden**: `accept_market_order()` primero
+  comprueba `repository.get_order(order.id) is None`; si ya existe,
+  lanza `InvalidOrderStateError` (nunca duplica una reserva).
+- **Llenar/cancelar dos veces**: `fill_pending_order()`/
+  `cancel_pending_order()` releen la `Order` actual por `id` y exigen
+  `status == PENDING`; una segunda llamada sobre una orden ya `FILLED`/
+  `CANCELLED` lanza `InvalidOrderStateError` antes de tocar nada.
+  Llenar después de cancelar, o cancelar después de llenar: ambos
+  prohibidos por la misma comprobación.
+
+### 21.7 Compatibilidad con `submit_market_order()`/`submit_manual_market_order()`
+
+Ambos se conservan como fachadas síncronas: `submit_market_order()` pasa
+a ser `accept_market_order()` seguido de `fill_pending_order()` con el
+mismo `timestamp`. **No finge una atomicidad que no existe**: son dos
+transacciones SQLite distintas. Si la aceptación se persiste y el
+llenado falla (una excepción de motor, no un rechazo de riesgo -- el
+riesgo ya se validó antes de aceptar), la orden queda legítimamente
+`PENDING` con su reserva activa en la base -- un estado válido y
+recuperable (puede llenarse o cancelarse después con las nuevas
+llamadas explícitas), no una corrupción. `submit_manual_market_order()`
+se conserva igual en `PaperTradingApplication`, delegando a
+`submit_market_order()` sin cambios de comportamiento observable.
+
+**Recuperación tras reinicio**: como la reserva vive en columnas
+persistidas de `paper_trading_orders` (§21.2) y no en memoria del
+proceso, una orden `PENDING` con su reserva activa sobrevive intacta a
+reconstruir la Composition Root (`build_paper_trading_context()`) sobre
+el mismo archivo SQLite -- la nueva instancia de `PaperTradingService`/
+`PaperTradingApplication` puede leer esa orden y llenarla o cancelarla
+con normalidad, sin volver a reservar ni perder el estado. Verificado en
+`tests/test_paper_trading_composition.py::TestReservationSurvivesRestart`.
+
+### 21.8 Invariantes relacionales (Order ↔ reserva)
+
+Las invariantes de `CashBalance` (`total_balance >= 0`,
+`reserved_balance >= 0`, `reserved_balance <= total_balance`) y de
+`Position` (`quantity >= 0`, `reserved_quantity >= 0`,
+`reserved_quantity <= quantity`, `FLAT ⇒ quantity == 0` que ya implica
+`FLAT ⇒ reserved_quantity == 0`) **ya existían y no cambian** (§2.4,
+§2.5) -- la Etapa 6.7 no necesita tocarlas. La única invariante nueva
+que sí vive en el modelo `Order` es la comprobación barata de §21.2
+(el campo de reserva del lado equivocado nunca se usa). La relación
+"`PENDING` implica que la reserva efectivamente está sumada en
+`CashBalance`/`Position`" es relacional entre 3 filas distintas y no
+puede vivir en un único modelo (y, como se documentó en §21.2, tampoco
+conviene forzarla allí): se garantiza porque `ReservationEngine` y las
+transacciones de persistencia siempre mueven `Order` + `CashBalance`/`Position` juntos,
+atómicamente, nunca por separado.
+
+### 21.9 Excepciones nuevas
+
+`InvalidOrderStateError`, `ReservationNotFoundError`,
+`InsufficientReservedCashError`, `InsufficientReservedQuantityError`,
+`ReservationAlreadyReleasedError` -- las 5 sugeridas, sin ampliar la
+jerarquía más allá. Todas heredan de `PaperTradingDomainError`. Un
+rechazo de riesgo sigue sin lanzar excepción (resultado
+`success=False`); estas 5 representan estados imposibles dado el flujo
+correcto (aceptar algo no-`NEW`, liberar algo no-`PENDING`, reserva
+insuficiente pese a que el riesgo ya aprobó).
+
+### 21.10 Dashboard
+
+Sigue estrictamente read-only. Los campos nuevos de reserva en `Order`
+no se agregan a `OrderRow` en esta etapa (no es necesario: `reserved_balance`
+de `CashBalance` y `reserved_quantity` de `Position` ya se muestran
+desde la Etapa 6.6, que es la información operativa relevante); los
+estados `PENDING` que ahora sí se persisten se muestran igual que
+cualquier otro `OrderStatus`, sin cambios de código.

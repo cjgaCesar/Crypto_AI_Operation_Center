@@ -212,6 +212,36 @@ class TestOrder:
             order = _order(status=status)
             assert order.status == status
 
+    def test_reserved_quantity_does_not_apply_to_buy(self):
+        """Etapa 6.7 (§21.2): reserved_quantity es solo para SELL."""
+        with pytest.raises(ValidationError):
+            _order(side=OrderSide.BUY, status=OrderStatus.PENDING, reserved_quantity=Decimal("0.1"))
+
+    def test_reserved_notional_and_fee_do_not_apply_to_sell(self):
+        with pytest.raises(ValidationError):
+            _order(side=OrderSide.SELL, status=OrderStatus.PENDING, reserved_notional=Decimal("5000"))
+
+    def test_reservation_fields_are_optional_and_default_to_none(self):
+        order = _order()
+        assert order.reserved_price is None
+        assert order.reserved_notional is None
+        assert order.reserved_fee is None
+        assert order.reserved_quantity is None
+
+    def test_accepts_populated_buy_reservation_fields(self):
+        order = _order(
+            status=OrderStatus.PENDING, reserved_price=Decimal("50000"),
+            reserved_notional=Decimal("5000"), reserved_fee=Decimal("5"),
+        )
+        assert order.reserved_notional == Decimal("5000")
+
+    def test_accepts_populated_sell_reservation_fields(self):
+        order = _order(
+            side=OrderSide.SELL, status=OrderStatus.PENDING,
+            reserved_price=Decimal("50000"), reserved_quantity=Decimal("0.1"),
+        )
+        assert order.reserved_quantity == Decimal("0.1")
+
     def test_accepts_ai_recommendation_source_with_linked_id(self):
         order = _order(source=OrderSource.AI_RECOMMENDATION, linked_recommendation_id="rec-1")
         assert order.linked_recommendation_id == "rec-1"

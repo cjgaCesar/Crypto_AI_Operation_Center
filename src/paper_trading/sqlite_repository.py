@@ -64,7 +64,21 @@ _ORDER_COLUMNS = (
     "id", "exchange", "symbol", "side", "order_type", "quantity", "limit_price", "status",
     "filled_quantity", "average_fill_price", "source", "linked_recommendation_id",
     "rejection_reason", "cancellation_reason", "created_at", "updated_at", "expires_at",
+    "reserved_price", "reserved_notional", "reserved_fee", "reserved_quantity",
 )
+
+# Columnas agregadas después de la primera versión de paper_trading_orders
+# (Etapa 6.7, ver ARQUITECTURA_PAPER_TRADING.md §21.2), con la definición
+# SQL a usar en ALTER TABLE ... ADD COLUMN -- mismo patrón idempotente ya
+# usado por SQLiteSignalRepository/SQLiteAIRepository. Las 4 son
+# nullable (sin NOT NULL): no tienen un valor por defecto razonable
+# distinto de NULL para las filas ya existentes.
+_ORDER_MIGRATION_COLUMNS = [
+    ("reserved_price", "TEXT"),
+    ("reserved_notional", "TEXT"),
+    ("reserved_fee", "TEXT"),
+    ("reserved_quantity", "TEXT"),
+]
 _EXECUTION_COLUMNS = ("id", "order_id", "exchange", "symbol", "quantity", "price", "fee", "executed_at")
 _TRADE_COLUMNS = (
     "id", "exchange", "symbol", "side", "quantity", "entry_price", "exit_price",
@@ -211,10 +225,22 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
                 )
                 """
             )
+            self._migrate_missing_columns(conn)
             self._create_indexes(conn)
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_missing_columns(conn: sqlite3.Connection) -> None:
+        """Migra bases creadas antes de la Etapa 6.7 (sin las 4 columnas
+        de reserva en paper_trading_orders), sin perder ni alterar ningún
+        registro existente. Idempotente: si ya se ejecutó antes (las
+        columnas ya existen), no hace nada."""
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_trading_orders)")}
+        for column, definition in _ORDER_MIGRATION_COLUMNS:
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE paper_trading_orders ADD COLUMN {column} {definition}")
 
     @staticmethod
     def _create_indexes(conn: sqlite3.Connection) -> None:
@@ -273,7 +299,9 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
                 linked_recommendation_id=excluded.linked_recommendation_id,
                 rejection_reason=excluded.rejection_reason,
                 cancellation_reason=excluded.cancellation_reason,
-                updated_at=excluded.updated_at, expires_at=excluded.expires_at
+                updated_at=excluded.updated_at, expires_at=excluded.expires_at,
+                reserved_price=excluded.reserved_price, reserved_notional=excluded.reserved_notional,
+                reserved_fee=excluded.reserved_fee, reserved_quantity=excluded.reserved_quantity
             """,
             (
                 order.id, order.exchange, order.symbol, order.side.value, order.order_type.value,
@@ -283,6 +311,8 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
                 order.linked_recommendation_id, order.rejection_reason, order.cancellation_reason,
                 datetime_to_text(order.created_at), datetime_to_text(order.updated_at),
                 optional_datetime_to_text(order.expires_at),
+                optional_decimal_to_text(order.reserved_price), optional_decimal_to_text(order.reserved_notional),
+                optional_decimal_to_text(order.reserved_fee), optional_decimal_to_text(order.reserved_quantity),
             ),
         )
 
@@ -345,6 +375,8 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
             linked_recommendation_id=row[11], rejection_reason=row[12], cancellation_reason=row[13],
             created_at=text_to_datetime(row[14]), updated_at=text_to_datetime(row[15]),
             expires_at=optional_text_to_datetime(row[16]),
+            reserved_price=optional_text_to_decimal(row[17]), reserved_notional=optional_text_to_decimal(row[18]),
+            reserved_fee=optional_text_to_decimal(row[19]), reserved_quantity=optional_text_to_decimal(row[20]),
         )
 
     # --- Execution ----------------------------------------------------------
@@ -786,6 +818,61 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
         if pnl_snapshot is not None:
             if pnl_snapshot.exchange != order.exchange or pnl_snapshot.symbol != order.symbol:
                 raise ValueError("pnl_snapshot.exchange/symbol no coincide con order.exchange/symbol.")
+
+    # --- Transacciones atómicas de aceptación/cancelación (Etapa 6.7) ------
+    #
+    # save_pending_fill_transaction NO se crea como método nuevo: llenar una
+    # orden PENDING con reserva usa exactamente save_fill_transaction() de
+    # arriba -- la operación SQL (UPSERT Order a FILLED + INSERT Execution +
+    # UPSERT Position/CashBalance + INSERT opcional Trade/snapshots) no
+    # distingue si la Order venía de NEW (submit_market_order, Etapa 6.4) o
+    # de PENDING con reserva (fill_pending_order, Etapa 6.7) -- ver
+    # ARQUITECTURA_PAPER_TRADING.md §21.5.
+
+    def save_order_acceptance_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        """Persiste atómicamente una Order recién aceptada (PENDING, con
+        reserva) junto con el CashBalance/Position que la reserva afectó.
+        El que no cambió se re-guarda tal cual (UPSERT idempotente, sin
+        efecto real) -- más simple que persistir condicionalmente según
+        BUY/SELL."""
+        self._validate_order_balances_consistency(order, cash_balance, position)
+        self._save_order_and_balances_transaction(order, cash_balance, position)
+
+    def save_order_cancellation_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        """Persiste atómicamente una Order cancelada (CANCELLED, reserva ya
+        liberada) junto con el CashBalance/Position ya actualizados. Misma
+        operación exacta que save_order_acceptance_transaction(): ver
+        _save_order_and_balances_transaction()."""
+        self._validate_order_balances_consistency(order, cash_balance, position)
+        self._save_order_and_balances_transaction(order, cash_balance, position)
+
+    def _save_order_and_balances_transaction(
+        self, order: Order, cash_balance: CashBalance, position: Position,
+    ) -> None:
+        conn = self._get_connection()
+        try:
+            self._upsert_order(conn, order)
+            self._upsert_cash_balance(conn, cash_balance)
+            self._upsert_position(conn, position)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _validate_order_balances_consistency(order: Order, cash_balance: CashBalance, position: Position) -> None:
+        """Mismo criterio que _validate_fill_consistency (Paso 15 de la
+        Etapa 6.3): no es lógica de negocio, solo confirma que las
+        entidades recibidas realmente pertenecen entre sí antes de escribir
+        nada."""
+        if position.exchange != order.exchange or position.symbol != order.symbol:
+            raise ValueError("position.exchange/symbol no coincide con order.exchange/symbol.")
 
     # --- PnL realizado: fuente de verdad y reconciliación ------------------
 

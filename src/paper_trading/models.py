@@ -32,7 +32,6 @@ from src.paper_trading.validators import ensure_le, ensure_none_iff
 
 ZERO = Decimal("0")
 
-
 class Order(BaseModel):
     """La intención de operar (simulada), desde que se crea hasta que se resuelve.
 
@@ -56,6 +55,22 @@ class Order(BaseModel):
     created_at: datetime
     updated_at: datetime
     expires_at: Optional[datetime] = None
+    # Campos de reserva (Etapa 6.7, ver ARQUITECTURA_PAPER_TRADING.md
+    # §21.2): opcionales, poblados por ReservationEngine cuando una orden
+    # se acepta (NEW -> PENDING) y conservados como registro histórico
+    # (nunca se vuelven a None tras liberarse). Deliberadamente NO se
+    # exige aquí que estén poblados según `status` (ej. "toda PENDING
+    # debe tenerlos"): esa invariante relacional se intentó a nivel de
+    # modelo y rompía ~135 pruebas ya aprobadas de motores/Service/
+    # repositorio que construyen órdenes PENDING/FILLED/CANCELLED sin
+    # ejercitar reservas -- se aplica en su lugar donde realmente importa
+    # (ReservationEngine, ver reservation_engine.py), siguiendo el propio
+    # criterio del enunciado de la Etapa 6.7 ("si no pueden vivir en
+    # modelos aislados, aplicarlas en Service/repositorio").
+    reserved_price: Optional[Decimal] = Field(default=None, gt=ZERO)
+    reserved_notional: Optional[Decimal] = Field(default=None, ge=ZERO)
+    reserved_fee: Optional[Decimal] = Field(default=None, ge=ZERO)
+    reserved_quantity: Optional[Decimal] = Field(default=None, gt=ZERO)
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> "Order":
@@ -68,6 +83,14 @@ class Order(BaseModel):
             raise ValueError("una orden MARKET no admite limit_price")
         if self.order_type == OrderType.LIMIT and self.limit_price is None:
             raise ValueError("una orden LIMIT requiere limit_price")
+
+        # Los campos de reserva del lado equivocado nunca tienen sentido
+        # (ver §21.2): una BUY reserva notional/fee, una SELL reserva
+        # cantidad, nunca ambos a la vez para la misma orden.
+        if self.side == OrderSide.BUY and self.reserved_quantity is not None:
+            raise ValueError("reserved_quantity no aplica a una orden BUY (ver §21.2).")
+        if self.side == OrderSide.SELL and (self.reserved_notional is not None or self.reserved_fee is not None):
+            raise ValueError("reserved_notional/reserved_fee no aplican a una orden SELL (ver §21.2).")
         return self
 
 

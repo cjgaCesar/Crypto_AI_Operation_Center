@@ -252,3 +252,117 @@ class TestInvalidConfiguration:
             id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
         )
         assert context.repository.get_cash_balance("USDT") is not None
+
+
+class TestReservationEngineInjection:
+    def test_service_uses_the_real_reservation_engine(self, tmp_path):
+        from src.paper_trading.reservation_engine import ReservationEngine
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context.service._reservation_engine is ReservationEngine
+
+
+class TestReservationSurvivesRestart:
+    """Etapa 6.7 (Paso 22): una orden PENDING con reserva debe conservarse
+    exactamente igual al reconstruir la Composition Root (simulando un
+    reinicio del proceso), sin duplicar ni perder la reserva."""
+
+    def test_buy_pending_reservation_survives_reinitialization(self, tmp_path):
+        from decimal import Decimal as D
+        from datetime import datetime as DT
+        from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
+        from src.paper_trading.models import Order
+
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        now = _now()
+        order = Order(
+            id="order-1", exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY,
+            order_type=OrderType.MARKET, quantity=D("0.1"), status=OrderStatus.NEW,
+            source=OrderSource.MANUAL, created_at=now, updated_at=now,
+        )
+        context.service.accept_market_order(
+            order=order, market_price=D("50000"), fee_rate=D("0.001"), timestamp=now,
+            max_order_value=D("100000"), max_position_value=D("100000"), rules_version="v1",
+        )
+
+        # "Reinicio": se reconstruye todo el contexto sobre la misma base.
+        restarted_context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+
+        restarted_order = restarted_context.repository.get_order("order-1")
+        assert restarted_order.status == OrderStatus.PENDING
+        assert restarted_order.reserved_notional == D("5000")
+        assert restarted_context.repository.get_cash_balance("USDT").reserved_balance == D("5005")
+        # El capital inicial no se reinicia ni se duplica.
+        assert restarted_context.repository.get_cash_balance("USDT").total_balance == D("10000")
+
+    def test_filling_after_restart_releases_correctly(self, tmp_path):
+        from decimal import Decimal as D
+        from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
+        from src.paper_trading.models import Order
+
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        now = _now()
+        order = Order(
+            id="order-1", exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY,
+            order_type=OrderType.MARKET, quantity=D("0.1"), status=OrderStatus.NEW,
+            source=OrderSource.MANUAL, created_at=now, updated_at=now,
+        )
+        context.service.accept_market_order(
+            order=order, market_price=D("50000"), fee_rate=D("0.001"), timestamp=now,
+            max_order_value=D("100000"), max_position_value=D("100000"), rules_version="v1",
+        )
+
+        restarted_context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        result = restarted_context.service.fill_pending_order(
+            order_id="order-1", execution_id="exec-1", fee_rate=D("0.001"), timestamp=_now(),
+        )
+        assert result.order.status == OrderStatus.FILLED
+        assert result.cash_balance.reserved_balance == D("0")
+
+    def test_cancelling_after_restart_releases_correctly(self, tmp_path):
+        from decimal import Decimal as D
+        from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
+        from src.paper_trading.models import Order
+
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        now = _now()
+        order = Order(
+            id="order-1", exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY,
+            order_type=OrderType.MARKET, quantity=D("0.1"), status=OrderStatus.NEW,
+            source=OrderSource.MANUAL, created_at=now, updated_at=now,
+        )
+        context.service.accept_market_order(
+            order=order, market_price=D("50000"), fee_rate=D("0.001"), timestamp=now,
+            max_order_value=D("100000"), max_position_value=D("100000"), rules_version="v1",
+        )
+
+        restarted_context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        result = restarted_context.service.cancel_pending_order(
+            order_id="order-1", cancellation_reason="reinicio", timestamp=_now(),
+        )
+        assert result.order.status == OrderStatus.CANCELLED
+        assert result.cash_balance.reserved_balance == D("0")
+        assert result.cash_balance.total_balance == D("10000")

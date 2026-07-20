@@ -416,3 +416,131 @@ class TestNoMutation:
         # con lo que ya persistió el Service (nada se recalcula encima).
         assert repository.get_order(result.order.id) == result.order
         assert repository.get_position("Binance", "BTCUSDT") == result.position
+
+
+# --- Etapa 6.7: ciclo explícito accept / fill / cancel --------------------
+
+class TestAcceptManualMarketOrder:
+    def test_accept_buy_leaves_order_pending_with_reservation(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+        assert result.success is True
+        assert result.order.status == OrderStatus.PENDING
+        assert result.order.id == "order-1"
+
+    def test_accept_sell_reserves_quantity(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        application.submit_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"))
+        result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.SELL, quantity=Decimal("0.05"),
+        )
+        assert result.success is True
+        assert result.position.reserved_quantity == Decimal("0.05")
+
+    def test_disabled_raises_before_anything(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path, config=_config(enabled=False))
+        with pytest.raises(PaperTradingDisabledError):
+            application.accept_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"))
+        assert price_provider.queried_symbols == []
+        assert id_generator.total_calls == 0
+
+    def test_risk_rejection_returns_success_false(self, tmp_path):
+        application, repository, _, _ = _app(tmp_path, config=_config(max_order_value=Decimal("1")))
+        result = application.accept_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"))
+        assert result.success is False
+        assert repository.fetch_orders() == []
+
+
+class TestFillManualPendingOrder:
+    def test_fills_pending_order_without_querying_traded_symbol_price(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+        price_provider.queried_symbols.clear()
+
+        result = application.fill_manual_pending_order(order_id=accept_result.order.id)
+
+        assert result.order.status == OrderStatus.FILLED
+        assert ("Binance", "BTCUSDT") not in price_provider.queried_symbols
+
+    def test_fill_generates_execution_id_but_no_trade_id_for_buy(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+        result = application.fill_manual_pending_order(order_id=accept_result.order.id)
+        assert result.execution is not None
+        assert result.trade is None
+
+    def test_fill_generates_trade_id_for_sell(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        application.submit_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"))
+        price_provider._prices[("Binance", "BTCUSDT")] = Decimal("54000")
+        accept_result = application.accept_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.SELL, quantity=Decimal("0.1"))
+
+        result = application.fill_manual_pending_order(order_id=accept_result.order.id)
+
+        assert result.trade is not None
+
+    def test_disabled_raises_before_anything(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"))
+
+        disabled_application, _, disabled_price_provider, disabled_id_generator = _app(tmp_path, config=_config(enabled=False))
+        with pytest.raises(PaperTradingDisabledError):
+            disabled_application.fill_manual_pending_order(order_id=accept_result.order.id)
+        assert disabled_id_generator.total_calls == 0
+
+
+class TestCancelManualPendingOrder:
+    def test_cancels_pending_order_without_querying_any_price(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+        price_provider.queried_symbols.clear()
+
+        result = application.cancel_manual_pending_order(order_id=accept_result.order.id, cancellation_reason="cambié de opinión")
+
+        assert result.order.status == OrderStatus.CANCELLED
+        assert price_provider.queried_symbols == []
+
+    def test_releases_reservation(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+        result = application.cancel_manual_pending_order(order_id=accept_result.order.id, cancellation_reason="test")
+        assert result.cash_balance.reserved_balance == Decimal("0")
+
+    def test_disabled_raises_before_anything(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"))
+
+        disabled_application, _, disabled_price_provider, _ = _app(tmp_path, config=_config(enabled=False))
+        with pytest.raises(PaperTradingDisabledError):
+            disabled_application.cancel_manual_pending_order(order_id=accept_result.order.id, cancellation_reason="test")
+        assert disabled_price_provider.queried_symbols == []
+
+
+class TestReinitializationAfterRestart:
+    def test_accept_then_new_application_instance_can_still_fill(self, tmp_path):
+        """Simula un reinicio: se construye una Application NUEVA sobre el
+        mismo repositorio y logra llenar una orden aceptada por la
+        instancia anterior."""
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+
+        from src.paper_trading.service import PaperTradingService
+        new_application = PaperTradingApplication(
+            service=PaperTradingService(repository=repository),
+            repository=repository, price_provider=FakePriceProvider({("Binance", "BTCUSDT"): Decimal("50000")}),
+            clock=FixedClock(_now()), id_generator=DeterministicIdGenerator(), config=_config(),
+        )
+        result = new_application.fill_manual_pending_order(order_id=accept_result.order.id)
+        assert result.order.status == OrderStatus.FILLED

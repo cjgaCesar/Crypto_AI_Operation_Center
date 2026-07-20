@@ -3,7 +3,8 @@ Composition Root de Paper Trading (Etapa 6.5).
 
 Única capa autorizada para construir objetos concretos de Paper
 Trading: `SQLitePaperTradingRepository`, `PaperTradingService` (con los
-4 motores reales), y `PaperTradingApplication`. El resto del proyecto
+5 motores reales, incluyendo `ReservationEngine` desde la Etapa 6.7), y
+`PaperTradingApplication`. El resto del proyecto
 (main.py) solo debe recibir el `PaperTradingContext` ya construido y
 usar `context.application`, sin conocer ninguna clase concreta.
 
@@ -25,6 +26,7 @@ from src.paper_trading.models import CashBalance
 from src.paper_trading.pnl_engine import PnLEngine
 from src.paper_trading.position_engine import PositionEngine
 from src.paper_trading.price_provider import MarketPriceProvider
+from src.paper_trading.reservation_engine import ReservationEngine
 from src.paper_trading.risk_engine import RiskEngine
 from src.paper_trading.runtime import Clock, IdGenerator
 from src.paper_trading.service import PaperTradingService
@@ -106,6 +108,7 @@ def build_paper_trading_context(
         position_engine=PositionEngine,
         pnl_engine=PnLEngine,
         risk_engine=RiskEngine,
+        reservation_engine=ReservationEngine,
     )
 
     application = PaperTradingApplication(
