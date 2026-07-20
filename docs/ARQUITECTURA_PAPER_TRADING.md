@@ -1,16 +1,59 @@
 # Arquitectura de Paper Trading (Etapa 6.0 — diseño; implementación en curso desde 6.1)
 
-> **Este documento sigue siendo la referencia de diseño.** El servicio,
-> `config.yaml` y el Dashboard descritos aquí **todavía no existen** en
-> el código (llegan en la Etapa 6.4 en adelante). Lo que **sí existe
-> ya**, implementado y con pruebas, es el dominio (`src/paper_trading/
+> **Este documento sigue siendo la referencia de diseño.** `config.yaml`,
+> `main.py` y el Dashboard descritos aquí **todavía no existen** en el
+> código (llegan en la Etapa 6.5 en adelante). Lo que **sí existe ya**,
+> implementado y con pruebas, es el dominio (`src/paper_trading/
 > models.py`, `enums.py`, `validators.py`, `exceptions.py`, Etapa 6.1),
 > los motores puros (`fill_engine.py`, `position_engine.py`,
-> `pnl_engine.py`, `risk_engine.py`, Etapa 6.2) y la persistencia
-> SQLite (`base.py`, `sqlite_repository.py`, `postgres_repository.py`,
-> `serialization.py`, Etapa 6.3) — ver las notas de implementación
-> justo debajo. No hay compra ni venta real (con dinero real) en
-> ninguna etapa de Paper Trading.
+> `pnl_engine.py`, `risk_engine.py`, Etapa 6.2), la persistencia SQLite
+> (`base.py`, `sqlite_repository.py`, `postgres_repository.py`,
+> `serialization.py`, Etapa 6.3) y la capa de servicio
+> (`service.py`/`PaperTradingService`, `service_results.py`, Etapa 6.4)
+> — ver las notas de implementación justo debajo. No hay compra ni
+> venta real (con dinero real) en ninguna etapa de Paper Trading.
+
+> **Nota de implementación (Etapa 6.4 — servicio)**: `PaperTradingService`
+> (`src/paper_trading/service.py`) es, desde esta etapa, **la única capa
+> autorizada para ejecutar una orden de Paper Trading de punta a
+> punta**: `submit_market_order()` obtiene `Position`/`CashBalance` del
+> repositorio, invoca `RiskEngine.validate_order()`, `FillEngine.
+> execute_market_order()`, `PositionEngine.apply_execution()`,
+> `PnLEngine.build_portfolio_snapshot()`/`build_pnl_snapshot()`, y
+> persiste el resultado completo con un único
+> `PaperTradingRepository.save_fill_transaction()` — nunca abre una
+> conexión SQLite directamente ni recalcula ninguna regla que ya viva en
+> un motor. Precisiones sobre el flujo implementado, distintas del
+> ciclo de vida completo descrito en §4/§9 (`NEW→PENDING` con reserva de
+> capital/cantidad, luego `PENDING→FILLED` en un paso separado):
+> - **Una sola llamada, sin reserva.** `submit_market_order()` valida y
+>   llena en la misma invocación: la orden pasa por `PENDING`
+>   únicamente en memoria (para satisfacer la precondición de
+>   `FillEngine`), sin persistirse como estado intermedio, y sin tocar
+>   `CashBalance.reserved_balance`/`Position.reserved_quantity` (quedan
+>   en 0, igual que en 6.2/6.3). El ciclo de reserva-al-aceptar/
+>   libera-al-llenar de §9 queda para una iteración futura que separe
+>   "aceptar" de "llenar" en dos llamadas.
+> - **Actualización de `CashBalance` en el servicio, no en el motor ni
+>   en el repositorio**: `total_balance -= (cantidad×precio) + fee` en
+>   BUY, `total_balance += (cantidad×precio) - fee` en SELL — la única
+>   lógica de este tipo que vive fuera de un motor, porque ningún motor
+>   de 6.2 conoce `CashBalance` (`PositionEngine` es explícito en no
+>   conocerlo, ver position_engine.py).
+> - **Snapshot de cartera con precios explícitos.** `current_prices` es
+>   un parámetro opcional para cuando la cuenta tiene posiciones abiertas
+>   en otros símbolos además del operado; si falta el precio de alguna,
+>   `PnLEngine` falla explícitamente (nunca inventa un precio).
+> - **Requiere `CashBalance` ya sembrado.** Si no existe una fila para la
+>   moneda pedida, el servicio lanza `ValueError` en vez de inventar un
+>   saldo inicial — sembrar `initial_capital` (§9.2) sigue siendo
+>   responsabilidad de una futura Composition Root (`config.yaml`/
+>   `main.py`, Etapa 6.5+), no de este servicio.
+> - **Rechazos de riesgo son resultados, no excepciones**:
+>   `SubmitOrderResult(success=False, risk_result=...)`, sin persistir
+>   nada. Cualquier excepción (`OverFillError`, `InvalidOrderTransitionError`,
+>   `PaperTradingDomainError`, `ValueError`, `sqlite3.IntegrityError`)
+>   se propaga sin ocultarse.
 
 > **Nota de implementación (Etapa 6.3 — persistencia)**: las 7 tablas
 > (`paper_trading_orders`, `_executions`, `_trades`, `_positions`,
