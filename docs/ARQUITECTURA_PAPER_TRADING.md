@@ -2211,19 +2211,24 @@ salida del comparador sean deterministas).
 
 `compare_reports(previous_report, current_report)` (puro,
 `inspection_comparator.py`) indexa ambos reportes por `IssueIdentity` y
-clasifica cada identidad en exactamente una categoría:
+clasifica cada identidad:
 
 - Solo en `current` -> `new_issues`.
 - Solo en `previous` -> `resolved_issues`.
 - En ambos -> pertenece a `persistent_issues` (el superconjunto) y,
-  además, a **una** de estas cuatro subcategorías mutuamente excluyentes
-  (se evalúan en este orden):
+  además, a **todas** las subcategorías que apliquen -- no son
+  mutuamente excluyentes desde la corrección de la Etapa 6.9 (ver
+  §23.19): un mismo issue puede caer en `severity_increased` **y**
+  `value_changed` a la vez si ambas cosas cambiaron en la misma corrida.
   1. `severity_increased` si el ordinal de severidad subió
      (`INFO(0) < WARNING(1) < ERROR(2) < CRITICAL(3)`).
-  2. `severity_decreased` si bajó.
+  2. `severity_decreased` si bajó (mutuamente excluyente solo entre sí
+     y `severity_increased` -- la severidad no puede subir y bajar a la
+     vez).
   3. `value_changed` si `expected_value`, `actual_value` o `repairable`
-     cambiaron (severidad igual).
-  4. `unchanged` en cualquier otro caso.
+     cambiaron, **independientemente** de si también hubo cambio de
+     severidad.
+  4. `unchanged` únicamente si no aplicó ninguna de las anteriores.
 
 `previous_report=None` (primera inspección de la cuenta, nunca hubo una
 corrida exitosa antes) se trata como "reporte anterior vacío": todos los
@@ -2462,3 +2467,34 @@ corrige.
   Etapa 6.8 -- no rompe ningún consumidor existente que construya estas
   clases directamente (solo `composition.py` las instancia en el
   proyecto real).
+
+### 23.19 Corrección post-aprobación: clasificación acumulativa, no excluyente
+
+Detectado en auditoría tras el cierre inicial de la etapa: la
+implementación original de `compare_reports()` usaba una cadena
+`if severity_increased / elif severity_decreased / elif value_changed /
+else unchanged`, que es **excluyente** -- un issue que cambiaba de
+severidad Y de valor a la vez (ej. `WARNING`+`actual_value=100` ->
+`CRITICAL`+`actual_value=200`) solo quedaba clasificado como
+`severity_increased`, perdiendo silenciosamente la señal de
+`value_changed`. Esto no correspondía al diseño aprobado (§23.5 nunca
+exigió exclusión entre severidad y valor, solo la exclusión obvia entre
+"subió" y "bajó").
+
+**Corrección**: se reemplazó la cadena por dos bloques independientes
+-- uno que evalúa severidad (`if aumentó / elif disminuyó`, mutuamente
+excluyentes entre sí, ya que no puede subir y bajar en la misma
+comparación) y otro, siempre evaluado por separado, que evalúa
+`expected_value`/`actual_value`/`repairable`. Un issue puede así caer en
+`severity_increased` **y** `value_changed` simultáneamente. `unchanged`
+solo se puebla si ninguno de los dos bloques disparó. Cambio acotado
+exclusivamente a `inspection_comparator.py`: `IssueIdentity`,
+deduplicación, `AlertBuilder`, `InspectionService`, repositorio,
+scheduler y Dashboard quedan exactamente igual -- `AlertBuilder` ya
+iteraba cada subcategoría de `InspectionComparison` de forma
+independiente (Paso 11 original), así que generar dos alertas
+(`SEVERITY_INCREASED` + `VALUE_CHANGED`) para el mismo `IssueIdentity`,
+con `deduplication_key` distintas, no requirió ningún cambio de código
+en `alert_builder.py` ni en `InspectionService.run_inspection()` (que ya
+calculaba el total de IDs necesarias sumando el tamaño de cada
+subcategoría, sin asumir exclusión).

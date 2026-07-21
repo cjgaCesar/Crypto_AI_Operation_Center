@@ -68,6 +68,29 @@ class TestSeverityChangedAlerts:
         assert alerts[0].alert_type == AlertType.SEVERITY_DECREASED
 
 
+class TestSimultaneousSeverityAndValueChange:
+    """Caso 5 (corrección Etapa 6.9, §23.19): cuando severidad Y valor
+    cambian a la vez, el comparador produce ambas categorías y el builder
+    debe generar dos alertas distintas para el mismo IssueIdentity."""
+
+    def test_builds_two_distinct_alerts_for_same_identity(self):
+        previous = _issue(severity=IssueSeverity.WARNING, actual_value=Decimal("100"))
+        current = _issue(severity=IssueSeverity.CRITICAL, actual_value=Decimal("200"))
+        comparison = compare_reports(_report(previous), _report(current))
+        alerts = build_alerts(comparison, run_id="run-1", timestamp=_now(), alert_ids=["a1", "a2"])
+
+        assert len(alerts) == 2
+        alert_types = {alert.alert_type for alert in alerts}
+        assert alert_types == {AlertType.SEVERITY_INCREASED, AlertType.VALUE_CHANGED}
+
+        # Distinta deduplication_key.
+        assert alerts[0].deduplication_key != alerts[1].deduplication_key
+
+        # Mismo IssueIdentity para ambas.
+        identities = {alert.issue_identity for alert in alerts}
+        assert len(identities) == 1
+
+
 class TestValueChangedAlert:
     def test_builds_value_changed_alert(self):
         previous = _issue(actual_value=Decimal("100"))

@@ -87,7 +87,10 @@ class TestSeverityChanges:
         assert comparison.severity_decreased[0].previous == previous
         assert comparison.severity_decreased[0].current == current
 
-    def test_severity_change_excludes_from_value_changed_and_unchanged(self):
+    def test_severity_change_alone_does_not_also_appear_in_value_changed_or_unchanged(self):
+        """Cuando SOLO cambia la severidad (expected/actual/repairable
+        iguales), el issue no aparece en value_changed ni en unchanged --
+        distinto del caso de cambio simultáneo (ver TestSimultaneousChanges)."""
         previous = _issue(severity=IssueSeverity.WARNING)
         current = _issue(severity=IssueSeverity.CRITICAL)
         comparison = compare_reports(_report(previous), _report(current))
@@ -140,6 +143,62 @@ class TestNoAlertOnTextOnlyChanges:
         comparison = compare_reports(_report(previous), _report(current))
         assert comparison.unchanged == (current,)
         assert comparison.value_changed == ()
+
+
+class TestSimultaneousChanges:
+    """Corrección Etapa 6.9 (auditoría post-aprobación, §23.19): un mismo
+    issue puede caer en severity_increased/decreased Y en value_changed a
+    la vez -- ya no son mutuamente excluyentes."""
+
+    def test_case_1_severity_increased_and_value_changed_both_fire(self):
+        previous = _issue(severity=IssueSeverity.WARNING, actual_value=Decimal("100"))
+        current = _issue(severity=IssueSeverity.CRITICAL, actual_value=Decimal("200"))
+        comparison = compare_reports(_report(previous), _report(current))
+        assert len(comparison.severity_increased) == 1
+        assert len(comparison.value_changed) == 1
+        assert len(comparison.unchanged) == 0
+        assert comparison.severity_increased[0].current == current
+        assert comparison.value_changed[0].current == current
+
+    def test_case_2_same_severity_only_value_changed_fires(self):
+        previous = _issue(severity=IssueSeverity.ERROR, actual_value=Decimal("100"))
+        current = _issue(severity=IssueSeverity.ERROR, actual_value=Decimal("200"))
+        comparison = compare_reports(_report(previous), _report(current))
+        assert comparison.severity_increased == ()
+        assert comparison.severity_decreased == ()
+        assert len(comparison.value_changed) == 1
+        assert comparison.unchanged == ()
+
+    def test_case_3_severity_increased_without_value_change_only_severity_fires(self):
+        previous = _issue(severity=IssueSeverity.ERROR, actual_value=Decimal("100"))
+        current = _issue(severity=IssueSeverity.CRITICAL, actual_value=Decimal("100"))
+        comparison = compare_reports(_report(previous), _report(current))
+        assert len(comparison.severity_increased) == 1
+        assert comparison.value_changed == ()
+        assert comparison.unchanged == ()
+
+    def test_case_4_no_changes_remains_unchanged(self):
+        issue = _issue(severity=IssueSeverity.ERROR, actual_value=Decimal("100"))
+        comparison = compare_reports(_report(issue), _report(issue))
+        assert comparison.severity_increased == ()
+        assert comparison.severity_decreased == ()
+        assert comparison.value_changed == ()
+        assert comparison.unchanged == (issue,)
+
+    def test_severity_decreased_and_value_changed_both_fire(self):
+        previous = _issue(severity=IssueSeverity.CRITICAL, actual_value=Decimal("200"))
+        current = _issue(severity=IssueSeverity.WARNING, actual_value=Decimal("100"))
+        comparison = compare_reports(_report(previous), _report(current))
+        assert len(comparison.severity_decreased) == 1
+        assert len(comparison.value_changed) == 1
+        assert comparison.unchanged == ()
+
+    def test_repairable_change_combined_with_severity_increase(self):
+        previous = _issue(severity=IssueSeverity.WARNING, repairable=True)
+        current = _issue(severity=IssueSeverity.CRITICAL, repairable=False)
+        comparison = compare_reports(_report(previous), _report(current))
+        assert len(comparison.severity_increased) == 1
+        assert len(comparison.value_changed) == 1
 
 
 class TestDeterminismAndPurity:

@@ -60,19 +60,30 @@ def compare_reports(
         previous_rank = _severity_rank(previous_issue.severity)
         current_rank = _severity_rank(current_issue.severity)
 
-        changed = ChangedIssue(identity=identity, previous=previous_issue, current=current_issue)
+        changed_issue = ChangedIssue(identity=identity, previous=previous_issue, current=current_issue)
+        is_changed = False
 
+        # Acumulativo, no excluyente (corrección Etapa 6.9): un mismo issue
+        # puede caer en severity_increased/decreased Y en value_changed a
+        # la vez si ambas cosas cambiaron simultáneamente -- antes, la
+        # cadena if/elif descartaba silenciosamente el cambio de valores
+        # en cuanto detectaba un cambio de severidad.
         if current_rank > previous_rank:
-            severity_increased.append(changed)
+            severity_increased.append(changed_issue)
+            is_changed = True
         elif current_rank < previous_rank:
-            severity_decreased.append(changed)
-        elif (
+            severity_decreased.append(changed_issue)
+            is_changed = True
+
+        if (
             current_issue.expected_value != previous_issue.expected_value
             or current_issue.actual_value != previous_issue.actual_value
             or current_issue.repairable != previous_issue.repairable
         ):
-            value_changed.append(changed)
-        else:
+            value_changed.append(changed_issue)
+            is_changed = True
+
+        if not is_changed:
             unchanged.append(current_issue)
 
     return InspectionComparison(
