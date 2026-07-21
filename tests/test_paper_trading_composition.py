@@ -45,6 +45,15 @@ class DeterministicIdGenerator:
     def new_trade_id(self) -> str:
         return self._next("trade")
 
+    def new_reconciliation_audit_id(self) -> str:
+        return self._next("audit")
+
+    def new_inspection_run_id(self) -> str:
+        return self._next("run")
+
+    def new_inspection_alert_id(self) -> str:
+        return self._next("alert")
+
 
 class FakePriceProvider:
     """No se usa en las pruebas de composición: ningún caso construye una
@@ -439,3 +448,92 @@ class TestBuildDoesNotRunReconciliation:
         )
         assert restarted_context.repository.get_cash_balance("USDT").reserved_balance == D("999")
         assert restarted_context.repository.get_cash_balance("USDT").total_balance == D("10000")
+
+
+class TestInspectionServicesInjection:
+    def test_context_exposes_inspection_services(self, tmp_path):
+        from src.paper_trading.alert_delivery_service import AlertDeliveryService
+        from src.paper_trading.inspection_job import InspectionJob
+        from src.paper_trading.inspection_service import InspectionService
+
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert isinstance(context.inspection_service, InspectionService)
+        assert isinstance(context.alert_delivery_service, AlertDeliveryService)
+        assert isinstance(context.inspection_job, InspectionJob)
+
+    def test_application_exposes_inspection_use_cases(self, tmp_path):
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert hasattr(context.application, "run_reconciliation_inspection")
+        assert hasattr(context.application, "deliver_pending_reconciliation_alerts")
+        assert hasattr(context.application, "fetch_reconciliation_inspection_history")
+
+
+class TestBuildDoesNotRunInspection:
+    """Paso 24 (extendido a la Etapa 6.9): build_paper_trading_context()
+    nunca ejecuta inspect()/repair()/run_once()/entrega alguna."""
+
+    def test_build_does_not_call_run_once_inspect_or_deliver(self, tmp_path, monkeypatch):
+        from src.paper_trading import alert_delivery_service as alert_delivery_module
+        from src.paper_trading import inspection_job as inspection_job_module
+        from src.paper_trading import inspection_service as inspection_service_module
+
+        calls = []
+        monkeypatch.setattr(
+            inspection_job_module.InspectionJob, "run_once", lambda self: calls.append("run_once"),
+        )
+        monkeypatch.setattr(
+            inspection_service_module.InspectionService, "run_inspection",
+            lambda self, *a, **k: calls.append("run_inspection"),
+        )
+        monkeypatch.setattr(
+            alert_delivery_module.AlertDeliveryService, "deliver_pending_alerts",
+            lambda self, *a, **k: calls.append("deliver_pending_alerts"),
+        )
+
+        build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert calls == []
+
+    def test_disabled_reconciliation_inspection_config_has_no_effect_on_build(self, tmp_path):
+        from src.utils.config import ReconciliationInspectionConfig
+
+        config = _config(tmp_path, reconciliation_inspection=ReconciliationInspectionConfig(enabled=False))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context.repository.fetch_inspection_runs(limit=None) == []
+
+
+class TestInspectionSurvivesRestart:
+    def test_restart_preserves_inspection_history(self, tmp_path):
+        from decimal import Decimal as D
+
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        run = context.application.run_reconciliation_inspection()
+
+        restarted_context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        history = restarted_context.application.fetch_reconciliation_inspection_history()
+        assert [r.id for r in history] == [run.id]
+        # El capital inicial sigue siendo idempotente tras el reinicio.
+        assert restarted_context.repository.get_cash_balance("USDT").total_balance == D("10000")
+
+    def test_dashboard_module_is_never_imported_by_composition(self):
+        import src.paper_trading.composition as module
+        source = open(module.__file__, encoding="utf-8").read()
+        assert "dashboard" not in source.lower()

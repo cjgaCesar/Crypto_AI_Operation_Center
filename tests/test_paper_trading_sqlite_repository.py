@@ -16,9 +16,13 @@ from decimal import Decimal
 
 import pytest
 
+from src.paper_trading.alert_models import AlertStatus, AlertType, InspectionAlert, build_deduplication_key
 from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType, PositionSide, TradeSide
+from src.paper_trading.inspection_models import IssueIdentity, ScheduledInspectionRun, build_issue_identity
 from src.paper_trading.models import CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade
-from src.paper_trading.reconciliation_models import ReconciliationAuditRecord
+from src.paper_trading.reconciliation_models import (
+    IssueCode, IssueSeverity, ReconciliationAuditRecord, ReconciliationIssue, ReconciliationReport,
+)
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 
 
@@ -116,6 +120,41 @@ def _audit_record(**overrides) -> ReconciliationAuditRecord:
     )
     defaults.update(overrides)
     return ReconciliationAuditRecord(**defaults)
+
+
+def _reconciliation_issue(**overrides) -> ReconciliationIssue:
+    defaults = dict(
+        code=IssueCode.ORPHAN_CASH_RESERVATION, severity=IssueSeverity.ERROR, entity_type="CashBalance",
+        entity_id="USDT", exchange=None, symbol=None, description="x", expected_value=Decimal("0"),
+        actual_value=Decimal("100"), repairable=True, suggested_action="y", detected_at=_now(),
+    )
+    defaults.update(overrides)
+    return ReconciliationIssue(**defaults)
+
+
+def _inspection_run(**overrides) -> ScheduledInspectionRun:
+    now = _now()
+    report = ReconciliationReport(generated_at=now, issues=(_reconciliation_issue(),))
+    defaults = dict(
+        id="run-1", started_at=now, completed_at=now, success=True, report=report, previous_run_id=None,
+        new_issue_count=1, resolved_issue_count=0, persistent_issue_count=0, changed_issue_count=0, alert_count=1,
+    )
+    defaults.update(overrides)
+    return ScheduledInspectionRun(**defaults)
+
+
+def _inspection_alert(**overrides) -> InspectionAlert:
+    identity = IssueIdentity(
+        code="ORPHAN_CASH_RESERVATION", entity_type="CashBalance", entity_id="USDT", exchange=None, symbol=None,
+    )
+    defaults = dict(
+        id="alert-1", run_id="run-1", alert_type=AlertType.NEW_ISSUE, issue_identity=identity,
+        issue_code="ORPHAN_CASH_RESERVATION", severity=IssueSeverity.ERROR, title="t", message="m",
+        deduplication_key=build_deduplication_key(AlertType.NEW_ISSUE, issue_identity=identity, severity=IssueSeverity.ERROR),
+        status=AlertStatus.PENDING, delivery_attempts=0, last_error=None, created_at=_now(),
+    )
+    defaults.update(overrides)
+    return InspectionAlert(**defaults)
 
 
 # --- INIT --------------------------------------------------------------------
@@ -1067,6 +1106,190 @@ class TestReconciliationAuditMigration:
         repo.init()
         repo.save_reconciliation_audit_record(_audit_record())
         assert repo.fetch_cash_balances() == []  # tabla nueva, sin datos previos
+
+
+# --- INSPECCIÓN AUTOMATIZADA (Etapa 6.9) -----------------------------------
+
+class TestInspectionRunMigration:
+    def test_init_creates_inspection_tables_idempotently(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.init()
+        repo.init()
+        repo.save_inspection_run_transaction(_inspection_run(), [])
+        assert repo.get_latest_inspection_run().id == "run-1"
+
+    def test_indexes_exist(self, tmp_path):
+        repo = _repo(tmp_path)
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        try:
+            index_names = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name IN ('paper_trading_inspection_runs', 'paper_trading_inspection_alerts')"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        assert "idx_paper_trading_inspection_runs_started_at" in index_names
+        assert "idx_paper_trading_inspection_alerts_run_id" in index_names
+        assert "idx_paper_trading_inspection_alerts_created_at" in index_names
+        assert "idx_paper_trading_inspection_alerts_status" in index_names
+
+    def test_foreign_key_run_id_enforced(self, tmp_path):
+        repo = _repo(tmp_path)
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO paper_trading_inspection_alerts "
+                    "(id, run_id, alert_type, issue_key, issue_code, severity, title, message, "
+                    "deduplication_key, status, delivery_attempts, last_error, created_at, delivered_at) "
+                    "VALUES ('a1', 'nonexistent-run', 'NEW_ISSUE', NULL, NULL, NULL, 't', 'm', "
+                    "'k1', 'PENDING', 0, NULL, ?, NULL)",
+                    (_now().isoformat(),),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+
+class TestSaveInspectionRunTransaction:
+    def test_persists_run_and_alerts_atomically(self, tmp_path):
+        repo = _repo(tmp_path)
+        run = _inspection_run()
+        alert = _inspection_alert()
+        repo.save_inspection_run_transaction(run, [alert])
+
+        fetched_run = repo.get_latest_inspection_run()
+        assert fetched_run.id == "run-1"
+        assert fetched_run.report.issues[0].code == IssueCode.ORPHAN_CASH_RESERVATION
+
+        fetched_alert = repo.get_inspection_alert_by_deduplication_key(alert.deduplication_key)
+        assert fetched_alert.id == "alert-1"
+
+    def test_rollback_on_duplicate_deduplication_key(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert1 = _inspection_alert()
+        repo.save_inspection_run_transaction(_inspection_run(), [alert1])
+
+        run2 = _inspection_run(id="run-2")
+        alert2 = _inspection_alert(id="alert-2", run_id="run-2", deduplication_key=alert1.deduplication_key)
+        with pytest.raises(sqlite3.IntegrityError):
+            repo.save_inspection_run_transaction(run2, [alert2])
+
+        assert repo.get_latest_inspection_run().id == "run-1"  # run-2 no se persistió (rollback)
+
+    def test_unique_deduplication_key_constraint(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _inspection_alert()
+        repo.save_inspection_run_transaction(_inspection_run(), [alert])
+        run2 = _inspection_run(id="run-2")
+        with pytest.raises(sqlite3.IntegrityError):
+            repo.save_inspection_run_transaction(
+                run2, [_inspection_alert(id="alert-2", run_id="run-2", deduplication_key=alert.deduplication_key)],
+            )
+
+    def test_failed_run_with_null_report_json(self, tmp_path):
+        repo = _repo(tmp_path)
+        failed_run = _inspection_run(id="run-fail", success=False, report=None, error_message="boom")
+        repo.save_inspection_run_transaction(failed_run, [])
+        fetched = repo.get_latest_inspection_run()
+        assert fetched.success is False
+        assert fetched.report is None
+        assert fetched.error_message == "boom"
+
+
+class TestGetLatestInspectionRuns:
+    def test_get_latest_successful_run(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_inspection_run_transaction(_inspection_run(id="run-1"), [])
+        repo.save_inspection_run_transaction(_inspection_run(id="run-fail", success=False, report=None), [])
+        latest_successful = repo.get_latest_successful_inspection_run()
+        assert latest_successful.id == "run-1"
+
+    def test_get_latest_run_regardless_of_success(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_inspection_run_transaction(_inspection_run(id="run-1"), [])
+        repo.save_inspection_run_transaction(_inspection_run(id="run-fail", success=False, report=None), [])
+        latest = repo.get_latest_inspection_run()
+        assert latest.id == "run-fail"
+
+    def test_returns_none_when_empty(self, tmp_path):
+        repo = _repo(tmp_path)
+        assert repo.get_latest_successful_inspection_run() is None
+        assert repo.get_latest_inspection_run() is None
+
+    def test_history_limit(self, tmp_path):
+        repo = _repo(tmp_path)
+        for i in range(3):
+            repo.save_inspection_run_transaction(_inspection_run(id=f"run-{i}"), [])
+        assert len(repo.fetch_inspection_runs(limit=2)) == 2
+        assert len(repo.fetch_inspection_runs(limit=None)) == 3
+
+
+class TestInspectionAlertDelivery:
+    def test_fetch_pending_alerts(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _inspection_alert()
+        repo.save_inspection_run_transaction(_inspection_run(), [alert])
+        pending = repo.fetch_pending_inspection_alerts()
+        assert [a.id for a in pending] == ["alert-1"]
+
+    def test_transition_to_delivered(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _inspection_alert()
+        repo.save_inspection_run_transaction(_inspection_run(), [alert])
+        now = _now()
+        repo.update_inspection_alert_delivery(
+            alert_id="alert-1", status=AlertStatus.DELIVERED, delivery_attempts=1, last_error=None, delivered_at=now,
+        )
+        fetched = repo.get_inspection_alert_by_deduplication_key(alert.deduplication_key)
+        assert fetched.status == AlertStatus.DELIVERED
+        assert fetched.delivery_attempts == 1
+        assert fetched.delivered_at is not None
+        assert repo.fetch_pending_inspection_alerts() == []
+
+    def test_transition_to_failed_with_error(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _inspection_alert()
+        repo.save_inspection_run_transaction(_inspection_run(), [alert])
+        repo.update_inspection_alert_delivery(
+            alert_id="alert-1", status=AlertStatus.FAILED, delivery_attempts=3, last_error="boom", delivered_at=None,
+        )
+        fetched = repo.get_inspection_alert_by_deduplication_key(alert.deduplication_key)
+        assert fetched.status == AlertStatus.FAILED
+        assert fetched.last_error == "boom"
+        assert fetched.delivery_attempts == 3
+
+    def test_get_by_deduplication_key_returns_none_if_missing(self, tmp_path):
+        repo = _repo(tmp_path)
+        assert repo.get_inspection_alert_by_deduplication_key("nonexistent") is None
+
+
+class TestInspectionPersistenceAcrossRestart:
+    def test_runs_and_alerts_survive_reinitialization(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _inspection_alert()
+        repo.save_inspection_run_transaction(_inspection_run(), [alert])
+        repo.update_inspection_alert_delivery(
+            alert_id="alert-1", status=AlertStatus.DELIVERED, delivery_attempts=1, last_error=None, delivered_at=_now(),
+        )
+
+        restarted_repo = SQLitePaperTradingRepository(str(tmp_path / "test.db"))
+        restarted_repo.init()
+        run = restarted_repo.get_latest_inspection_run()
+        assert run.id == "run-1"
+        fetched_alert = restarted_repo.get_inspection_alert_by_deduplication_key(alert.deduplication_key)
+        assert fetched_alert.status == AlertStatus.DELIVERED
+
+    def test_does_not_change_operational_tables(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance())
+        repo.save_order(_order())
+        repo.save_inspection_run_transaction(_inspection_run(), [_inspection_alert()])
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("0")
+        assert repo.get_order("order-1") is not None
 
 
 # --- AISLAMIENTO ----------------------------------------------------------

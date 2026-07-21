@@ -364,3 +364,131 @@ def test_weights_dont_need_to_sum_to_100(tmp_path):
 
     settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
     assert settings.signals.weights.trend == 3
+
+
+# --- reconciliation_inspection (Etapa 6.9) ---------------------------------
+
+
+def test_reconciliation_inspection_defaults_when_block_missing(tmp_path):
+    """Config antigua (sin el bloque, Etapa 6.8 y anteriores) sigue
+    cargando, con los defaults seguros documentados en §23.13."""
+    config = _valid_yaml()
+    assert "reconciliation_inspection" not in config["paper_trading"]
+    config_path = _write_yaml(tmp_path, config)
+
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    ri = settings.paper_trading.reconciliation_inspection
+    assert ri.enabled is False
+    assert ri.interval_minutes == 60
+    assert ri.run_on_startup is False
+    assert ri.deliver_alerts is True
+    assert ri.max_alert_delivery_attempts == 3
+    assert ri.history_limit == 100
+    assert ri.pending_alert_batch_size == 100
+
+
+def test_reconciliation_inspection_enabled_false_explicit(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"enabled": False}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    assert settings.paper_trading.reconciliation_inspection.enabled is False
+
+
+def test_reconciliation_inspection_run_on_startup_false_by_default(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"enabled": True}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    assert settings.paper_trading.reconciliation_inspection.run_on_startup is False
+
+
+def test_reconciliation_inspection_valid_interval_accepted(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"interval_minutes": 15}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    assert settings.paper_trading.reconciliation_inspection.interval_minutes == 15
+
+
+def test_reconciliation_inspection_interval_zero_rejected(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"interval_minutes": 0}
+    config_path = _write_yaml(tmp_path, config)
+    with pytest.raises(ValueError):
+        load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+
+def test_reconciliation_inspection_valid_attempts_accepted(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"max_alert_delivery_attempts": 5}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    assert settings.paper_trading.reconciliation_inspection.max_alert_delivery_attempts == 5
+
+
+def test_reconciliation_inspection_attempts_zero_rejected(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"max_alert_delivery_attempts": 0}
+    config_path = _write_yaml(tmp_path, config)
+    with pytest.raises(ValueError):
+        load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+
+def test_reconciliation_inspection_history_limit_validated(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"history_limit": 0}
+    config_path = _write_yaml(tmp_path, config)
+    with pytest.raises(ValueError):
+        load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+
+def test_reconciliation_inspection_batch_size_validated(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {"pending_alert_batch_size": 0}
+    config_path = _write_yaml(tmp_path, config)
+    with pytest.raises(ValueError):
+        load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+
+def test_reconciliation_inspection_full_block_accepted(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["reconciliation_inspection"] = {
+        "enabled": True, "interval_minutes": 30, "run_on_startup": True, "deliver_alerts": False,
+        "max_alert_delivery_attempts": 5, "history_limit": 50, "pending_alert_batch_size": 20,
+    }
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    ri = settings.paper_trading.reconciliation_inspection
+    assert ri.enabled is True
+    assert ri.interval_minutes == 30
+    assert ri.run_on_startup is True
+    assert ri.deliver_alerts is False
+    assert ri.max_alert_delivery_attempts == 5
+    assert ri.history_limit == 50
+    assert ri.pending_alert_batch_size == 20
+
+
+def test_paper_trading_enabled_false_does_not_block_manual_inspection_semantics(tmp_path):
+    """paper_trading.enabled y reconciliation_inspection.enabled son gates
+    independientes (§23.13): confirmamos que ambos se cargan sin
+    interferirse entre sí."""
+    config = _valid_yaml()
+    config["paper_trading"]["enabled"] = False
+    config["paper_trading"]["reconciliation_inspection"] = {"enabled": False}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    assert settings.paper_trading.enabled is False
+    assert settings.paper_trading.reconciliation_inspection.enabled is False
+
+
+def test_scheduler_gate_is_independent_field(tmp_path):
+    """El scheduler se gatea únicamente por reconciliation_inspection.enabled,
+    no por paper_trading.enabled -- ambos pueden variar independientemente."""
+    config = _valid_yaml()
+    config["paper_trading"]["enabled"] = True
+    config["paper_trading"]["reconciliation_inspection"] = {"enabled": False}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    assert settings.paper_trading.enabled is True
+    assert settings.paper_trading.reconciliation_inspection.enabled is False

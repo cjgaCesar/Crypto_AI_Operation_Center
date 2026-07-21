@@ -22,7 +22,7 @@ desde config.yaml sin tocar código.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
@@ -272,6 +272,28 @@ class AIEngineSettings:
 
 
 @dataclass(frozen=True)
+class ReconciliationInspectionConfig:
+    """Configuración de la automatización de inspecciones de
+    reconciliación (Etapa 6.9, ver docs/ARQUITECTURA_PAPER_TRADING.md §23.13).
+
+    Bloque **opcional** dentro de `paper_trading` en config.yaml: si no
+    existe, se usan estos mismos valores por defecto (todos seguros: el
+    scheduler queda deshabilitado). `enabled` aquí es un gate
+    *independiente* de `paper_trading.enabled` -- controla únicamente si
+    `inspection_scheduler.py` arranca su loop periódico, nunca si la
+    inspección/reparación manual puede invocarse (§23.13).
+    """
+
+    enabled: bool = False
+    interval_minutes: int = 60
+    run_on_startup: bool = False
+    deliver_alerts: bool = True
+    max_alert_delivery_attempts: int = 3
+    history_limit: int = 100
+    pending_alert_batch_size: int = 100
+
+
+@dataclass(frozen=True)
 class PaperTradingConfig:
     """Configuración de Paper Trading (Etapa 6.5).
 
@@ -300,6 +322,9 @@ class PaperTradingConfig:
     max_order_value: Decimal
     max_position_value: Decimal
     rules_version: str
+    reconciliation_inspection: ReconciliationInspectionConfig = field(
+        default_factory=ReconciliationInspectionConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -532,6 +557,68 @@ def _validate_paper_trading_config(pt_cfg: dict) -> None:
             "'paper_trading.max_position_value' debe ser mayor o igual a 'paper_trading.max_order_value'."
         )
 
+    if "reconciliation_inspection" in pt_cfg:
+        _validate_reconciliation_inspection_config(pt_cfg["reconciliation_inspection"])
+
+
+def _validate_reconciliation_inspection_config(ri_cfg: dict) -> None:
+    """Bloque opcional (Etapa 6.9, §23.13): cada campo es opcional
+    individualmente (usa el default si falta), pero si está presente debe
+    tener el tipo/rango correcto -- así una config.yaml de una etapa
+    anterior (sin este bloque) sigue cargando sin cambios."""
+    if "enabled" in ri_cfg and not isinstance(ri_cfg["enabled"], bool):
+        raise ValueError("'paper_trading.reconciliation_inspection.enabled' debe ser verdadero o falso.")
+
+    if "interval_minutes" in ri_cfg:
+        value = ri_cfg["interval_minutes"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                "'paper_trading.reconciliation_inspection.interval_minutes' debe ser un entero >= 1."
+            )
+
+    if "run_on_startup" in ri_cfg and not isinstance(ri_cfg["run_on_startup"], bool):
+        raise ValueError("'paper_trading.reconciliation_inspection.run_on_startup' debe ser verdadero o falso.")
+
+    if "deliver_alerts" in ri_cfg and not isinstance(ri_cfg["deliver_alerts"], bool):
+        raise ValueError("'paper_trading.reconciliation_inspection.deliver_alerts' debe ser verdadero o falso.")
+
+    if "max_alert_delivery_attempts" in ri_cfg:
+        value = ri_cfg["max_alert_delivery_attempts"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                "'paper_trading.reconciliation_inspection.max_alert_delivery_attempts' debe ser un entero >= 1."
+            )
+
+    if "history_limit" in ri_cfg:
+        value = ri_cfg["history_limit"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("'paper_trading.reconciliation_inspection.history_limit' debe ser un entero >= 1.")
+
+    if "pending_alert_batch_size" in ri_cfg:
+        value = ri_cfg["pending_alert_batch_size"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                "'paper_trading.reconciliation_inspection.pending_alert_batch_size' debe ser un entero >= 1."
+            )
+
+
+def _parse_reconciliation_inspection_config(pt_cfg: dict) -> ReconciliationInspectionConfig:
+    ri_cfg = pt_cfg.get("reconciliation_inspection", {})
+    defaults = ReconciliationInspectionConfig()
+    return ReconciliationInspectionConfig(
+        enabled=ri_cfg.get("enabled", defaults.enabled),
+        interval_minutes=ri_cfg.get("interval_minutes", defaults.interval_minutes),
+        run_on_startup=ri_cfg.get("run_on_startup", defaults.run_on_startup),
+        deliver_alerts=ri_cfg.get("deliver_alerts", defaults.deliver_alerts),
+        max_alert_delivery_attempts=ri_cfg.get(
+            "max_alert_delivery_attempts", defaults.max_alert_delivery_attempts
+        ),
+        history_limit=ri_cfg.get("history_limit", defaults.history_limit),
+        pending_alert_batch_size=ri_cfg.get(
+            "pending_alert_batch_size", defaults.pending_alert_batch_size
+        ),
+    )
+
 
 def load_settings(
     config_path: Path = DEFAULT_CONFIG_PATH,
@@ -652,5 +739,6 @@ def load_settings(
             max_order_value=Decimal(config["paper_trading"]["max_order_value"]),
             max_position_value=Decimal(config["paper_trading"]["max_position_value"]),
             rules_version=config["paper_trading"]["rules_version"],
+            reconciliation_inspection=_parse_reconciliation_inspection_config(config["paper_trading"]),
         ),
     )

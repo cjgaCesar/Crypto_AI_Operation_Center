@@ -19,8 +19,10 @@ exacto).
 from decimal import Decimal
 from typing import Optional
 
+from src.paper_trading.alert_models import AlertStatus, InspectionAlert
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.enums import OrderStatus
+from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.models import (
     CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
 )
@@ -150,5 +152,31 @@ class PostgresPaperTradingRepository(PaperTradingRepository):
         cash_balances: list[CashBalance],
         positions: list[Position],
         audit_record: ReconciliationAuditRecord,
+    ) -> None:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def get_latest_successful_inspection_run(self):
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def get_latest_inspection_run(self):
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def fetch_inspection_runs(self, limit: Optional[int] = None) -> list[ScheduledInspectionRun]:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def fetch_pending_inspection_alerts(self, limit: Optional[int] = None) -> list[InspectionAlert]:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def get_inspection_alert_by_deduplication_key(self, deduplication_key: str):
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def save_inspection_run_transaction(
+        self, run: ScheduledInspectionRun, alerts: list[InspectionAlert],
+    ) -> None:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def update_inspection_alert_delivery(
+        self, alert_id: str, status: AlertStatus, delivery_attempts: int,
+        last_error: Optional[str], delivered_at,
     ) -> None:
         raise NotImplementedError(_NOT_IMPLEMENTED_MSG)

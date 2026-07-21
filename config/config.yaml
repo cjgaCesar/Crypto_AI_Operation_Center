@@ -167,3 +167,16 @@ paper_trading:
   max_order_value: "1000"
   max_position_value: "5000"
   rules_version: "v1"
+  # Bloque opcional (Etapa 6.9, ver ARQUITECTURA_PAPER_TRADING.md §23.13):
+  # si se omite, se usan estos mismos valores por defecto. Controla
+  # exclusivamente si inspection_scheduler.py arranca su loop periódico
+  # -- nunca la inspección/reparación manual, que siempre está disponible
+  # sin importar este bloque ni paper_trading.enabled.
+  reconciliation_inspection:
+    enabled: false
+    interval_minutes: 60
+    run_on_startup: false
+    deliver_alerts: true
+    max_alert_delivery_attempts: 3
+    history_limit: 100
+    pending_alert_batch_size: 100

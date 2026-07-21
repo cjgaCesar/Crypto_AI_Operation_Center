@@ -9,8 +9,8 @@ dependencias inyectadas como protocolos:
 
 - `Clock.now()` reemplaza `datetime.now(timezone.utc)`.
 - `IdGenerator.new_order_id()/new_execution_id()/new_trade_id()/
-  new_reconciliation_audit_id()` (el último agregado en la Etapa 6.8)
-  reemplazan `uuid.uuid4()`.
+  new_reconciliation_audit_id()` (Etapa 6.8)/`new_inspection_run_id()`/
+  `new_inspection_alert_id()` (Etapa 6.9) reemplazan `uuid.uuid4()`.
 
 `SystemClock`/`UUIDIdGenerator` son las únicas implementaciones de este
 módulo que sí usan `datetime.now()`/`uuid.uuid4()` -- deliberadamente
@@ -46,6 +46,10 @@ class IdGenerator(Protocol):
 
     def new_reconciliation_audit_id(self) -> str: ...
 
+    def new_inspection_run_id(self) -> str: ...
+
+    def new_inspection_alert_id(self) -> str: ...
+
 
 class SystemClock:
     """Implementación real de Clock: usa datetime.now(timezone.utc)."""
@@ -67,4 +71,10 @@ class UUIDIdGenerator:
         return str(uuid.uuid4())
 
     def new_reconciliation_audit_id(self) -> str:
+        return str(uuid.uuid4())
+
+    def new_inspection_run_id(self) -> str:
+        return str(uuid.uuid4())
+
+    def new_inspection_alert_id(self) -> str:
         return str(uuid.uuid4())

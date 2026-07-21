@@ -35,7 +35,7 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   Estado Técnico), diseño responsive con selector de vista compartido y
   centralizado. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
   [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
-- 🛠️ **Etapas 6.0-6.8 (implementación en curso)** — Paper Trading
+- 🛠️ **Etapas 6.0-6.9 (implementación en curso)** — Paper Trading
   (compra/venta simulada, sin dinero real, sin conexión a un exchange
   para operar): dominio (`src/paper_trading/models.py`), motores puros
   (fill/position/PnL/risk/**reservation**/**reconciliation**), persistencia
@@ -55,7 +55,20 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   automática ni al arrancar): dry-run por defecto, auditoría persistente
   de cada corrida (`paper_trading_reconciliation_audit`), y una CLI
   administrativa separada (`python -m src.paper_trading.reconciliation_cli`)
-  -- el Dashboard sigue sin ningún botón de inspección/reparación.
+  -- el Dashboard sigue sin ningún botón de inspección/reparación. **6.9**
+  automatizó exclusivamente la *inspección* (nunca la reparación):
+  `InspectionService` ejecuta `ReconciliationService.inspect()`
+  periódicamente, compara contra la corrida anterior, y genera alertas
+  (`NEW_ISSUE`/`RESOLVED_ISSUE`/`SEVERITY_INCREASED`/`SEVERITY_DECREASED`/
+  `VALUE_CHANGED`/`INSPECTION_FAILED`/`SYSTEM_RECOVERED`) deduplicadas por
+  SHA-256, entregadas vía `logging` con reintentos acotados; un
+  `InspectionJob` con no-solapamiento en memoria puede ejecutarse
+  manualmente (`python -m src.paper_trading.inspection_cli run|alerts|history`)
+  o periódicamente (`python -m src.paper_trading.inspection_scheduler`,
+  proceso independiente de `main.py`, gateado por
+  `paper_trading.reconciliation_inspection.enabled`, `false` por
+  defecto) -- **nunca llama `repair()`**, que sigue siendo exclusivamente
+  manual (Etapa 6.8).
   `config.yaml -> paper_trading.enabled` es `false` por defecto:
   **ninguna orden se ejecuta automáticamente ni desde el
   Dashboard** (sin Strategy Engine, sin señales ni IA ejecutando
@@ -420,7 +433,7 @@ las 5 páginas que lo usan (`layout.render_view_mode_selector()`). Ver
 [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md) para el
 detalle completo de cada iteración.
 
-🛠️ **Etapas 6.0-6.8 (implementación en curso)**: Paper Trading (compra/
+🛠️ **Etapas 6.0-6.9 (implementación en curso)**: Paper Trading (compra/
 venta simulada, sin dinero real, sin conexión a un exchange para
 operar). 6.0 diseñó la arquitectura (auditada en 6.0.1); desde entonces
 se implementó, con pruebas automatizadas en cada paso: **6.1** dominio
@@ -463,15 +476,40 @@ ejecuta al arrancar; una CLI administrativa nueva y separada
 (`python -m src.paper_trading.reconciliation_cli inspect|repair`,
 `--apply` obligatorio para escribir) es la única forma de invocarlo. El
 Dashboard no cambia (sigue estrictamente de solo lectura, sin ningún
-botón administrativo). **Ninguna orden se ejecuta automáticamente
+botón administrativo); **6.9** automatizó exclusivamente la *inspección*
+periódica de reconciliación -- nunca la reparación, que sigue siendo
+manual (Etapa 6.8): `InspectionComparator` (puro) compara la corrida
+actual contra la última exitosa por `IssueIdentity` (código+entidad,
+nunca por texto/timestamp), clasificando cada issue en nuevo/resuelto/
+persistente, con subcategorías de severidad aumentada/disminuida y
+cambio de valor; `AlertBuilder` (puro) construye alertas tipadas
+(`NEW_ISSUE`/`RESOLVED_ISSUE`/`SEVERITY_INCREASED`/`SEVERITY_DECREASED`/
+`VALUE_CHANGED`/`INSPECTION_FAILED`/`SYSTEM_RECOVERED`) con una
+`deduplication_key` SHA-256 (nunca `hash()` nativo) que evita duplicar
+la misma alerta tras un reinicio; `InspectionService` persiste cada
+corrida + sus alertas en una única transacción atómica
+(`paper_trading_inspection_runs`/`paper_trading_inspection_alerts`,
+UNIQUE en `deduplication_key`); `AlertDeliveryService` entrega alertas
+`PENDING` vía `logging` (`LoggingInspectionAlertSink`/
+`NullInspectionAlertSink` para pruebas) con reintentos acotados
+(`max_alert_delivery_attempts`, `FAILED` al agotarse, `DELIVERED` nunca
+se reenvía); `InspectionJob` combina Clock/IdGenerator/ambos servicios
+con un lock no reentrante en memoria (protege un solo proceso, no
+multiproceso) para evitar solapamiento; ejecutable manualmente
+(`python -m src.paper_trading.inspection_cli run|alerts|history`) o
+periódicamente (`python -m src.paper_trading.inspection_scheduler`,
+proceso independiente con su propio loop, sin la librería `schedule` de
+`main.py`), gateado por `paper_trading.reconciliation_inspection.enabled`
+(`false` por defecto, bloque opcional en `config.yaml`, independiente de
+`paper_trading.enabled`). **Ninguna orden se ejecuta automáticamente
 todavía**: sin Strategy Engine, sin señales ni IA ejecutando órdenes,
 sin cambios en el Dashboard (sigue de solo lectura). Ver
 [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
 [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
-Pendiente tu auditoría y aprobación formal de la Etapa 6.8 antes de
+Pendiente tu auditoría y aprobación formal de la Etapa 6.9 antes de
 continuar.
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
-de conectar un proveedor de IA real; aprobación de la Etapa 6.8 antes de
-continuar con Paper Trading (automatización, migración PostgreSQL
-real).
+de conectar un proveedor de IA real; aprobación de la Etapa 6.9 antes de
+continuar con Paper Trading (entrega de alertas por canales adicionales,
+migración PostgreSQL real).

@@ -26,8 +26,12 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
+from src.paper_trading.alert_delivery_service import AlertDeliveryBatchResult, AlertDeliveryService
+from src.paper_trading.alert_sink import NullInspectionAlertSink
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
+from src.paper_trading.inspection_models import ScheduledInspectionRun
+from src.paper_trading.inspection_service import InspectionService
 from src.paper_trading.models import Order
 from src.paper_trading.price_provider import MarketPriceProvider
 from src.paper_trading.reconciliation_models import IssueCode, ReconciliationReport, ReconciliationRepairResult
@@ -70,6 +74,8 @@ class PaperTradingApplication:
         id_generator: IdGenerator,
         config: PaperTradingConfig,
         reconciliation_service: Optional[ReconciliationService] = None,
+        inspection_service: Optional[InspectionService] = None,
+        alert_delivery_service: Optional[AlertDeliveryService] = None,
     ):
         self._service = service
         self._repository = repository
@@ -78,6 +84,14 @@ class PaperTradingApplication:
         self._id_generator = id_generator
         self._config = config
         self._reconciliation_service = reconciliation_service or ReconciliationService(repository=repository)
+        self._inspection_service = inspection_service or InspectionService(
+            repository=repository, reconciliation_service=self._reconciliation_service,
+            id_generator=id_generator, clock=clock,
+        )
+        self._alert_delivery_service = alert_delivery_service or AlertDeliveryService(
+            repository=repository, sink=NullInspectionAlertSink(clock=clock),
+            max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
+        )
 
     def _require_enabled(self, action_description: str) -> None:
         if not self._config.enabled:
@@ -267,6 +281,32 @@ class PaperTradingApplication:
         return self._reconciliation_service.repair(
             audit_id=audit_id, timestamp=timestamp, issue_codes=issue_codes, dry_run=dry_run,
         )
+
+    # --- Automatización de inspecciones (Etapa 6.9) -------------------------
+    #
+    # Mismo criterio que inspect_reconciliation()/repair_reconciliation():
+    # deliberadamente NO gatean con _require_enabled() (ver §23.13 -- la
+    # inspección/entrega es mantenimiento, no una acción de trading nueva).
+    # No exponer estos métodos desde el Dashboard (§23.14).
+
+    def run_reconciliation_inspection(self) -> ScheduledInspectionRun:
+        """Ejecuta una inspección manual (delega en InspectionService, que
+        a su vez usa ReconciliationService.inspect() -- nunca repair()).
+        Usa Clock/IdGenerator inyectados; no consulta precios."""
+        timestamp = self._clock.now()
+        run_id = self._id_generator.new_inspection_run_id()
+        return self._inspection_service.run_inspection(run_id=run_id, started_at=timestamp)
+
+    def deliver_pending_reconciliation_alerts(self) -> AlertDeliveryBatchResult:
+        """Entrega las alertas PENDING ya persistidas (delega en
+        AlertDeliveryService). No compara reportes ni ejecuta SQL propio."""
+        return self._alert_delivery_service.deliver_pending_alerts()
+
+    def fetch_reconciliation_inspection_history(
+        self, limit: Optional[int] = None,
+    ) -> list[ScheduledInspectionRun]:
+        """Historial de corridas de inspección, de solo lectura."""
+        return self._repository.fetch_inspection_runs(limit=limit)
 
     # --- API de compatibilidad (Etapa 6.5) ---------------------------------
 

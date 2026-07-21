@@ -50,15 +50,18 @@ import sqlite3
 from decimal import Decimal
 from typing import Optional
 
+from src.paper_trading.alert_models import AlertStatus, InspectionAlert
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.enums import OrderStatus, PositionSide
+from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.models import (
     CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
 )
 from src.paper_trading.reconciliation_models import ReconciliationAuditRecord
 from src.paper_trading.serialization import (
-    datetime_to_text, decimal_to_text, optional_datetime_to_text, optional_decimal_to_text,
-    optional_text_to_datetime, optional_text_to_decimal, text_to_datetime, text_to_decimal,
+    datetime_to_text, decimal_to_text, deserialize_inspection_alert, deserialize_inspection_run,
+    optional_datetime_to_text, optional_decimal_to_text, optional_text_to_datetime, optional_text_to_decimal,
+    serialize_inspection_alert, serialize_inspection_run, text_to_datetime, text_to_decimal,
 )
 
 _ORDER_COLUMNS = (
@@ -93,6 +96,15 @@ _CASH_BALANCE_COLUMNS = ("currency", "total_balance", "reserved_balance", "updat
 _RECONCILIATION_AUDIT_COLUMNS = (
     "id", "started_at", "completed_at", "dry_run", "success",
     "issue_count", "repaired_count", "report_json", "operations_json", "error_message",
+)
+_INSPECTION_RUN_COLUMNS = (
+    "id", "started_at", "completed_at", "success", "report_json", "issue_count", "critical_count",
+    "error_count", "warning_count", "info_count", "previous_run_id", "new_issue_count",
+    "resolved_issue_count", "persistent_issue_count", "changed_issue_count", "alert_count", "error_message",
+)
+_INSPECTION_ALERT_COLUMNS = (
+    "id", "run_id", "alert_type", "issue_key", "issue_code", "severity", "title", "message",
+    "deduplication_key", "status", "delivery_attempts", "last_error", "created_at", "delivered_at",
 )
 _PORTFOLIO_SNAPSHOT_COLUMNS = (
     "id", "timestamp", "cash_balance", "positions_value",
@@ -246,6 +258,50 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_inspection_runs (
+                    id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    report_json TEXT,
+                    issue_count INTEGER NOT NULL,
+                    critical_count INTEGER NOT NULL,
+                    error_count INTEGER NOT NULL,
+                    warning_count INTEGER NOT NULL,
+                    info_count INTEGER NOT NULL,
+                    previous_run_id TEXT,
+                    new_issue_count INTEGER NOT NULL,
+                    resolved_issue_count INTEGER NOT NULL,
+                    persistent_issue_count INTEGER NOT NULL,
+                    changed_issue_count INTEGER NOT NULL,
+                    alert_count INTEGER NOT NULL,
+                    error_message TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_inspection_alerts (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    alert_type TEXT NOT NULL,
+                    issue_key TEXT,
+                    issue_code TEXT,
+                    severity TEXT,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    delivery_attempts INTEGER NOT NULL,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    FOREIGN KEY(run_id) REFERENCES paper_trading_inspection_runs(id)
+                )
+                """
+            )
             self._migrate_missing_columns(conn)
             self._create_indexes(conn)
             conn.commit()
@@ -293,6 +349,24 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
             "CREATE INDEX IF NOT EXISTS idx_paper_trading_reconciliation_audit_started_at "
             "ON paper_trading_reconciliation_audit(started_at)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_inspection_runs_started_at "
+            "ON paper_trading_inspection_runs(started_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_inspection_alerts_run_id "
+            "ON paper_trading_inspection_alerts(run_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_inspection_alerts_created_at "
+            "ON paper_trading_inspection_alerts(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_inspection_alerts_status "
+            "ON paper_trading_inspection_alerts(status)"
+        )
+        # deduplication_key ya tiene un índice implícito por su UNIQUE
+        # (SQLite crea uno automáticamente) -- no se duplica aquí.
 
     @staticmethod
     def _validate_limit(limit: Optional[int]) -> None:
@@ -993,5 +1067,149 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    # --- Automatización de inspecciones (Etapa 6.9) ------------------------
+
+    @staticmethod
+    def _row_to_inspection_run(row) -> ScheduledInspectionRun:
+        return deserialize_inspection_run(dict(zip(_INSPECTION_RUN_COLUMNS, row)))
+
+    @staticmethod
+    def _row_to_inspection_alert(row) -> InspectionAlert:
+        return deserialize_inspection_alert(dict(zip(_INSPECTION_ALERT_COLUMNS, row)))
+
+    def get_latest_successful_inspection_run(self) -> Optional[ScheduledInspectionRun]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_INSPECTION_RUN_COLUMNS)} FROM paper_trading_inspection_runs "
+                "WHERE success = 1 ORDER BY started_at DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_inspection_run(row) if row else None
+
+    def get_latest_inspection_run(self) -> Optional[ScheduledInspectionRun]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_INSPECTION_RUN_COLUMNS)} FROM paper_trading_inspection_runs "
+                "ORDER BY started_at DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_inspection_run(row) if row else None
+
+    def fetch_inspection_runs(self, limit: Optional[int] = None) -> list[ScheduledInspectionRun]:
+        self._validate_limit(limit)
+        limit_sql = ""
+        params: list = []
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_INSPECTION_RUN_COLUMNS)} FROM paper_trading_inspection_runs "
+                f"ORDER BY started_at DESC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_inspection_run(row) for row in rows]
+
+    def fetch_pending_inspection_alerts(self, limit: Optional[int] = None) -> list[InspectionAlert]:
+        self._validate_limit(limit)
+        limit_sql = ""
+        params: list = [AlertStatus.PENDING.value]
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_INSPECTION_ALERT_COLUMNS)} FROM paper_trading_inspection_alerts "
+                f"WHERE status = ? ORDER BY created_at ASC {limit_sql}",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_inspection_alert(row) for row in rows]
+
+    def get_inspection_alert_by_deduplication_key(self, deduplication_key: str) -> Optional[InspectionAlert]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_INSPECTION_ALERT_COLUMNS)} FROM paper_trading_inspection_alerts "
+                "WHERE deduplication_key = ?",
+                (deduplication_key,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_inspection_alert(row) if row else None
+
+    @staticmethod
+    def _insert_inspection_run(conn: sqlite3.Connection, run: ScheduledInspectionRun) -> None:
+        row = serialize_inspection_run(run)
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_inspection_runs ({', '.join(_INSPECTION_RUN_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_INSPECTION_RUN_COLUMNS))})
+            """,
+            tuple(row[column] for column in _INSPECTION_RUN_COLUMNS),
+        )
+
+    @staticmethod
+    def _insert_inspection_alert(conn: sqlite3.Connection, alert: InspectionAlert) -> None:
+        row = serialize_inspection_alert(alert)
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_inspection_alerts ({', '.join(_INSPECTION_ALERT_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_INSPECTION_ALERT_COLUMNS))})
+            """,
+            tuple(row[column] for column in _INSPECTION_ALERT_COLUMNS),
+        )
+
+    def save_inspection_run_transaction(
+        self, run: ScheduledInspectionRun, alerts: list[InspectionAlert],
+    ) -> None:
+        """Persiste atómicamente (todo o nada) una corrida y todas sus
+        alertas nuevas (§23.8). Nunca toca Order/Execution/Trade/
+        CashBalance/Position."""
+        conn = self._get_connection()
+        try:
+            self._insert_inspection_run(conn, run)
+            for alert in alerts:
+                self._insert_inspection_alert(conn, alert)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def update_inspection_alert_delivery(
+        self,
+        alert_id: str,
+        status: AlertStatus,
+        delivery_attempts: int,
+        last_error: Optional[str],
+        delivered_at,
+    ) -> None:
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE paper_trading_inspection_alerts "
+                "SET status = ?, delivery_attempts = ?, last_error = ?, delivered_at = ? WHERE id = ?",
+                (status.value, delivery_attempts, last_error, optional_datetime_to_text(delivered_at), alert_id),
+            )
+            conn.commit()
         finally:
             conn.close()

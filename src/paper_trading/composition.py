@@ -21,6 +21,12 @@ Etapa 6.8: también construye e inyecta `ReconciliationService` (con
 normal no repara nada, ni siquiera detecta nada -- solo deja el
 servicio listo para que la CLI administrativa (u otro caller explícito)
 lo invoque.
+
+Etapa 6.9: además construye `InspectionService`/`AlertDeliveryService`/
+`InspectionJob` (`inspection_service`/`alert_delivery_service`/
+`inspection_job` en `PaperTradingContext`). Tampoco se ejecuta
+`run_once()`/entrega alguna durante la construcción (§23.14) -- eso
+queda para `inspection_cli.py`/`inspection_scheduler.py`.
 """
 
 import logging
@@ -28,9 +34,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
+from src.paper_trading.alert_delivery_service import AlertDeliveryService
+from src.paper_trading.alert_sink import LoggingInspectionAlertSink
 from src.paper_trading.application import PaperTradingApplication
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.fill_engine import FillEngine
+from src.paper_trading.inspection_job import InspectionJob
+from src.paper_trading.inspection_service import InspectionService
 from src.paper_trading.models import CashBalance
 from src.paper_trading.pnl_engine import PnLEngine
 from src.paper_trading.position_engine import PositionEngine
@@ -56,6 +66,9 @@ class PaperTradingContext:
     application: PaperTradingApplication
     config: PaperTradingConfig
     reconciliation_service: ReconciliationService
+    inspection_service: InspectionService
+    alert_delivery_service: AlertDeliveryService
+    inspection_job: InspectionJob
 
 
 def seed_initial_cash_balance(
@@ -125,6 +138,21 @@ def build_paper_trading_context(
 
     reconciliation_service = ReconciliationService(repository=repository, engine=ReconciliationEngine)
 
+    inspection_service = InspectionService(
+        repository=repository, reconciliation_service=reconciliation_service,
+        id_generator=id_generator, clock=clock,
+    )
+    alert_delivery_service = AlertDeliveryService(
+        repository=repository, sink=LoggingInspectionAlertSink(clock=clock),
+        max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
+    )
+    inspection_job = InspectionJob(
+        inspection_service=inspection_service, alert_delivery_service=alert_delivery_service,
+        clock=clock, id_generator=id_generator,
+        deliver_alerts=config.reconciliation_inspection.deliver_alerts,
+        alert_batch_size=config.reconciliation_inspection.pending_alert_batch_size,
+    )
+
     application = PaperTradingApplication(
         service=service,
         repository=repository,
@@ -133,9 +161,12 @@ def build_paper_trading_context(
         id_generator=id_generator,
         config=config,
         reconciliation_service=reconciliation_service,
+        inspection_service=inspection_service,
+        alert_delivery_service=alert_delivery_service,
     )
 
     return PaperTradingContext(
         repository=repository, service=service, application=application, config=config,
-        reconciliation_service=reconciliation_service,
+        reconciliation_service=reconciliation_service, inspection_service=inspection_service,
+        alert_delivery_service=alert_delivery_service, inspection_job=inspection_job,
     )

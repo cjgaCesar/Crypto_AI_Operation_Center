@@ -2165,3 +2165,300 @@ mezclan con rechazos de riesgo normales.
 - La automatización de la reconciliación (ejecutarla periódicamente,
   alertar, o exponerla en el Dashboard de alguna forma read-only) queda
   pendiente para una etapa futura (6.9+).
+
+## 23. Automatización controlada de inspecciones (Etapa 6.9 — diseño previo a implementar)
+
+### 23.1 Objetivo y alcance
+
+Automatizar exclusivamente `ReconciliationService.inspect()` (Etapa
+6.8): ejecutarlo periódicamente, persistir cada corrida, comparar contra
+la anterior, y generar alertas estructuradas cuando algo cambia.
+**`repair()` nunca se invoca desde ningún componente de esta etapa** --
+ni el job, ni el scheduler, ni la Application, ni la Composition Root.
+Reparar sigue siendo, exclusivamente, la CLI manual de la Etapa 6.8
+(`reconciliation_cli.py repair --apply`), invocada por una persona.
+
+### 23.2 Ejecución manual vs. periódica
+
+- **Manual**: `PaperTradingApplication.run_reconciliation_inspection()`
+  (delegando a `InspectionService`) o la nueva CLI
+  (`inspection_cli.py run`) -- una sola corrida, bajo demanda.
+- **Periódica**: `inspection_scheduler.py`, un proceso independiente
+  (`python -m src.paper_trading.inspection_scheduler`) que invoca
+  `InspectionJob.run_once()` cada `interval_minutes`. No es parte de
+  `main.py`/`run_full_cycle()`, no comparte proceso con el bot principal.
+
+### 23.3 Fuente de verdad
+
+El `ReconciliationReport` que ya produce `ReconciliationEngine.analyze()`
+(Etapa 6.8) sigue siendo la única fuente de verdad de qué está
+inconsistente. Esta etapa no agrega ninguna regla de detección nueva:
+solo persiste ese reporte, lo compara con el anterior, y decide si algo
+amerita una alerta.
+
+### 23.4 Identidad estable de un issue
+
+`IssueIdentity` (`code`, `entity_type`, `entity_id`, `exchange`,
+`symbol` -- exactamente los campos que identifican QUÉ está mal, nunca
+CUÁNDO se detectó ni CÓMO se describe) permite reconocer "el mismo
+problema" entre dos reportes generados en instantes distintos.
+`build_issue_identity(issue)` es una función pura y determinista;
+`IssueIdentity` es `@dataclass(frozen=True, order=True)`: hashable (para
+usarse como clave de `dict`/`set`) y ordenable (para que las listas de
+salida del comparador sean deterministas).
+
+### 23.5 Comparación entre reportes
+
+`compare_reports(previous_report, current_report)` (puro,
+`inspection_comparator.py`) indexa ambos reportes por `IssueIdentity` y
+clasifica cada identidad en exactamente una categoría:
+
+- Solo en `current` -> `new_issues`.
+- Solo en `previous` -> `resolved_issues`.
+- En ambos -> pertenece a `persistent_issues` (el superconjunto) y,
+  además, a **una** de estas cuatro subcategorías mutuamente excluyentes
+  (se evalúan en este orden):
+  1. `severity_increased` si el ordinal de severidad subió
+     (`INFO(0) < WARNING(1) < ERROR(2) < CRITICAL(3)`).
+  2. `severity_decreased` si bajó.
+  3. `value_changed` si `expected_value`, `actual_value` o `repairable`
+     cambiaron (severidad igual).
+  4. `unchanged` en cualquier otro caso.
+
+`previous_report=None` (primera inspección de la cuenta, nunca hubo una
+corrida exitosa antes) se trata como "reporte anterior vacío": todos los
+issues de `current_report` caen en `new_issues`, el resto queda vacío.
+Una diferencia solo en `description`/`detected_at` nunca cambia la
+identidad ni dispara ninguna subcategoría (esos campos no forman parte
+de `IssueIdentity` ni se comparan).
+
+### 23.6 Modelo de alertas y reglas de disparo
+
+`AlertType`: `NEW_ISSUE`, `RESOLVED_ISSUE`, `SEVERITY_INCREASED`,
+`SEVERITY_DECREASED`, `VALUE_CHANGED`, `INSPECTION_FAILED`,
+`SYSTEM_RECOVERED`. Reglas (Paso 8): `NEW_ISSUE`/`RESOLVED_ISSUE`/
+`SEVERITY_INCREASED` siempre generan alerta; se decide generar también
+`SEVERITY_DECREASED` siempre (no solo "opcional"), por consistencia con
+`SEVERITY_INCREASED` y porque una baja de severidad sigue siendo
+información operativa relevante (ej. pasar de CRITICAL a WARNING sigue
+mereciendo visibilidad); `VALUE_CHANGED` genera alerta solo si
+`expected_value`/`actual_value` cambiaron (definido en 23.5). Ningún
+cambio de solo `description`/`detected_at` genera alerta.
+
+### 23.7 Deduplicación (`deduplication_key`)
+
+SHA-256 sobre un payload JSON determinista (`sort_keys=True`, UTF-8) --
+nunca `hash()` nativo (no determinista entre procesos). El payload
+depende del tipo de alerta y **nunca** incluye `alert.id`, `run_id`,
+`created_at` ni `detected_at`:
+
+| AlertType | Payload |
+|---|---|
+| `NEW_ISSUE` | `alert_type`, `issue_identity`, `severity` (actual) |
+| `RESOLVED_ISSUE` | `alert_type`, `issue_identity`, `severity` (la que tenía al resolverse) |
+| `SEVERITY_INCREASED`/`SEVERITY_DECREASED` | `alert_type`, `issue_identity`, `previous_severity`, `current_severity` |
+| `VALUE_CHANGED` | `alert_type`, `issue_identity`, `previous_expected_value`, `previous_actual_value`, `current_expected_value`, `current_actual_value`, `previous_repairable`, `current_repairable` |
+| `INSPECTION_FAILED` | `alert_type`, `error_message` |
+| `SYSTEM_RECOVERED` | `alert_type`, `previous_error_message` (el de la corrida fallida que precedió a la recuperación) |
+
+**Limitación documentada**: como ni `run_id` ni marcas de tiempo forman
+parte de la clave (por diseño, para que un reinicio no duplique
+alertas), si exactamente la misma identidad reaparece con exactamente
+la misma severidad después de haberse resuelto una vez, o si el mismo
+`error_message` de fallo vuelve a ocurrir en un episodio posterior, la
+clave de deduplicación coincide con la de la primera vez y esa
+recurrencia no genera una fila nueva (la restricción `UNIQUE` la
+rechazaría). Se documenta como limitación aceptada -- resolverla
+exigiría incorporar un marcador de "episodio" monótono, explícitamente
+fuera de alcance de los campos permitidos en la clave (Paso 10).
+
+### 23.8 Persistencia
+
+Dos tablas nuevas, mismo patrón que `paper_trading_reconciliation_audit`
+(Etapa 6.8): `paper_trading_inspection_runs` (una fila por corrida,
+`report_json` nulo si la corrida falló) y `paper_trading_inspection_alerts`
+(`deduplication_key` con `UNIQUE`, `FOREIGN KEY(run_id)`). Migración
+idempotente (`CREATE TABLE IF NOT EXISTS`, igual que toda tabla nueva de
+Paper Trading). `save_inspection_run_transaction(run, alerts)` es la
+única escritura multi-fila: una transacción atómica que inserta el run y
+todas sus alertas (filtradas de duplicados antes de intentar el
+`INSERT`, ver 23.7), todo o nada.
+
+### 23.9 Entrega y reintentos
+
+`InspectionAlertSink.deliver(alert) -> AlertDeliveryResult` es la única
+abstracción de entrega; `LoggingInspectionAlertSink` (usa `logging`,
+nunca `print`, captura sus propios errores) y `NullInspectionAlertSink`
+(para pruebas) son las únicas implementaciones de esta etapa -- ningún
+canal externo (email/Slack/Telegram/webhooks) se implementa todavía.
+`AlertDeliveryService.deliver_pending_alerts()` lee `PENDING` (lote
+acotado por `pending_alert_batch_size`), entrega una por una, y por cada
+una: éxito -> `DELIVERED`; fallo con `delivery_attempts + 1 <
+max_alert_delivery_attempts` -> sigue `PENDING` (reintentable); fallo
+que alcanza el máximo -> `FAILED` (ya no se reintenta). Un fallo de
+entrega o de la propia actualización de estado nunca detiene el
+procesamiento de las demás alertas del lote (`try/except` por alerta).
+`DELIVERED` nunca se reenvía; `SUPPRESSED` nunca se entrega (valor
+reservado en `AlertStatus` para una futura función de silenciado manual
+-- igual criterio que `OrderType.LIMIT`/`PositionSide.SHORT`: declarado,
+sin ningún camino de código de esta etapa que lo produzca todavía).
+
+### 23.10 `InspectionService`
+
+Ajuste sobre la firma sugerida (Paso 15, con licencia explícita del
+enunciado para adaptarla): `run_inspection(run_id, started_at, alert_ids)`
+recibe `run_id`/`started_at` ya generados (por `InspectionJob`, vía
+`IdGenerator`/`Clock`) pero determina `completed_at` internamente
+llamando a su propio `Clock` inyectado justo antes de persistir --
+pedirlo como parámetro externo habría obligado al llamador a inventar
+ese instante *antes* de que la inspección realmente terminara. Del mismo
+modo, `alert_ids` no es una lista de tamaño fijo pasada a ciegas: el
+Service primero ejecuta `inspect()` + `compare_reports()`, cuenta
+exactamente cuántas alertas hacen falta (la suma de los tamaños de cada
+subcategoría de `InspectionComparison`), y **entonces** pide esa
+cantidad exacta de ids a `IdGenerator.new_inspection_alert_id()` antes
+de invocar `alert_builder.build_alerts()` (puro) con la lista ya
+completa -- así el builder nunca genera un id él mismo (Paso 11) y el
+Service es, igual que `PaperTradingApplication`, el único punto que
+combina IdGenerator + una función pura.
+
+### 23.11 Manejo de errores, `INSPECTION_FAILED` y `SYSTEM_RECOVERED`
+
+Si `ReconciliationService.inspect()` lanza una excepción,
+`InspectionService` la captura: nunca la deja propagar como fallo no
+controlado (violaría "un fallo no debe detener el scheduler", Paso 4).
+Construye un `ScheduledInspectionRun(success=False, report=None,
+error_message=str(exc))`, una alerta `INSPECTION_FAILED` (deduplicada
+por `error_message`, ver 23.7), y persiste ambos con la misma
+transacción atómica que un run exitoso. Si la corrida **anterior**
+(`get_latest_inspection_run()`, no `get_latest_successful_inspection_run()`)
+tenía `success=False` y esta corrida sí tiene éxito, se agrega una
+alerta `SYSTEM_RECOVERED` (una sola vez por episodio, deduplicada por el
+`error_message` de esa corrida fallida previa). Si la propia
+persistencia del run falla (un problema estructural del repositorio, no
+un hallazgo de reconciliación), se intenta un último registro de fallo
+con `save_inspection_run_transaction` de solo el run marcado
+`success=False`; si eso también falla, se relanza envuelta en
+`InspectionPersistenceError` -- mismo patrón que `ReconciliationAuditError`
+en `reconciliation_service.py` (Etapa 6.8).
+
+### 23.12 `InspectionJob` y no solapamiento
+
+`InspectionJob.run_once()` es la única pieza que combina timing
+(`Clock`), identidad (`IdGenerator`), `InspectionService` y
+`AlertDeliveryService` -- no contiene ninguna regla de comparación ni de
+reconciliación. Usa un `threading.Lock()` no reentrante en memoria
+(`acquire(blocking=False)`): si ya hay un `run_once()` en curso, el
+nuevo intento se omite de inmediato (`InspectionJobResult(skipped=True)`),
+sin bloquear. El lock se libera siempre en `finally`, incluso si
+`InspectionService`/`AlertDeliveryService` lanzan una excepción no
+prevista. **Limitación explícita**: este lock protege un único proceso;
+no es un advisory lock de base de datos y no impide que dos procesos
+distintos (dos instancias del scheduler, o el scheduler + la CLI a la
+vez) corran `run_once()` simultáneamente -- eso queda para una etapa
+futura si se necesita.
+
+### 23.13 Configuración y semántica de `enabled`
+
+`paper_trading.reconciliation_inspection` es un bloque **opcional**
+dentro de `config.yaml -> paper_trading`: si no existe, se aplican
+valores por defecto seguros (`enabled=false`, `interval_minutes=60`,
+`run_on_startup=false`, `deliver_alerts=true`,
+`max_alert_delivery_attempts=3`, `history_limit=100`,
+`pending_alert_batch_size=100`) -- un `config.yaml` de una etapa
+anterior sigue cargando sin cambios. Dos gates independientes, nunca
+confundidos:
+
+- `paper_trading.enabled` controla la operación simulada (aceptar/
+  llenar/cancelar órdenes). La inspección administrativa **manual**
+  (`Application.run_reconciliation_inspection()`, la CLI) funciona
+  igual con `paper_trading.enabled=false` -- mismo criterio ya aplicado
+  a `inspect_reconciliation()`/`repair_reconciliation()` en la Etapa 6.8
+  (§22.11): mantenimiento/diagnóstico no es una acción de trading.
+- `reconciliation_inspection.enabled` controla exclusivamente si el
+  **scheduler** (`inspection_scheduler.py`) arranca. Si es `false`, el
+  proceso del scheduler informa y termina con código 0 sin construir
+  ningún loop.
+
+### 23.14 `Application`/Composition Root/CLI/Dashboard
+
+`PaperTradingApplication` gana 3 métodos administrativos
+(`run_reconciliation_inspection()`, `deliver_pending_reconciliation_alerts()`,
+`fetch_reconciliation_inspection_history(limit=None)`) que delegan sin
+contener reglas, igual criterio que `inspect_reconciliation()`/
+`repair_reconciliation()` (§22.11) -- no expuestos en el Dashboard.
+`PaperTradingContext` gana `inspection_service`/`alert_delivery_service`/
+`inspection_job`; `build_paper_trading_context()` los construye e
+inyecta pero **nunca** llama `run_once()`/`inspect()`/entrega alguna
+durante la construcción (mismo principio ya establecido en §22.11 para
+`repair()`). El Dashboard no cambia en esta etapa: sigue sin ningún
+botón ni control del scheduler/inspección/alertas, sigue leyendo
+únicamente vía el repositorio de solo lectura ya existente (Etapa 6.6).
+
+### 23.15 CLI y scheduler
+
+`inspection_cli.py` (`run`/`alerts`/`history --limit N`) sigue el mismo
+patrón que `reconciliation_cli.py` (Etapa 6.8): construye su propio
+`PaperTradingContext`, nunca llama `repair()`, nunca conecta Binance.
+`inspection_scheduler.py` es un proceso completamente independiente de
+`main.py`: no importa `run_full_cycle`, `BinanceExchangeClient`,
+`SignalEngine`/`SignalService`, ni ningún módulo de `src.ai`/
+`src.dashboard`. Implementa su propio loop simple (`InspectionScheduler`,
+con `sleep_fn`/`max_cycles` inyectables para pruebas deterministas, sin
+depender de la librería `schedule` -- ya usada por `main.py`, mantenida
+fuera de este módulo para no acoplar ambos schedulers), en vez de
+reutilizar `schedule.every(...)` de `main.py`, precisamente para poder
+probarlo sin esperas reales (Paso 41) y para no tocar el scheduler
+principal (Paso 28, "no modificar el scheduler principal salvo
+necesidad estricta" -- no hizo falta ninguna).
+
+### 23.16 Excepciones nuevas
+
+`InspectionError` (base), `InspectionPersistenceError`,
+`InspectionComparisonError`, `AlertDeliveryError`,
+`InspectionAlreadyRunningError` -- no heredan de
+`PaperTradingDomainError` ni de `ReconciliationError` (Etapa 6.8): son
+un subsistema propio, análogo en independencia al de reconciliación.
+
+### 23.17 Aislamiento y prohibición de reparación automática
+
+Ningún componente de esta etapa (`InspectionComparator`, `AlertBuilder`,
+`InspectionService`, `AlertDeliveryService`, `InspectionJob`,
+`InspectionScheduler`) importa `ReconciliationService.repair`,
+`PaperTradingService`, `RiskEngine`/`FillEngine`/`PositionEngine`,
+Binance, `requests`, Streamlit/Dashboard, ni `src.signals`/`src.ai`. La
+única forma de reparar sigue siendo la CLI manual de la Etapa 6.8. La
+inspección automatizada de esta etapa **detecta y alerta**, nunca
+corrige.
+
+### 23.18 Notas de implementación (clarificaciones surgidas al programar)
+
+- **`LoggingInspectionAlertSink`/`NullInspectionAlertSink` reciben un
+  `Clock` inyectado** (no estaba explícito en el diseño original de
+  §23.9): `AlertDeliveryResult.delivered_at` es responsabilidad del
+  propio sink, y el Paso 4 (principio 14) exige que ningún módulo fuera
+  de `runtime.py` llame `datetime.now()` directamente -- un `Clock`
+  inyectado (con `SystemClock()` como valor por defecto) es la única
+  forma de cumplir ambas cosas a la vez.
+- **`AlertDeliveryBatchResult`** (`delivered_count`, `failed_count`) es
+  un `NamedTuple` nuevo, no listado explícitamente en el enunciado:
+  necesario como valor de retorno de
+  `AlertDeliveryService.deliver_pending_alerts()`, mismo criterio que
+  `SubmitOrderResult`/`ReconciliationRepairResult` en etapas anteriores.
+- **`deserialize_reconciliation_report()`** (inverso de la función ya
+  existente desde la Etapa 6.8) se agregó a `serialization.py` aunque no
+  aparecía en la lista literal del Paso 14: es la única forma de
+  "reconstruir el reporte anterior" que el Paso 15 exige explícitamente.
+- **`ReconciliationInspectionConfig`** vive en `src/utils/config.py`
+  (no en `src/paper_trading/`), como un campo con `default_factory`
+  dentro de `PaperTradingConfig` -- así una `config.yaml` sin el bloque
+  (toda config de la Etapa 6.0-6.8) sigue funcionando exactamente igual,
+  sin ningún cambio de comportamiento.
+- **`PaperTradingApplication`/`PaperTradingContext` ganan un tercer
+  parámetro/campo opcional** (`inspection_service`/`alert_delivery_service`
+  en Application; `inspection_service`/`alert_delivery_service`/
+  `inspection_job` en `PaperTradingContext`), con el mismo patrón de
+  default-si-no-se-inyecta ya usado por `reconciliation_service` en la
+  Etapa 6.8 -- no rompe ningún consumidor existente que construya estas
+  clases directamente (solo `composition.py` las instancia en el
+  proyecto real).

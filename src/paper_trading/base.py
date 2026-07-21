@@ -16,10 +16,13 @@ que esta interfaz no conoce ni importa.
 """
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
+from src.paper_trading.alert_models import AlertStatus, InspectionAlert
 from src.paper_trading.enums import OrderStatus
+from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.models import (
     CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
 )
@@ -211,3 +214,48 @@ class PaperTradingRepository(ABC):
         """Persiste atómicamente (todo o nada) los CashBalance/Position ya
         recalculados por una reparación real, junto con su fila de
         auditoría. Nunca toca Order/Execution/Trade/snapshots (§22.8)."""
+
+    # --- Automatización de inspecciones (Etapa 6.9, ver ARQUITECTURA_PAPER_TRADING.md §23) --
+
+    @abstractmethod
+    def get_latest_successful_inspection_run(self) -> Optional[ScheduledInspectionRun]:
+        """La corrida exitosa (success=True) más reciente, o None si nunca
+        hubo una. Fuente del "reporte anterior" para comparar (§23.10)."""
+
+    @abstractmethod
+    def get_latest_inspection_run(self) -> Optional[ScheduledInspectionRun]:
+        """La corrida más reciente sin importar su resultado, o None si
+        nunca hubo ninguna. Se usa para detectar si la corrida anterior
+        falló (y así decidir si emitir SYSTEM_RECOVERED, §23.11) --
+        distinto de get_latest_successful_inspection_run()."""
+
+    @abstractmethod
+    def fetch_inspection_runs(self, limit: Optional[int] = None) -> list[ScheduledInspectionRun]:
+        """Historial de corridas, más recientes primero."""
+
+    @abstractmethod
+    def fetch_pending_inspection_alerts(self, limit: Optional[int] = None) -> list[InspectionAlert]:
+        """Alertas en estado PENDING, más antiguas primero (para entregarlas en orden)."""
+
+    @abstractmethod
+    def get_inspection_alert_by_deduplication_key(self, deduplication_key: str) -> Optional[InspectionAlert]:
+        """La alerta con esa deduplication_key, o None si nunca se creó una."""
+
+    @abstractmethod
+    def save_inspection_run_transaction(
+        self, run: ScheduledInspectionRun, alerts: list[InspectionAlert],
+    ) -> None:
+        """Persiste atómicamente (todo o nada) una corrida de inspección y
+        todas sus alertas nuevas. Nunca toca Order/Execution/Trade/
+        CashBalance/Position (§23.8)."""
+
+    @abstractmethod
+    def update_inspection_alert_delivery(
+        self,
+        alert_id: str,
+        status: AlertStatus,
+        delivery_attempts: int,
+        last_error: Optional[str],
+        delivered_at: Optional[datetime],
+    ) -> None:
+        """Actualiza el estado de entrega de una alerta ya persistida (§23.9)."""

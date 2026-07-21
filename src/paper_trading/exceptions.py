@@ -21,6 +21,13 @@ reconciliación, no al dominio de trading: deliberadamente NO heredan de
 `PaperTradingDomainError` (no son un rechazo de riesgo ni un estado
 imposible del ciclo de una Order) y no se mezclan con las excepciones
 de arriba.
+
+Las 5 excepciones agregadas en la Etapa 6.9 (ver
+docs/ARQUITECTURA_PAPER_TRADING.md §23.16) pertenecen al subsistema de
+automatización de inspecciones: tampoco heredan de
+`PaperTradingDomainError` ni de `ReconciliationError` -- son un
+subsistema propio, tan independiente del dominio de trading como el de
+reconciliación.
 """
 
 
@@ -112,4 +119,41 @@ class ReconciliationAuditError(ReconciliationError):
     fallo de la transacción de reparación en sí para que quien llame
     pueda diferenciar "no se reparó nada" de "se reparó pero no quedó
     auditado".
+    """
+
+
+class InspectionError(Exception):
+    """Error base del subsistema de automatización de inspecciones
+    (Etapa 6.9, ver §23.16).
+    """
+
+
+class InspectionPersistenceError(InspectionError):
+    """Falló la persistencia de una corrida de inspección (y también
+    falló el intento de registrar esa falla) -- mismo patrón que
+    `ReconciliationAuditError` (§22.9/§23.11).
+    """
+
+
+class InspectionComparisonError(InspectionError):
+    """`compare_reports()` recibió entradas estructuralmente incoherentes
+    (ej. un reporte con issues duplicados por identidad) que impiden
+    producir una comparación determinista.
+    """
+
+
+class AlertDeliveryError(InspectionError):
+    """Falló la entrega de una alerta de forma no controlada por el
+    propio `InspectionAlertSink` (que debe capturar sus propios errores
+    y devolver un `AlertDeliveryResult`) -- señal de un error estructural
+    del sink, no de un fallo de entrega normal.
+    """
+
+
+class InspectionAlreadyRunningError(InspectionError):
+    """Se intentó iniciar una segunda inspección mientras otra seguía en
+    curso en el mismo proceso (§23.12). En la práctica, `InspectionJob`
+    no la lanza -- devuelve `InspectionJobResult(skipped=True)` -- pero
+    queda disponible para quien prefiera fallar ruidosamente en vez de
+    omitir en silencio.
     """
