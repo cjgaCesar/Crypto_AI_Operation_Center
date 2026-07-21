@@ -20,7 +20,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from src.paper_trading.alert_models import AlertStatus, InspectionAlert
+from src.paper_trading.alert_models import AlertStatus, InspectionAlert, InspectionAlertChannelDelivery
 from src.paper_trading.enums import OrderStatus
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.models import (
@@ -259,3 +259,23 @@ class PaperTradingRepository(ABC):
         delivered_at: Optional[datetime],
     ) -> None:
         """Actualiza el estado de entrega de una alerta ya persistida (§23.9)."""
+
+    # --- Idempotencia de entrega por canal (Etapa 6.10.1, ver §25.2) -------
+
+    @abstractmethod
+    def get_alert_channel_delivery(
+        self, alert_id: str, channel_name: str,
+    ) -> Optional[InspectionAlertChannelDelivery]:
+        """El estado de entrega de `alert_id` para `channel_name`, o None si
+        ese canal nunca se intentó para esa alerta."""
+
+    @abstractmethod
+    def fetch_alert_channel_deliveries(self, alert_id: str) -> list[InspectionAlertChannelDelivery]:
+        """Todos los estados de entrega por canal de una alerta, ordenados
+        por nombre de canal (orden determinista)."""
+
+    @abstractmethod
+    def upsert_alert_channel_delivery(self, delivery: InspectionAlertChannelDelivery) -> None:
+        """Crea o actualiza (upsert) el estado de entrega de una alerta para
+        un canal específico. Única operación de escritura: quien llama ya
+        calculó el estado completo deseado (status/intentos/error/timestamp)."""

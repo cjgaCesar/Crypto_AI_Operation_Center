@@ -238,21 +238,26 @@ class TestWorksWithCompositeNotificationChannel:
 
         repo = _repo(tmp_path)
         _seed_alert(repo)
-        composite = CompositeNotificationChannel([NullNotificationChannel()])
+        composite = CompositeNotificationChannel([NullNotificationChannel()], repository=repo, max_attempts=3)
         service = AlertDeliveryService(repo, composite, max_attempts=3)
         result = service.deliver_pending_alerts()
         assert result.delivered_count == 1
         assert repo.get_inspection_alert_by_deduplication_key("key-1").status == AlertStatus.DELIVERED
 
     def test_delivers_via_composite_with_multiple_channels(self, tmp_path):
-        from src.paper_trading.notification_channels import CompositeNotificationChannel, NullNotificationChannel
+        from src.paper_trading.notification_channels import (
+            CompositeNotificationChannel, LoggingNotificationChannel, NullNotificationChannel,
+        )
 
         repo = _repo(tmp_path)
         _seed_alert(repo)
-        composite = CompositeNotificationChannel([NullNotificationChannel(), NullNotificationChannel()])
+        composite = CompositeNotificationChannel(
+            [NullNotificationChannel(), LoggingNotificationChannel()], repository=repo, max_attempts=3,
+        )
         service = AlertDeliveryService(repo, composite, max_attempts=3)
         result = service.deliver_pending_alerts()
         assert result.delivered_count == 1
+        assert repo.fetch_alert_channel_deliveries("alert-1")[0].status == AlertStatus.DELIVERED
 
     def test_composite_with_a_failing_placeholder_channel_keeps_alert_pending(self, tmp_path):
         from src.paper_trading.notification_channels import (
@@ -261,10 +266,45 @@ class TestWorksWithCompositeNotificationChannel:
 
         repo = _repo(tmp_path)
         _seed_alert(repo)
-        composite = CompositeNotificationChannel([NullNotificationChannel(), EmailNotificationChannel()])
+        composite = CompositeNotificationChannel(
+            [NullNotificationChannel(), EmailNotificationChannel()], repository=repo, max_attempts=3,
+        )
         service = AlertDeliveryService(repo, composite, max_attempts=3)
         result = service.deliver_pending_alerts()
         assert result.failed_count == 1
         alert = repo.get_inspection_alert_by_deduplication_key("key-1")
         assert alert.status == AlertStatus.PENDING
-        assert "EmailNotificationChannel" in alert.last_error
+
+    def test_composite_does_not_resend_to_already_delivered_channel_on_retry(self, tmp_path):
+        from src.paper_trading.notification_channels import CompositeNotificationChannel, NullNotificationChannel
+
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+
+        class CountingChannel:
+            def __init__(self):
+                self.calls = 0
+
+            def deliver(self, alert):
+                self.calls += 1
+                return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
+
+        good = CountingChannel()
+        flaky_calls = {"n": 0}
+
+        class FlakyChannel:
+            def deliver(self, alert):
+                flaky_calls["n"] += 1
+                if flaky_calls["n"] < 2:
+                    return AlertDeliveryResult(success=False, error_message="not yet", delivered_at=_now())
+                return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
+
+        composite = CompositeNotificationChannel([good, FlakyChannel()], repository=repo, max_attempts=3)
+        service = AlertDeliveryService(repo, composite, max_attempts=3)
+
+        service.deliver_pending_alerts()
+        service.deliver_pending_alerts()
+
+        assert good.calls == 1  # nunca se reenvía al canal ya exitoso
+        assert flaky_calls["n"] == 2
+        assert repo.get_inspection_alert_by_deduplication_key("key-1").status == AlertStatus.DELIVERED

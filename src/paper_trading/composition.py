@@ -34,6 +34,12 @@ Etapa 6.10: `AlertDeliveryService` se construye con un
 única capa que decide qué canales concretos entran en la lista; ni
 `AlertDeliveryService` ni `CompositeNotificationChannel` conocen esos
 nombres por separado.
+
+Etapa 6.10.1 (§25.3): `_build_notification_channel()` valida, antes de
+construir ningún canal, que ningún placeholder (`email`/`slack`/
+`telegram`/`webhook`) esté habilitado -- si lo está, `build_paper_trading_context()`
+falla de inmediato con `ValueError` y un mensaje que nombra el canal.
+Nunca se llega a instanciar un placeholder ni a intentar una entrega.
 """
 
 import logging
@@ -113,25 +119,46 @@ def seed_initial_cash_balance(
     return cash_balance
 
 
+# Nombre de config -> nombre de clase placeholder, para el mensaje de
+# error de _build_notification_channel() (§25.3). Ninguno de estos 4
+# canales tiene una conexión real todavía.
+_PLACEHOLDER_CHANNEL_NAMES = {
+    "email": "EmailNotificationChannel",
+    "slack": "SlackNotificationChannel",
+    "telegram": "TelegramNotificationChannel",
+    "webhook": "WebhookNotificationChannel",
+}
+
+
 def _build_notification_channel(
-    config: InspectionNotificationsConfig, clock: Clock,
+    config: InspectionNotificationsConfig,
+    repository: PaperTradingRepository,
+    max_attempts: int,
+    clock: Clock,
 ) -> InspectionNotificationChannel:
     """Único lugar que traduce `inspection_notifications` a una lista de
     canales concretos (§24.5). Agregar un canal nuevo en el futuro es
     agregar una entrada más aquí, nunca una rama dentro de
-    AlertDeliveryService/CompositeNotificationChannel."""
+    AlertDeliveryService/CompositeNotificationChannel.
+
+    Etapa 6.10.1 (§25.3): falla de inmediato, antes de construir nada,
+    si algún placeholder está habilitado -- nunca espera a la primera
+    alerta para descubrir que ese canal no está implementado."""
+    enabled_placeholders = [
+        class_name for flag, class_name in _PLACEHOLDER_CHANNEL_NAMES.items() if getattr(config, flag)
+    ]
+    if enabled_placeholders:
+        raise ValueError(
+            "Los siguientes canales de notificación están habilitados en "
+            "paper_trading.inspection_notifications pero todavía no están implementados "
+            f"(§24.10/§25.3): {', '.join(enabled_placeholders)}. Deshabilítalos (false) hasta que "
+            "se implementen en una etapa posterior."
+        )
+
     channels: list[InspectionNotificationChannel] = []
     if config.logging:
         channels.append(LoggingNotificationChannel(clock=clock))
-    if config.email:
-        channels.append(EmailNotificationChannel())
-    if config.slack:
-        channels.append(SlackNotificationChannel())
-    if config.telegram:
-        channels.append(TelegramNotificationChannel())
-    if config.webhook:
-        channels.append(WebhookNotificationChannel())
-    return CompositeNotificationChannel(channels, clock=clock)
+    return CompositeNotificationChannel(channels, repository=repository, max_attempts=max_attempts, clock=clock)
 
 
 def build_paper_trading_context(
@@ -176,8 +203,12 @@ def build_paper_trading_context(
     )
     alert_delivery_service = AlertDeliveryService(
         repository=repository,
-        channel=_build_notification_channel(config.inspection_notifications, clock),
+        channel=_build_notification_channel(
+            config.inspection_notifications, repository,
+            config.reconciliation_inspection.max_alert_delivery_attempts, clock,
+        ),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
+        clock=clock,
     )
     inspection_job = InspectionJob(
         inspection_service=inspection_service, alert_delivery_service=alert_delivery_service,

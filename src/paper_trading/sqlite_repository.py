@@ -50,7 +50,7 @@ import sqlite3
 from decimal import Decimal
 from typing import Optional
 
-from src.paper_trading.alert_models import AlertStatus, InspectionAlert
+from src.paper_trading.alert_models import AlertStatus, InspectionAlert, InspectionAlertChannelDelivery
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.enums import OrderStatus, PositionSide
 from src.paper_trading.inspection_models import ScheduledInspectionRun
@@ -105,6 +105,9 @@ _INSPECTION_RUN_COLUMNS = (
 _INSPECTION_ALERT_COLUMNS = (
     "id", "run_id", "alert_type", "issue_key", "issue_code", "severity", "title", "message",
     "deduplication_key", "status", "delivery_attempts", "last_error", "created_at", "delivered_at",
+)
+_ALERT_CHANNEL_DELIVERY_COLUMNS = (
+    "alert_id", "channel_name", "status", "delivery_attempts", "last_error", "delivered_at", "updated_at",
 )
 _PORTFOLIO_SNAPSHOT_COLUMNS = (
     "id", "timestamp", "cash_balance", "positions_value",
@@ -299,6 +302,21 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
                     created_at TEXT NOT NULL,
                     delivered_at TEXT,
                     FOREIGN KEY(run_id) REFERENCES paper_trading_inspection_runs(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_inspection_alert_channel_deliveries (
+                    alert_id TEXT NOT NULL,
+                    channel_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    delivery_attempts INTEGER NOT NULL,
+                    last_error TEXT,
+                    delivered_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (alert_id, channel_name),
+                    FOREIGN KEY(alert_id) REFERENCES paper_trading_inspection_alerts(id)
                 )
                 """
             )
@@ -1213,3 +1231,67 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
             conn.commit()
         finally:
             conn.close()
+
+    # --- Idempotencia de entrega por canal (Etapa 6.10.1, §25.2) -----------
+
+    @staticmethod
+    def _row_to_alert_channel_delivery(row) -> InspectionAlertChannelDelivery:
+        return InspectionAlertChannelDelivery(
+            alert_id=row[0], channel_name=row[1], status=AlertStatus(row[2]), delivery_attempts=row[3],
+            last_error=row[4], delivered_at=optional_text_to_datetime(row[5]), updated_at=text_to_datetime(row[6]),
+        )
+
+    def get_alert_channel_delivery(
+        self, alert_id: str, channel_name: str,
+    ) -> Optional[InspectionAlertChannelDelivery]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_ALERT_CHANNEL_DELIVERY_COLUMNS)} "
+                "FROM paper_trading_inspection_alert_channel_deliveries WHERE alert_id = ? AND channel_name = ?",
+                (alert_id, channel_name),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._row_to_alert_channel_delivery(row) if row else None
+
+    def fetch_alert_channel_deliveries(self, alert_id: str) -> list[InspectionAlertChannelDelivery]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_ALERT_CHANNEL_DELIVERY_COLUMNS)} "
+                "FROM paper_trading_inspection_alert_channel_deliveries WHERE alert_id = ? "
+                "ORDER BY channel_name ASC",
+                (alert_id,),
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_alert_channel_delivery(row) for row in rows]
+
+    def upsert_alert_channel_delivery(self, delivery: InspectionAlertChannelDelivery) -> None:
+        conn = self._get_connection()
+        try:
+            self._upsert_alert_channel_delivery(conn, delivery)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _upsert_alert_channel_delivery(conn: sqlite3.Connection, delivery: InspectionAlertChannelDelivery) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_inspection_alert_channel_deliveries
+                ({', '.join(_ALERT_CHANNEL_DELIVERY_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_ALERT_CHANNEL_DELIVERY_COLUMNS))})
+            ON CONFLICT(alert_id, channel_name) DO UPDATE SET
+                status=excluded.status, delivery_attempts=excluded.delivery_attempts,
+                last_error=excluded.last_error, delivered_at=excluded.delivered_at, updated_at=excluded.updated_at
+            """,
+            (
+                delivery.alert_id, delivery.channel_name, delivery.status.value, delivery.delivery_attempts,
+                delivery.last_error, optional_datetime_to_text(delivery.delivered_at),
+                datetime_to_text(delivery.updated_at),
+            ),
+        )

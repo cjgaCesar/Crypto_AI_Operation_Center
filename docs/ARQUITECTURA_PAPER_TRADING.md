@@ -2631,3 +2631,95 @@ SMTP real, Slack API real, Telegram API real, webhooks HTTP reales,
 secretos/tokens/credenciales/OAuth para cualquiera de ellos. Los 4
 canales nuevos son placeholders que documentan la forma final de la
 interfaz, no integraciones funcionales.
+
+## 25. Robustez e idempotencia de entrega por canal (Etapa 6.10.1)
+
+Corrección posterior a la auditoría formal de la Etapa 6.10 (veredicto
+"APROBADA CON CORRECCIONES"). Resuelve 3 riesgos confirmados por prueba
+directa durante la auditoría, sin tocar dominio/reconciliación/reservas/
+Dashboard ni implementar ningún canal real.
+
+### 25.1 Corrección 1 -- excepciones directas siempre se persisten
+
+`AlertDeliveryService.deliver_pending_alerts()` ya no depende de que el
+canal capture sus propios errores: envuelve `self._channel.deliver(alert)`
+en su **propio** `try/except`. Si `deliver()` lanza, se construye un
+`AlertDeliveryResult(success=False, error_message=str(exc), ...)`
+sintético con el mismo `Clock` ya inyectado (nuevo parámetro
+`clock: Clock = SystemClock()` en el constructor, con valor por defecto
+para no romper las dos llamadas posicionales existentes) y se procesa
+exactamente igual que cualquier fallo normal: `delivery_attempts` se
+incrementa, `last_error` se guarda, y `status` pasa a `FAILED` al
+alcanzar `max_attempts` -- nunca queda en reintento infinito sin rastro.
+
+### 25.2 Corrección 2 -- idempotencia por canal (`InspectionAlertChannelDelivery`)
+
+Nueva entidad `InspectionAlertChannelDelivery` (alert_id, channel_name,
+status, delivery_attempts, last_error, delivered_at, updated_at;
+reutiliza `AlertStatus` -- PENDING/DELIVERED/FAILED, mismo significado
+que a nivel de alerta), persistida en la tabla nueva
+`paper_trading_inspection_alert_channel_deliveries` (PK compuesta
+`(alert_id, channel_name)`, `FOREIGN KEY(alert_id)`). Tres métodos
+nuevos en `PaperTradingRepository`: `get_alert_channel_delivery`,
+`fetch_alert_channel_deliveries`, `upsert_alert_channel_delivery`
+(upsert único -- crear-si-no-existe y actualizar son la misma
+operación, sin necesidad de una "plataforma" de métodos separados por
+transición de estado).
+
+`CompositeNotificationChannel` deja de ser el único responsable de la
+lógica de reintentos: ahora recibe `repository` y `max_attempts` en su
+constructor y, por cada canal (en el orden determinista de la lista),
+consulta el estado persistido antes de decidir qué hacer:
+
+- `DELIVERED` -> se omite por completo (nunca se vuelve a invocar `deliver()`).
+- `FAILED` (terminal, alcanzó su propio `max_attempts`) -> se omite,
+  pero su error se sigue reportando como parte del fallo agregado.
+- Ausente o `PENDING` -> se invoca `channel.deliver()` (con el mismo
+  `try/except` de la Etapa 6.10, nunca deja propagar una excepción de
+  un placeholder), y el resultado (éxito o fallo, con su propio contador
+  de intentos **por canal**) se persiste vía `upsert_alert_channel_delivery`.
+
+El resultado agregado (`AlertDeliveryResult`) gana un campo nuevo,
+`terminal: bool = False` (compatible hacia atrás, con default): es
+`True` cuando al menos un canal alcanzó su propio `FAILED` terminal en
+esta pasada o en una anterior. `AlertDeliveryService` marca la alerta
+completa como `FAILED` si `attempts >= max_attempts` **o** si
+`result.terminal` es `True` -- así "al menos un canal en estado
+terminal FAILED" fuerza el `FAILED` de la alerta completa sin esperar a
+que el contador de intentos *de la alerta* (distinto del contador *por
+canal*) también se agote. La alerta completa solo llega a `DELIVERED`
+cuando **todos** los canales de la lista están `DELIVERED` (ya sea en
+esta pasada o en una anterior) -- un canal exitoso nunca recibe la
+alerta una segunda vez, sin importar cuántas veces se reintente el
+lote completo. Todo el estado vive en SQLite, nunca en memoria del
+proceso: sobrevive reinicios, nuevas instancias y reconstrucciones de
+la Composition Root.
+
+### 25.3 Corrección 3 -- placeholders bloqueados en el arranque
+
+`build_paper_trading_context()` (vía `_build_notification_channel()`)
+valida, antes de construir ningún canal, que ninguno de
+`email`/`slack`/`telegram`/`webhook` esté en `true` -- si alguno lo
+está, lanza `ValueError` de inmediato, con un mensaje que nombra
+explícitamente cada canal habilitado todavía no implementado. Nunca se
+llega a instanciar el placeholder ni a intentar una entrega. Solo
+`logging` puede valer `true` en esta etapa; los 5 en `false`
+(incluido `logging=false`) es una configuración válida y probada:
+`CompositeNotificationChannel([])` es un no-op exitoso explícito
+(`success=True` sin invocar nada), no un error.
+
+### 25.4 Compatibilidad
+
+- `sink=` (nombre del parámetro anterior a la Etapa 6.10) **no se
+  restaura**: `channel` queda como nombre oficial, decisión explícita
+  documentada aquí (sin uso interno de `sink=` en todo el repositorio,
+  confirmado por auditoría). Se agrega una prueba que fija la firma
+  actual del constructor para detectar cualquier cambio accidental futuro.
+- `LoggingInspectionAlertSink`/`NullInspectionAlertSink` (alias de la
+  Etapa 6.9) se conservan sin ningún cambio; se agregan pruebas
+  explícitas de identidad (`is LoggingNotificationChannel`/
+  `is NullNotificationChannel`).
+- La deduplicación de alertas (`deduplication_key`, Etapa 6.9) no se
+  toca: sigue operando exclusivamente a nivel de creación de la alerta,
+  antes y de forma completamente independiente de esta corrección (que
+  opera después, a nivel de entrega).

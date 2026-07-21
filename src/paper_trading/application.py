@@ -90,7 +90,7 @@ class PaperTradingApplication:
         )
         self._alert_delivery_service = alert_delivery_service or AlertDeliveryService(
             repository=repository, channel=NullNotificationChannel(clock=clock),
-            max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
+            max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts, clock=clock,
         )
 
     def _require_enabled(self, action_description: str) -> None:

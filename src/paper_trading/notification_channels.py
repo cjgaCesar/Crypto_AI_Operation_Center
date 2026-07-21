@@ -1,7 +1,8 @@
 """
-Canales de entrega de alertas de inspección -- patrón Strategy (Etapa 6.10).
+Canales de entrega de alertas de inspección -- patrón Strategy (Etapa 6.10,
+ampliado en 6.10.1 con idempotencia de entrega por canal, §25.2).
 
-Ver docs/ARQUITECTURA_PAPER_TRADING.md §24. `InspectionNotificationChannel`
+Ver docs/ARQUITECTURA_PAPER_TRADING.md §24/§25. `InspectionNotificationChannel`
 es la única abstracción que `AlertDeliveryService` conoce: nunca un
 `if`/`isinstance`/switch por tipo de canal, ni aquí ni allá. Agregar un
 canal real en el futuro (Slack, Email, Telegram, Webhook) significa
@@ -20,14 +21,22 @@ Los 4 canales placeholder (`EmailNotificationChannel`,
 importan `smtplib`, `requests`, `slack_sdk`, `telegram` ni `aiohttp`.
 Simplemente lanzan `NotImplementedError` con un mensaje explícito --
 quedan preparados para una etapa posterior (fuera de alcance de la
-6.10: SMTP, Slack API, Telegram API, webhooks HTTP reales, secretos/
-tokens/OAuth).
+6.10/6.10.1: SMTP, Slack API, Telegram API, webhooks HTTP reales,
+secretos/tokens/OAuth).
+
+Etapa 6.10.1 (§25.2): `CompositeNotificationChannel` deja de llevar la
+lógica de reintentos únicamente en memoria. Ahora recibe `repository` y
+`max_attempts`, y consulta/persiste `InspectionAlertChannelDelivery`
+(alert_id + channel_name) antes y después de invocar cada canal -- un
+canal ya `DELIVERED` nunca se vuelve a invocar, y ese estado sobrevive
+reinicios, nuevas instancias y reconstrucciones de la Composition Root.
 """
 
 import logging
 from typing import Protocol
 
-from src.paper_trading.alert_models import AlertDeliveryResult, InspectionAlert
+from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, InspectionAlert, InspectionAlertChannelDelivery
+from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.runtime import Clock, SystemClock
 
 logger = logging.getLogger(__name__)
@@ -134,44 +143,116 @@ class WebhookNotificationChannel:
 
 
 class CompositeNotificationChannel:
-    """Reparte una entrega entre N canales (patrón Strategy + Composite, §24.4).
+    """Reparte una entrega entre N canales (patrón Strategy + Composite,
+    §24.4), con idempotencia persistente por canal (§25.2, Etapa 6.10.1).
 
-    Cada canal se invoca de forma independiente, envuelto en su propio
-    try/except: un canal que falla (ya sea devolviendo
-    `success=False` o lanzando una excepción, como los placeholders de
-    arriba) se registra vía `logging` y no detiene a los demás. El
-    resultado agregado es éxito solo si TODOS los canales tuvieron
-    éxito -- así una alerta sigue siendo reintentable mientras algún
-    canal real siga fallando, aunque el canal de logging (trivial) no
-    falle nunca.
+    Antes de invocar cada canal, consulta su `InspectionAlertChannelDelivery`
+    ya persistido (`alert_id` + nombre de clase del canal):
+
+    - `DELIVERED` -> se omite por completo, nunca se vuelve a invocar
+      `channel.deliver()` (ni siquiera si otro canal sigue fallando).
+    - `FAILED` (terminal, ese canal ya agotó su propio `max_attempts`) ->
+      se omite también, pero su error se sigue reportando como parte
+      del fallo agregado.
+    - Ausente o `PENDING` -> se invoca `channel.deliver()` (envuelto en
+      su propio try/except: un canal que lanza, como los placeholders,
+      nunca detiene a los demás) y el resultado -- éxito o fallo, con su
+      propio contador de intentos *por canal* -- se persiste de inmediato.
+
+    Todo el estado vive en el repositorio, nunca solo en memoria: una
+    reconstrucción de este objeto (o de toda la Composition Root) no
+    hace que un canal ya exitoso reciba la alerta de nuevo.
+
+    El resultado agregado es éxito (`success=True`) solo si TODOS los
+    canales de la lista terminan `DELIVERED` (en esta pasada o en una
+    anterior). `terminal=True` si al menos un canal alcanzó su propio
+    `FAILED` -- señal para que `AlertDeliveryService` marque la alerta
+    completa como `FAILED` de inmediato, sin esperar a que el contador
+    de intentos *de la alerta* también se agote.
+
+    Limitación conocida: la identidad de un canal es `type(channel).__name__`
+    (ej. "LoggingNotificationChannel"). Esto asume, igual que
+    `_build_notification_channel()` en composition.py (§24.5/§25.3), como
+    máximo una instancia por clase de canal dentro de un mismo Composite
+    -- exactamente el caso real actual (un flag por tipo de canal en
+    `inspection_notifications`). Si en el futuro se necesitaran dos
+    instancias del mismo tipo (ej. dos webhooks a URLs distintas),
+    haría falta una identidad explícita por instancia, no solo por clase.
     """
 
-    def __init__(self, channels: list, clock: Clock = SystemClock()):
+    def __init__(
+        self,
+        channels: list,
+        repository: PaperTradingRepository,
+        max_attempts: int,
+        clock: Clock = SystemClock(),
+    ):
+        if max_attempts < 1:
+            raise ValueError("max_attempts debe ser >= 1.")
         self._channels = list(channels)
+        self._repository = repository
+        self._max_attempts = max_attempts
         self._clock = clock
 
     def deliver(self, alert: InspectionAlert) -> AlertDeliveryResult:
+        if not self._channels:
+            # Configuración explícita sin canales habilitados (§24.3/§25.3):
+            # no-op exitoso, no un error -- no hay nada que pueda fallar.
+            return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
+
         errors: list[str] = []
-        all_succeeded = True
+        all_delivered = True
+        any_terminal_failure = False
 
         for channel in self._channels:
             channel_name = type(channel).__name__
+            existing = self._repository.get_alert_channel_delivery(alert.id, channel_name)
+
+            if existing is not None and existing.status == AlertStatus.DELIVERED:
+                continue  # ya entregado: nunca se reintenta este canal.
+
+            if existing is not None and existing.status == AlertStatus.FAILED:
+                # Terminal: este canal ya agotó su propio max_attempts antes.
+                all_delivered = False
+                any_terminal_failure = True
+                if existing.last_error:
+                    errors.append(f"{channel_name}: {existing.last_error}")
+                continue
+
+            previous_attempts = existing.delivery_attempts if existing is not None else 0
+            now = self._clock.now()
             try:
                 result = channel.deliver(alert)
-                if not result.success:
-                    all_succeeded = False
-                    message = result.error_message or "fallo sin mensaje"
-                    errors.append(f"{channel_name}: {message}")
-                    logger.warning("Canal de notificación %s falló al entregar la alerta %s: %s",
-                                    channel_name, alert.id, message)
             except Exception as exc:
-                all_succeeded = False
-                errors.append(f"{channel_name}: {exc}")
-                logger.warning("Canal de notificación %s lanzó una excepción al entregar la alerta %s: %s",
-                                channel_name, alert.id, exc)
+                result = AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=now)
+
+            if result.success:
+                self._repository.upsert_alert_channel_delivery(InspectionAlertChannelDelivery(
+                    alert_id=alert.id, channel_name=channel_name, status=AlertStatus.DELIVERED,
+                    delivery_attempts=previous_attempts + 1, last_error=None,
+                    delivered_at=result.delivered_at, updated_at=now,
+                ))
+                continue
+
+            attempts = previous_attempts + 1
+            message = result.error_message or "fallo sin mensaje"
+            channel_status = AlertStatus.FAILED if attempts >= self._max_attempts else AlertStatus.PENDING
+            self._repository.upsert_alert_channel_delivery(InspectionAlertChannelDelivery(
+                alert_id=alert.id, channel_name=channel_name, status=channel_status,
+                delivery_attempts=attempts, last_error=message, delivered_at=None, updated_at=now,
+            ))
+            all_delivered = False
+            errors.append(f"{channel_name}: {message}")
+            if channel_status == AlertStatus.FAILED:
+                any_terminal_failure = True
+            logger.warning(
+                "Canal de notificación %s falló al entregar la alerta %s (intento %s/%s): %s",
+                channel_name, alert.id, attempts, self._max_attempts, message,
+            )
 
         return AlertDeliveryResult(
-            success=all_succeeded,
+            success=all_delivered,
             error_message="; ".join(errors) if errors else None,
             delivered_at=self._clock.now(),
+            terminal=any_terminal_failure,
         )

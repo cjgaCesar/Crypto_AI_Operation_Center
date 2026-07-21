@@ -68,11 +68,36 @@ class InspectionAlert:
 
 @dataclass(frozen=True)
 class AlertDeliveryResult:
-    """Resultado de InspectionAlertSink.deliver() (Paso 9)."""
+    """Resultado de InspectionAlertSink.deliver() (Paso 9).
+
+    `terminal` (Etapa 6.10.1, §25.2): `True` cuando el fallo no admite
+    más reintentos aunque el contador de intentos *de la alerta* no
+    esté agotado -- ej. un `CompositeNotificationChannel` con al menos
+    un canal que ya alcanzó su propio `FAILED` terminal. Con default
+    `False` para no romper ninguna construcción existente de
+    `AlertDeliveryResult`."""
 
     success: bool
     error_message: Optional[str]
     delivered_at: datetime
+    terminal: bool = False
+
+
+@dataclass(frozen=True)
+class InspectionAlertChannelDelivery:
+    """Estado de entrega de una InspectionAlert para UN canal específico
+    (Etapa 6.10.1, §25.2): permite que un canal ya exitoso nunca se
+    reintente, incluso si otro canal del mismo Composite sigue fallando.
+    Reutiliza AlertStatus (PENDING/DELIVERED/FAILED) -- mismo
+    significado que a nivel de alerta completa."""
+
+    alert_id: str
+    channel_name: str
+    status: AlertStatus
+    delivery_attempts: int
+    last_error: Optional[str]
+    delivered_at: Optional[datetime]
+    updated_at: datetime
 
 
 def _decimal_or_none(value: Optional[Decimal]) -> Optional[str]:

@@ -555,19 +555,6 @@ class TestNotificationChannelWiring:
         assert len(channel._channels) == 1
         assert isinstance(channel._channels[0], LoggingNotificationChannel)
 
-    def test_disabling_logging_and_enabling_email_wires_only_email(self, tmp_path):
-        from src.utils.config import InspectionNotificationsConfig
-        from src.paper_trading.notification_channels import EmailNotificationChannel
-
-        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(logging=False, email=True))
-        context = build_paper_trading_context(
-            config=config, clock=FixedClock(_now()),
-            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-        )
-        channels = context.alert_delivery_service._channel._channels
-        assert len(channels) == 1
-        assert isinstance(channels[0], EmailNotificationChannel)
-
     def test_all_channels_disabled_produces_empty_composite(self, tmp_path):
         from src.utils.config import InspectionNotificationsConfig
 
@@ -592,3 +579,87 @@ class TestNotificationChannelWiring:
         ):
             assert not any(forbidden in line for line in import_lines)
         assert "isinstance(" not in open(module.__file__, encoding="utf-8").read()
+
+
+class TestPlaceholderChannelsBlockedAtStartup:
+    """Corrección 3 (Etapa 6.10.1, §25.3): habilitar un canal placeholder
+    debe fallar de inmediato al construir la Composition Root, con un
+    mensaje que identifica el canal -- nunca esperar a la primera alerta."""
+
+    def test_email_true_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(email=True))
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "EmailNotificationChannel" in str(exc_info.value)
+
+    def test_slack_true_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(slack=True))
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "SlackNotificationChannel" in str(exc_info.value)
+
+    def test_telegram_true_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(telegram=True))
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "TelegramNotificationChannel" in str(exc_info.value)
+
+    def test_webhook_true_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(webhook=True))
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "WebhookNotificationChannel" in str(exc_info.value)
+
+    def test_message_identifies_multiple_enabled_placeholders(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path, inspection_notifications=InspectionNotificationsConfig(telegram=True, slack=True),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "TelegramNotificationChannel" in str(exc_info.value)
+        assert "SlackNotificationChannel" in str(exc_info.value)
+
+    def test_logging_true_works(self, tmp_path):
+        config = _config(tmp_path)  # default: logging=True, resto False
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_all_channels_disabled_is_explicit_and_does_not_fail(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(logging=False))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context.alert_delivery_service._channel._channels == []
+        result = context.application.deliver_pending_reconciliation_alerts()
+        assert result.failed_count == 0
