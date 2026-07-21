@@ -2498,3 +2498,136 @@ con `deduplication_key` distintas, no requirió ningún cambio de código
 en `alert_builder.py` ni en `InspectionService.run_inspection()` (que ya
 calculaba el total de IDs necesarias sumando el tamaño de cada
 subcategoría, sin asumir exclusión).
+
+## 24. Canales de entrega de alertas (Etapa 6.10 — diseño previo a implementar)
+
+### 24.1 Objetivo
+
+Ampliar únicamente el **mecanismo de entrega** de las alertas ya
+generadas por la Etapa 6.9 (`InspectionAlert`, persistidas en
+`paper_trading_inspection_alerts`) para soportar, en el futuro, múltiples
+canales simultáneos (logging, email, Slack, Telegram, webhooks) sin que
+`AlertDeliveryService` conozca ninguno de ellos por nombre. Esta etapa
+**no** agrega ninguna regla de detección, comparación ni generación de
+alertas (eso ya está cerrado desde la 6.9): es exclusivamente una
+refactorización de la capa de entrega hacia el patrón Strategy, más 4
+canales *placeholder* que todavía no conectan a ningún servicio externo.
+
+### 24.2 Arquitectura de canales (patrón Strategy)
+
+`InspectionNotificationChannel` (`Protocol`, método único
+`deliver(alert) -> AlertDeliveryResult`) es la única abstracción que
+`AlertDeliveryService` conoce -- exactamente el mismo contrato que ya
+tenía `InspectionAlertSink` (Etapa 6.9), solo renombrado y trasladado a
+`notification_channels.py` para dejar claro que es el punto de
+extensión Strategy de esta etapa. Cada canal concreto
+(`LoggingNotificationChannel`, `NullNotificationChannel`,
+`EmailNotificationChannel`, `SlackNotificationChannel`,
+`TelegramNotificationChannel`, `WebhookNotificationChannel`) implementa
+ese único método sin que `AlertDeliveryService` necesite saber cuál es
+cuál -- **nunca** un `if`/`isinstance`/switch por tipo de canal dentro
+de `AlertDeliveryService` ni dentro de `CompositeNotificationChannel`.
+
+### 24.3 Flujo de entrega
+
+`AlertDeliveryService.deliver_pending_alerts()` (sin cambios de lógica,
+solo de tipo declarado) sigue leyendo alertas `PENDING`, llamando a
+`self._channel.deliver(alert)` una vez por alerta, y actualizando el
+estado según el `AlertDeliveryResult` devuelto -- exactamente igual que
+en la Etapa 6.9. La única novedad es que, en producción, `self._channel`
+ya no es un sink individual: es un `CompositeNotificationChannel` que
+internamente reparte esa única llamada `deliver()` entre todos los
+canales habilitados en `config.yaml`.
+
+### 24.4 `CompositeNotificationChannel`
+
+Recibe una colección de canales en el constructor. `deliver(alert)`
+itera esa colección y llama a `channel.deliver(alert)` uno por uno,
+envolviendo cada llamada en su propio `try/except`: si un canal lanza
+una excepción (ej. un placeholder con `NotImplementedError`) o devuelve
+`AlertDeliveryResult(success=False, ...)`, se registra el error (vía
+`logging`) y se continúa con el siguiente canal -- nunca se detiene la
+iteración completa. El resultado agregado es
+`AlertDeliveryResult(success=True, ...)` únicamente si **todos** los
+canales tuvieron éxito (no basta con que uno solo lo tenga): así, si un
+canal real (ej. Slack en una etapa futura) falla mientras logging sigue
+funcionando, la alerta permanece reintentable (`PENDING`/`FAILED` según
+`max_attempts`) en vez de marcarse `DELIVERED` solo porque el canal más
+trivial no falló. `error_message` concatena los errores de los canales
+que fallaron (con el nombre de la clase del canal, para poder
+diagnosticar cuál fue). Si la colección de canales está vacía (todos los
+flags de `inspection_notifications` en `false`), `deliver()` es un no-op
+exitoso -- comportamiento esperado y documentado, no un error: si el
+usuario deshabilitó todos los canales, no hay nada que pueda fallar.
+
+### 24.5 Responsabilidades
+
+- **`AlertDeliveryService`**: lectura de `PENDING`, orquestación de
+  reintentos, actualización de estado -- desconoce por completo qué
+  canales existen.
+- **`CompositeNotificationChannel`**: reparte una entrega entre N
+  canales, aísla los fallos de cada uno, agrega un único resultado.
+- **Cada canal concreto**: sabe entregar (o, por ahora, fallar
+  explícitamente) por su propio medio; no sabe nada de reintentos,
+  persistencia ni de los demás canales.
+- **Composition Root**: única capa que decide, según
+  `config.yaml -> paper_trading.inspection_notifications`, qué canales
+  concretos entran en el `CompositeNotificationChannel`.
+
+### 24.6 Extensibilidad
+
+Agregar un canal real en una etapa futura (ej. Slack) significa
+únicamente: (a) reemplazar el cuerpo de `SlackNotificationChannel.deliver()`
+por la llamada real, sin tocar su firma; (b) no tocar
+`AlertDeliveryService` ni `CompositeNotificationChannel` en absoluto. El
+mecanismo de extensión es agregar una entrada más a la lista que
+`build_paper_trading_context()` pasa al `CompositeNotificationChannel`,
+nunca una rama condicional dentro de la entrega.
+
+### 24.7 Manejo de errores, reintentos e idempotencia
+
+- Cada canal debe capturar sus propios errores estructurales cuando sea
+  posible y devolver `AlertDeliveryResult(success=False, ...)` (mismo
+  contrato ya exigido en la Etapa 6.9); si aun así lanza una excepción
+  (como los 4 placeholders, que lanzan `NotImplementedError` a
+  propósito), `CompositeNotificationChannel` la captura por él.
+- Los reintentos (`max_alert_delivery_attempts`, `DELIVERED` nunca se
+  reenvía, `FAILED` al agotar intentos) siguen siendo responsabilidad
+  exclusiva de `AlertDeliveryService` -- ni el canal individual ni el
+  composite necesitan saber cuántas veces se intentó.
+- Idempotencia: `deliver()` de cualquier canal no debe asumir que se
+  llama una sola vez para una alerta dada (el mismo alert puede
+  reintentarse); los placeholders son deliberadamente puros (lanzan
+  siempre lo mismo, sin efecto secundario ni estado), y
+  `CompositeNotificationChannel` no mantiene estado entre llamadas.
+
+### 24.8 Backward compatibility
+
+`alert_sink.py` (Etapa 6.9) se conserva íntegro: `LoggingInspectionAlertSink`/
+`NullInspectionAlertSink` pasan a ser alias directos
+(`LoggingInspectionAlertSink = LoggingNotificationChannel`) de las
+clases nuevas -- misma implementación, mismo nombre, mismo constructor,
+para que ningún import ni prueba existente de la Etapa 6.9 se rompa.
+`InspectionAlertSink` (el Protocol viejo) se conserva sin cambios;
+`AlertDeliveryService` pasa a tipar contra `InspectionNotificationChannel`
+en su lugar, pero como ambos Protocols son estructuralmente idénticos
+(`deliver(alert) -> AlertDeliveryResult`), cualquier objeto que ya
+cumplía uno cumple el otro automáticamente (duck typing) -- no hace
+falta migrar ningún doble usado en pruebas existentes.
+
+### 24.9 Configuración
+
+Nuevo bloque opcional `paper_trading.inspection_notifications`
+(`logging`/`email`/`slack`/`telegram`/`webhook`, todos `bool`).
+`logging=true` por defecto (preserva exactamente el comportamiento ya
+aprobado en la Etapa 6.9, donde `LoggingInspectionAlertSink` era el
+único canal); los otros 4, `false` por defecto. Una `config.yaml` sin
+este bloque sigue funcionando idéntico a como lo hacía antes de esta
+etapa.
+
+### 24.10 Explícitamente fuera de alcance
+
+SMTP real, Slack API real, Telegram API real, webhooks HTTP reales,
+secretos/tokens/credenciales/OAuth para cualquiera de ellos. Los 4
+canales nuevos son placeholders que documentan la forma final de la
+interfaz, no integraciones funcionales.

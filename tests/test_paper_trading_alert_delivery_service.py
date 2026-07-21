@@ -1,6 +1,7 @@
 """
-Pruebas para AlertDeliveryService (Etapa 6.9): entrega de alertas PENDING
-con reintentos acotados. Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9.
+Pruebas para AlertDeliveryService (Etapa 6.9, ampliado en 6.10 para
+depender de InspectionNotificationChannel): entrega de alertas PENDING
+con reintentos acotados. Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9/§24.
 """
 
 from datetime import datetime, timezone
@@ -225,3 +226,45 @@ class TestConstructorValidation:
         repo = _repo(tmp_path)
         with pytest.raises(ValueError):
             AlertDeliveryService(repo, SucceedingSink(), max_attempts=0)
+
+
+class TestWorksWithCompositeNotificationChannel:
+    """Etapa 6.10: AlertDeliveryService debe funcionar exactamente igual
+    cuando el canal inyectado es un CompositeNotificationChannel -- sin
+    ningún cambio de comportamiento respecto de un sink individual."""
+
+    def test_delivers_via_composite_with_one_channel(self, tmp_path):
+        from src.paper_trading.notification_channels import CompositeNotificationChannel, NullNotificationChannel
+
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+        composite = CompositeNotificationChannel([NullNotificationChannel()])
+        service = AlertDeliveryService(repo, composite, max_attempts=3)
+        result = service.deliver_pending_alerts()
+        assert result.delivered_count == 1
+        assert repo.get_inspection_alert_by_deduplication_key("key-1").status == AlertStatus.DELIVERED
+
+    def test_delivers_via_composite_with_multiple_channels(self, tmp_path):
+        from src.paper_trading.notification_channels import CompositeNotificationChannel, NullNotificationChannel
+
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+        composite = CompositeNotificationChannel([NullNotificationChannel(), NullNotificationChannel()])
+        service = AlertDeliveryService(repo, composite, max_attempts=3)
+        result = service.deliver_pending_alerts()
+        assert result.delivered_count == 1
+
+    def test_composite_with_a_failing_placeholder_channel_keeps_alert_pending(self, tmp_path):
+        from src.paper_trading.notification_channels import (
+            CompositeNotificationChannel, EmailNotificationChannel, NullNotificationChannel,
+        )
+
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+        composite = CompositeNotificationChannel([NullNotificationChannel(), EmailNotificationChannel()])
+        service = AlertDeliveryService(repo, composite, max_attempts=3)
+        result = service.deliver_pending_alerts()
+        assert result.failed_count == 1
+        alert = repo.get_inspection_alert_by_deduplication_key("key-1")
+        assert alert.status == AlertStatus.PENDING
+        assert "EmailNotificationChannel" in alert.last_error

@@ -492,3 +492,56 @@ def test_scheduler_gate_is_independent_field(tmp_path):
     settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
     assert settings.paper_trading.enabled is True
     assert settings.paper_trading.reconciliation_inspection.enabled is False
+
+
+# --- inspection_notifications (Etapa 6.10) ---------------------------------
+
+
+def test_inspection_notifications_defaults_when_block_missing(tmp_path):
+    """Config antigua (sin el bloque, Etapa 6.0-6.9) sigue cargando, con
+    logging=True preservando exactamente el comportamiento previo (§24.9)."""
+    config = _valid_yaml()
+    assert "inspection_notifications" not in config["paper_trading"]
+    config_path = _write_yaml(tmp_path, config)
+
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    notifications = settings.paper_trading.inspection_notifications
+    assert notifications.logging is True
+    assert notifications.email is False
+    assert notifications.slack is False
+    assert notifications.telegram is False
+    assert notifications.webhook is False
+
+
+def test_inspection_notifications_full_block_accepted(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["inspection_notifications"] = {
+        "logging": False, "email": True, "slack": True, "telegram": True, "webhook": True,
+    }
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    notifications = settings.paper_trading.inspection_notifications
+    assert notifications.logging is False
+    assert notifications.email is True
+    assert notifications.slack is True
+    assert notifications.telegram is True
+    assert notifications.webhook is True
+
+
+def test_inspection_notifications_partial_block_uses_defaults_for_missing_fields(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["inspection_notifications"] = {"email": True}
+    config_path = _write_yaml(tmp_path, config)
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+    notifications = settings.paper_trading.inspection_notifications
+    assert notifications.logging is True
+    assert notifications.email is True
+    assert notifications.slack is False
+
+
+def test_inspection_notifications_invalid_type_rejected(tmp_path):
+    config = _valid_yaml()
+    config["paper_trading"]["inspection_notifications"] = {"logging": "yes"}
+    config_path = _write_yaml(tmp_path, config)
+    with pytest.raises(ValueError):
+        load_settings(config_path=config_path, env_path=tmp_path / ".env")

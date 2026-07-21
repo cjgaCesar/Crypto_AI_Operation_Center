@@ -180,3 +180,15 @@ paper_trading:
     max_alert_delivery_attempts: 3
     history_limit: 100
     pending_alert_batch_size: 100
+  # Bloque opcional (Etapa 6.10, ver ARQUITECTURA_PAPER_TRADING.md §24.9):
+  # qué canales usa AlertDeliveryService para entregar alertas de
+  # inspección. logging=true preserva exactamente el comportamiento ya
+  # aprobado en la Etapa 6.9. email/slack/telegram/webhook son
+  # placeholders todavía (lanzan NotImplementedError si se habilitan) --
+  # sin conexión real hasta una etapa posterior.
+  inspection_notifications:
+    logging: true
+    email: false
+    slack: false
+    telegram: false
+    webhook: false

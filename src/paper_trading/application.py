@@ -27,12 +27,12 @@ from decimal import Decimal
 from typing import Optional
 
 from src.paper_trading.alert_delivery_service import AlertDeliveryBatchResult, AlertDeliveryService
-from src.paper_trading.alert_sink import NullInspectionAlertSink
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.inspection_service import InspectionService
 from src.paper_trading.models import Order
+from src.paper_trading.notification_channels import NullNotificationChannel
 from src.paper_trading.price_provider import MarketPriceProvider
 from src.paper_trading.reconciliation_models import IssueCode, ReconciliationReport, ReconciliationRepairResult
 from src.paper_trading.reconciliation_service import ReconciliationService
@@ -89,7 +89,7 @@ class PaperTradingApplication:
             id_generator=id_generator, clock=clock,
         )
         self._alert_delivery_service = alert_delivery_service or AlertDeliveryService(
-            repository=repository, sink=NullInspectionAlertSink(clock=clock),
+            repository=repository, channel=NullNotificationChannel(clock=clock),
             max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
         )
 

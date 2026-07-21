@@ -294,6 +294,25 @@ class ReconciliationInspectionConfig:
 
 
 @dataclass(frozen=True)
+class InspectionNotificationsConfig:
+    """Qué canales de entrega usa AlertDeliveryService (Etapa 6.10, ver
+    docs/ARQUITECTURA_PAPER_TRADING.md §24.9).
+
+    Bloque **opcional** dentro de `paper_trading` en config.yaml: si no
+    existe, `logging=True` preserva exactamente el comportamiento ya
+    aprobado en la Etapa 6.9 (`LoggingInspectionAlertSink` como único
+    canal); los otros 4 son placeholders (§24.10, sin conexión real
+    todavía) y quedan `False` por defecto.
+    """
+
+    logging: bool = True
+    email: bool = False
+    slack: bool = False
+    telegram: bool = False
+    webhook: bool = False
+
+
+@dataclass(frozen=True)
 class PaperTradingConfig:
     """Configuración de Paper Trading (Etapa 6.5).
 
@@ -324,6 +343,9 @@ class PaperTradingConfig:
     rules_version: str
     reconciliation_inspection: ReconciliationInspectionConfig = field(
         default_factory=ReconciliationInspectionConfig
+    )
+    inspection_notifications: InspectionNotificationsConfig = field(
+        default_factory=InspectionNotificationsConfig
     )
 
 
@@ -560,6 +582,9 @@ def _validate_paper_trading_config(pt_cfg: dict) -> None:
     if "reconciliation_inspection" in pt_cfg:
         _validate_reconciliation_inspection_config(pt_cfg["reconciliation_inspection"])
 
+    if "inspection_notifications" in pt_cfg:
+        _validate_inspection_notifications_config(pt_cfg["inspection_notifications"])
+
 
 def _validate_reconciliation_inspection_config(ri_cfg: dict) -> None:
     """Bloque opcional (Etapa 6.9, §23.13): cada campo es opcional
@@ -600,6 +625,28 @@ def _validate_reconciliation_inspection_config(ri_cfg: dict) -> None:
             raise ValueError(
                 "'paper_trading.reconciliation_inspection.pending_alert_batch_size' debe ser un entero >= 1."
             )
+
+
+def _validate_inspection_notifications_config(in_cfg: dict) -> None:
+    """Bloque opcional (Etapa 6.10, §24.9): cada campo es opcional
+    individualmente, pero si está presente debe ser un booleano."""
+    for field_name in ("logging", "email", "slack", "telegram", "webhook"):
+        if field_name in in_cfg and not isinstance(in_cfg[field_name], bool):
+            raise ValueError(
+                f"'paper_trading.inspection_notifications.{field_name}' debe ser verdadero o falso."
+            )
+
+
+def _parse_inspection_notifications_config(pt_cfg: dict) -> InspectionNotificationsConfig:
+    in_cfg = pt_cfg.get("inspection_notifications", {})
+    defaults = InspectionNotificationsConfig()
+    return InspectionNotificationsConfig(
+        logging=in_cfg.get("logging", defaults.logging),
+        email=in_cfg.get("email", defaults.email),
+        slack=in_cfg.get("slack", defaults.slack),
+        telegram=in_cfg.get("telegram", defaults.telegram),
+        webhook=in_cfg.get("webhook", defaults.webhook),
+    )
 
 
 def _parse_reconciliation_inspection_config(pt_cfg: dict) -> ReconciliationInspectionConfig:
@@ -740,5 +787,6 @@ def load_settings(
             max_position_value=Decimal(config["paper_trading"]["max_position_value"]),
             rules_version=config["paper_trading"]["rules_version"],
             reconciliation_inspection=_parse_reconciliation_inspection_config(config["paper_trading"]),
+            inspection_notifications=_parse_inspection_notifications_config(config["paper_trading"]),
         ),
     )

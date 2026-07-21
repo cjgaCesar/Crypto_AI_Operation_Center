@@ -27,6 +27,13 @@ Etapa 6.9: además construye `InspectionService`/`AlertDeliveryService`/
 `inspection_job` en `PaperTradingContext`). Tampoco se ejecuta
 `run_once()`/entrega alguna durante la construcción (§23.14) -- eso
 queda para `inspection_cli.py`/`inspection_scheduler.py`.
+
+Etapa 6.10: `AlertDeliveryService` se construye con un
+`CompositeNotificationChannel` (patrón Strategy, ver §24) armado según
+`config.paper_trading.inspection_notifications` -- esta función es la
+única capa que decide qué canales concretos entran en la lista; ni
+`AlertDeliveryService` ni `CompositeNotificationChannel` conocen esos
+nombres por separado.
 """
 
 import logging
@@ -35,13 +42,17 @@ from datetime import datetime
 from decimal import Decimal
 
 from src.paper_trading.alert_delivery_service import AlertDeliveryService
-from src.paper_trading.alert_sink import LoggingInspectionAlertSink
 from src.paper_trading.application import PaperTradingApplication
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.fill_engine import FillEngine
 from src.paper_trading.inspection_job import InspectionJob
 from src.paper_trading.inspection_service import InspectionService
 from src.paper_trading.models import CashBalance
+from src.paper_trading.notification_channels import (
+    CompositeNotificationChannel, EmailNotificationChannel, InspectionNotificationChannel,
+    LoggingNotificationChannel, SlackNotificationChannel, TelegramNotificationChannel,
+    WebhookNotificationChannel,
+)
 from src.paper_trading.pnl_engine import PnLEngine
 from src.paper_trading.position_engine import PositionEngine
 from src.paper_trading.price_provider import MarketPriceProvider
@@ -52,7 +63,7 @@ from src.paper_trading.risk_engine import RiskEngine
 from src.paper_trading.runtime import Clock, IdGenerator
 from src.paper_trading.service import PaperTradingService
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
-from src.utils.config import PaperTradingConfig
+from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +113,27 @@ def seed_initial_cash_balance(
     return cash_balance
 
 
+def _build_notification_channel(
+    config: InspectionNotificationsConfig, clock: Clock,
+) -> InspectionNotificationChannel:
+    """Único lugar que traduce `inspection_notifications` a una lista de
+    canales concretos (§24.5). Agregar un canal nuevo en el futuro es
+    agregar una entrada más aquí, nunca una rama dentro de
+    AlertDeliveryService/CompositeNotificationChannel."""
+    channels: list[InspectionNotificationChannel] = []
+    if config.logging:
+        channels.append(LoggingNotificationChannel(clock=clock))
+    if config.email:
+        channels.append(EmailNotificationChannel())
+    if config.slack:
+        channels.append(SlackNotificationChannel())
+    if config.telegram:
+        channels.append(TelegramNotificationChannel())
+    if config.webhook:
+        channels.append(WebhookNotificationChannel())
+    return CompositeNotificationChannel(channels, clock=clock)
+
+
 def build_paper_trading_context(
     config: PaperTradingConfig,
     clock: Clock,
@@ -143,7 +175,8 @@ def build_paper_trading_context(
         id_generator=id_generator, clock=clock,
     )
     alert_delivery_service = AlertDeliveryService(
-        repository=repository, sink=LoggingInspectionAlertSink(clock=clock),
+        repository=repository,
+        channel=_build_notification_channel(config.inspection_notifications, clock),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
     )
     inspection_job = InspectionJob(

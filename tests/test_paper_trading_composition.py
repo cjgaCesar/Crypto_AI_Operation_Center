@@ -537,3 +537,58 @@ class TestInspectionSurvivesRestart:
         import src.paper_trading.composition as module
         source = open(module.__file__, encoding="utf-8").read()
         assert "dashboard" not in source.lower()
+
+
+class TestNotificationChannelWiring:
+    """Etapa 6.10: Composition Root arma el CompositeNotificationChannel
+    según config.inspection_notifications; ver docs/ARQUITECTURA_PAPER_TRADING.md §24."""
+
+    def test_default_config_wires_only_logging_channel(self, tmp_path):
+        from src.paper_trading.notification_channels import CompositeNotificationChannel, LoggingNotificationChannel
+
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channel = context.alert_delivery_service._channel
+        assert isinstance(channel, CompositeNotificationChannel)
+        assert len(channel._channels) == 1
+        assert isinstance(channel._channels[0], LoggingNotificationChannel)
+
+    def test_disabling_logging_and_enabling_email_wires_only_email(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+        from src.paper_trading.notification_channels import EmailNotificationChannel
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(logging=False, email=True))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert len(channels) == 1
+        assert isinstance(channels[0], EmailNotificationChannel)
+
+    def test_all_channels_disabled_produces_empty_composite(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig
+
+        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(logging=False))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context.alert_delivery_service._channel._channels == []
+
+    def test_alert_delivery_service_never_imports_notification_channels_by_name(self):
+        """AlertDeliveryService no debe conocer ningún canal concreto por
+        nombre (nunca un if/isinstance por tipo de canal, ver §24.2)."""
+        import src.paper_trading.alert_delivery_service as module
+        import_lines = [
+            line for line in open(module.__file__, encoding="utf-8").read().splitlines()
+            if line.strip().startswith(("import ", "from "))
+        ]
+        for forbidden in (
+            "LoggingNotificationChannel", "EmailNotificationChannel", "SlackNotificationChannel",
+            "TelegramNotificationChannel", "WebhookNotificationChannel", "CompositeNotificationChannel",
+        ):
+            assert not any(forbidden in line for line in import_lines)
+        assert "isinstance(" not in open(module.__file__, encoding="utf-8").read()

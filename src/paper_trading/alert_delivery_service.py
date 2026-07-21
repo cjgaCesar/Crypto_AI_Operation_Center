@@ -1,17 +1,24 @@
 """
-AlertDeliveryService -- entrega de alertas PENDING con reintentos acotados (Etapa 6.9).
+AlertDeliveryService -- entrega de alertas PENDING con reintentos acotados (Etapa 6.9,
+ampliado en 6.10 para depender de InspectionNotificationChannel en vez de un sink concreto).
 
-Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9. No modifica órdenes,
+Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9/§24. No modifica órdenes,
 balances ni posiciones; no llama ReconciliationService/repair(); no
 ejecuta trading. Un fallo de entrega o de actualización de estado de
 una alerta nunca detiene el procesamiento de las demás.
+
+Depende únicamente de `InspectionNotificationChannel` (patrón Strategy,
+§24.2): nunca conoce `LoggingInspectionAlertSink`/`CompositeNotificationChannel`/
+ningún canal concreto por nombre, y nunca contiene un `if`/`isinstance`
+por tipo de canal -- quien decide qué canales existen es la Composition
+Root, no este servicio.
 """
 
 from typing import NamedTuple, Optional
 
 from src.paper_trading.alert_models import AlertStatus
-from src.paper_trading.alert_sink import InspectionAlertSink
 from src.paper_trading.base import PaperTradingRepository
+from src.paper_trading.notification_channels import InspectionNotificationChannel
 
 
 class AlertDeliveryBatchResult(NamedTuple):
@@ -22,19 +29,20 @@ class AlertDeliveryBatchResult(NamedTuple):
 
 
 class AlertDeliveryService:
-    """Lee alertas PENDING, las entrega vía un InspectionAlertSink, y
-    actualiza su estado (DELIVERED/FAILED, respetando max_attempts)."""
+    """Lee alertas PENDING, las entrega vía un InspectionNotificationChannel
+    (típicamente un CompositeNotificationChannel), y actualiza su estado
+    (DELIVERED/FAILED, respetando max_attempts)."""
 
     def __init__(
         self,
         repository: PaperTradingRepository,
-        sink: InspectionAlertSink,
+        channel: InspectionNotificationChannel,
         max_attempts: int,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts debe ser >= 1.")
         self._repository = repository
-        self._sink = sink
+        self._channel = channel
         self._max_attempts = max_attempts
 
     def deliver_pending_alerts(self, limit: Optional[int] = None) -> AlertDeliveryBatchResult:
@@ -44,7 +52,7 @@ class AlertDeliveryService:
 
         for alert in alerts:
             try:
-                result = self._sink.deliver(alert)
+                result = self._channel.deliver(alert)
                 attempts = alert.delivery_attempts + 1
                 if result.success:
                     self._repository.update_inspection_alert_delivery(
