@@ -24,6 +24,7 @@ from src.paper_trading.enums import OrderStatus
 from src.paper_trading.models import (
     CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
 )
+from src.paper_trading.reconciliation_models import ReconciliationAuditRecord
 
 _NOT_IMPLEMENTED_MSG = (
     "PostgresPaperTradingRepository todavía no está implementado. "
@@ -136,4 +137,18 @@ class PostgresPaperTradingRepository(PaperTradingRepository):
         raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
 
     def check_position_pnl_consistency(self, exchange: str, symbol: str) -> bool:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def fetch_cash_balances(self) -> list[CashBalance]:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def save_reconciliation_audit_record(self, audit_record: ReconciliationAuditRecord) -> None:
+        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+    def save_reconciliation_transaction(
+        self,
+        cash_balances: list[CashBalance],
+        positions: list[Position],
+        audit_record: ReconciliationAuditRecord,
+    ) -> None:
         raise NotImplementedError(_NOT_IMPLEMENTED_MSG)

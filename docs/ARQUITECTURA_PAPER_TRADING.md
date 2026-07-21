@@ -1861,3 +1861,307 @@ de `CashBalance` y `reserved_quantity` de `Position` ya se muestran
 desde la Etapa 6.6, que es la información operativa relevante); los
 estados `PENDING` que ahora sí se persisten se muestran igual que
 cualquier otro `OrderStatus`, sin cambios de código.
+
+## 22. Reconciliación y recuperación de estado (Etapa 6.8 — diseño previo a implementar)
+
+Esta etapa no agrega ningún caso de uso operacional nuevo (no crea
+órdenes, no reserva, no llena, no cancela). Agrega un subsistema
+paralelo, de solo diagnóstico por defecto, que **lee** el estado
+persistido de Órdenes/Ejecuciones/Trades/Posiciones/Saldo y produce un
+reporte estructurado de inconsistencias, con una vía explícita
+(nunca automática) para corregir únicamente los agregados de reserva
+(`CashBalance.reserved_balance`/`Position.reserved_quantity`).
+
+### 22.1 Qué significa "reconciliar" aquí
+
+Reconciliar = comparar el estado que **debería** existir (derivado
+determinísticamente de las Órdenes PENDING vigentes) contra el estado
+que **efectivamente** existe (los agregados guardados en `CashBalance`/
+`Position`), más un conjunto de comprobaciones relacionales sobre
+Órdenes/Ejecuciones/Trades que no dependen de ningún agregado. El
+resultado es siempre un `ReconciliationReport` (Paso 5): una lista de
+`ReconciliationIssue` con severidad y código estable.
+
+**Detectar vs. reparar** son dos operaciones completamente separadas,
+en módulos separados:
+
+- **Detectar** (`ReconciliationEngine.analyze`, `ReconciliationService.inspect`)
+  nunca escribe. Recibe colecciones ya cargadas (o las lee el Service
+  desde el repositorio, en modo solo-lectura) y devuelve un reporte.
+  Se puede ejecutar tantas veces como se quiera sin ningún efecto.
+- **Reparar** (`ReconciliationService.repair`) es una acción explícita,
+  separada, que el arranque normal (`build_paper_trading_context()`)
+  **nunca** invoca. Por defecto corre en `dry_run=True` (simula, no
+  escribe). Solo con `dry_run=False` (o `--apply` en la CLI) se
+  persiste algo, y solo para los códigos de issue que están en la lista
+  cerrada de reparaciones permitidas (§22.7).
+
+### 22.2 Fuente de verdad de cada dato
+
+| Dato | Fuente de verdad | Reconciliación puede... |
+|---|---|---|
+| `CashBalance.reserved_balance` | Suma de `reserved_notional + reserved_fee` de las Órdenes BUY `PENDING` vigentes | Recalcular y sobrescribir (repair permitido) |
+| `Position.reserved_quantity` | Suma de `reserved_quantity` de las Órdenes SELL `PENDING` vigentes, por `(exchange, symbol)` | Recalcular y sobrescribir (repair permitido) |
+| `Order.reserved_price/notional/fee/quantity` | `ReservationEngine`, al aceptar (histórico, inmutable una vez escrito) | Solo leer/comparar; nunca reescribir un campo de una `Order` |
+| `Position.realized_pnl_to_date` | `SUM(Trade.net_pnl)` para ese `(exchange, symbol)` (ya es la regla de `check_position_pnl_consistency`, Etapa 6.3) | Solo leer/comparar/reportar; nunca recalcular en esta etapa |
+| Existencia de una `Execution`/`Trade` | Las propias tablas `paper_trading_executions`/`paper_trading_trades` | Solo leer/comparar; nunca crear una fila nueva |
+| `Order.status` | La propia tabla `paper_trading_orders`, escrita únicamente por `PaperTradingService` (Etapas 6.4/6.7) | Solo leer/comparar; **nunca** cambiar un `status` desde reconciliación |
+
+Ningún precio se reconstruye nunca desde el precio de mercado actual:
+todas las comparaciones usan exclusivamente datos ya persistidos
+(`reserved_price`, `reserved_notional`, `Execution.price`, etc.), nunca
+`MarketPriceProvider`. Por eso `ReconciliationEngine`/`ReconciliationService`
+no reciben ni usan un `MarketPriceProvider`.
+
+### 22.3 Tipos de inconsistencia y severidad
+
+Ver Pasos 6-7 del enunciado para el criterio completo. Códigos
+finalmente implementados (`IssueCode`, `str, Enum` — mismo patrón que
+`OrderStatus`/`OrderSide`): 20 códigos, los 17 sugeridos por el
+enunciado más 3 adiciones justificadas:
+
+- `ORPHAN_EXECUTION` -- necesario porque el propio Paso 30 exige un caso
+  de prueba "Execution huérfana" (una `Execution.order_id` que no
+  resuelve a ninguna `Order`, o cuyo `exchange`/`symbol` no coincide con
+  los de la orden que dice llenar) y ningún código de la lista sugerida
+  cubre exactamente ese caso (`EXECUTION_FOR_NON_FILLED_ORDER` asume que
+  la orden sí existe, solo que no está `FILLED`).
+- `FILLED_ORDER_EXECUTION_MISMATCH` -- para "`filled_quantity`/
+  `average_fill_price` de la Order no coinciden con su única Execution"
+  (Paso 12, "filled_quantity debe ser coherente"/"average_fill_price
+  debe ser coherente"); distinto de `FILLED_ORDER_WITHOUT_EXECUTION`
+  (cero Executions) y de `MULTIPLE_EXECUTIONS_FOR_FULL_FILL_ORDER`
+  (más de una).
+- `NO_ACTIVITY` -- único código de severidad `INFO`, para el caso
+  "ausencia total de operaciones" del Paso 7 (ver §22.4 sobre por qué es
+  el único `INFO` que se emite).
+
+Severidad de cada código (siguiendo el criterio del Paso 7 al pie de la
+letra donde el enunciado ya lo fija explícitamente):
+
+| Severidad | Códigos |
+|---|---|
+| `CRITICAL` | `NEGATIVE_AVAILABLE_CASH`, `NEGATIVE_AVAILABLE_QUANTITY`, `PENDING_BUY_RESERVED_CASH_MISMATCH`, `PENDING_SELL_RESERVED_QUANTITY_MISMATCH`, `PENDING_ORDER_INVALID_RESERVED_PRICE`, `ORDER_RESERVATION_SIDE_MISMATCH`, `FILLED_ORDER_WITHOUT_EXECUTION`, `FILLED_ORDER_EXECUTION_MISMATCH`, `EXECUTION_FOR_NON_FILLED_ORDER`, `ORPHAN_EXECUTION`, `TRADE_WITHOUT_EXIT_EXECUTION`, `SELL_FILLED_WITHOUT_TRADE` |
+| `ERROR` | `PENDING_BUY_MISSING_RESERVATION`, `PENDING_SELL_MISSING_RESERVATION`, `ORPHAN_CASH_RESERVATION`, `ORPHAN_POSITION_RESERVATION`, `CASH_RESERVED_BALANCE_MISMATCH`, `POSITION_RESERVED_QUANTITY_MISMATCH`, `TERMINAL_ORDER_HAS_RESERVATION` |
+| `WARNING` | `POSITION_PNL_INCONSISTENT`, `MULTIPLE_EXECUTIONS_FOR_FULL_FILL_ORDER` |
+| `INFO` | `NO_ACTIVITY` |
+
+`ReconciliationReport` agrega un `error_count` además de
+`critical_count`/`warning_count`/`info_count` (el enunciado del Paso 5
+dice "campos mínimos": con 4 severidades declaradas en el Paso 7, faltar
+un contador para `ERROR` habría sido una inconsistencia del propio
+reporte). `is_consistent = (critical_count == 0 and error_count == 0
+and warning_count == 0)` -- `INFO` nunca afecta la consistencia.
+
+### 22.4 Por qué no se emite un `ReconciliationIssue` por cada entidad válida
+
+El Paso 7 lista como ejemplos de `INFO` "estado PENDING válido", "orden
+terminal consistente", "ausencia total de operaciones". Emitir una fila
+`INFO` por cada Orden PENDING válida y cada Orden terminal consistente
+haría el reporte ilegible en una cuenta con miles de órdenes (el propio
+Paso 11 usa Decimal exacto sobre agregados completos, pensado para
+escalar). Se adopta la convención estándar de un reconciliador: **el
+silencio es la confirmación** -- ausencia de cualquier issue con
+severidad `ERROR`/`CRITICAL`/`WARNING` sobre una entidad significa que
+esa entidad es válida. El único `INFO` que se emite es un resumen único,
+a nivel de todo el reporte, cuando no existe ninguna Orden ni Posición
+no-`FLAT` ni saldo reservado en el sistema (`NO_ACTIVITY`) -- exactamente
+el caso "ausencia total de operaciones" del enunciado.
+
+### 22.5 Reglas por categoría (resumen; ver docstrings de
+`reconciliation_engine.py` para el detalle exacto)
+
+- **BUY PENDING** (Paso 9): con los 3 campos de reserva poblados
+  (`reserved_price`/`reserved_notional`/`reserved_fee`), se valida
+  `reserved_notional == quantity * reserved_price` exacto (Decimal). El
+  enunciado señala explícitamente que `reserved_fee` no puede
+  validarse contra `fee_rate` porque `fee_rate` no se persiste por
+  orden y puede haber cambiado desde que se aceptó -- **limitación
+  documentada, no se inventa**: solo se valida que `reserved_fee` sea
+  parte de los campos poblados (su valor exacto no se recalcula).
+- **SELL PENDING** (Paso 10): con los 2 campos de reserva poblados
+  (`reserved_price`/`reserved_quantity`), se valida
+  `reserved_quantity == order.quantity` exacto.
+- **Agregación** (Paso 11): `expected_reserved_cash` (suma de BUY
+  PENDING) vs. `CashBalance.reserved_balance` de la moneda indicada
+  explícitamente a `analyze()` (el dominio solo maneja una cuenta/moneda
+  por vez, igual que `PaperTradingService`); `expected_reserved_quantity`
+  por `(exchange, symbol)` (suma de SELL PENDING) vs.
+  `Position.reserved_quantity` de esa posición. Ambas comparaciones son
+  Decimal exacto, sin tolerancia.
+- **Órdenes terminales** (Paso 12): `TERMINAL_ORDER_HAS_RESERVATION`
+  se acota a `REJECTED` con algún campo de reserva poblado (un rechazo
+  de riesgo nunca llega a `ReservationEngine`, ver `service.py`
+  `accept_market_order` -- si ocurre, es estructuralmente imposible por
+  el flujo correcto). Para `FILLED`/`CANCELLED`, conservar los campos de
+  reserva históricos es **correcto por diseño** (§21.2) y no se reporta
+  como issue; que un `FILLED`/`CANCELLED` no siga "contribuyendo" al
+  agregado ya lo garantiza que la agregación del Paso 11 solo suma
+  Órdenes `PENDING` -- cualquier remanente real en el agregado que no
+  provenga de una `PENDING` vigente aparece igual como
+  `CASH_RESERVED_BALANCE_MISMATCH`/`ORPHAN_CASH_RESERVATION` (o sus
+  equivalentes de cantidad), sin necesitar una comprobación aparte por
+  cada orden terminal.
+- **Executions/Trades** (Paso 13): `FILLED_ORDER_WITHOUT_EXECUTION`
+  (cero), `MULTIPLE_EXECUTIONS_FOR_FULL_FILL_ORDER` (más de una, sin
+  daño financiero inmediato conocido → `WARNING`),
+  `FILLED_ORDER_EXECUTION_MISMATCH` (exactamente una, pero
+  `quantity`/`price` no coinciden con `filled_quantity`/
+  `average_fill_price`), `EXECUTION_FOR_NON_FILLED_ORDER` (existe una
+  Execution para una orden cuyo `status` no es `FILLED`),
+  `ORPHAN_EXECUTION` (el `order_id` no resuelve, o el
+  `exchange`/`symbol` no coincide), `SELL_FILLED_WITHOUT_TRADE` (una
+  SELL `FILLED` sin ningún Trade cuyo `exit_execution_id` apunte a una
+  de sus Executions), `TRADE_WITHOUT_EXIT_EXECUTION` (el
+  `exit_execution_id` no resuelve, o resuelve a una Execution de una
+  orden que no es SELL/FILLED, o con `exchange`/`symbol` distintos).
+  Nunca se crea una Execution/Trade faltante.
+- **PnL** (Paso 14): por posición, `Position.realized_pnl_to_date` vs.
+  `SUM(Trade.net_pnl)` para ese símbolo (misma regla que
+  `check_position_pnl_consistency`, reimplementada localmente porque el
+  motor es puro y no puede llamar al repositorio) → `POSITION_PNL_INCONSISTENT`
+  (`WARNING`, nunca se recalcula `realized_pnl_to_date` en esta etapa).
+
+Comprobaciones estructurales que el propio `Order`/`Position`/
+`CashBalance` de Pydantic ya vuelve imposibles al cargarse desde el
+repositorio (`reserved_quantity` en una BUY, `reserved_balance >
+total_balance`, `available_quantity < 0`, `net_pnl != gross_pnl - fees`,
+`price/fee <= 0`) se conservan igual como comprobaciones defensivas y
+baratas en el motor (`ORDER_RESERVATION_SIDE_MISMATCH`,
+`NEGATIVE_AVAILABLE_CASH`, `NEGATIVE_AVAILABLE_QUANTITY`) -- documentadas
+explícitamente como inalcanzables por el flujo normal (cualquier fila
+corrupta ya falla al reconstruirse en `get_order()`/`get_cash_balance()`/
+etc.), pero mantenidas por si el motor alguna vez recibe modelos
+construidos con `model_construct()` (que salta la validación) desde
+fuera del repositorio real -- las pruebas del motor usan exactamente esa
+vía para poder ejercitarlas.
+
+### 22.6 `ReconciliationService`: dry-run e idempotencia
+
+`inspect(timestamp)` simplemente lee todo el estado vía el repositorio
+(usando `limit=None` en los métodos `fetch_*` ya existentes) e invoca
+`ReconciliationEngine.analyze()`. El único método de lectura nuevo que
+hizo falta agregar a `PaperTradingRepository` (Paso 15) es
+`fetch_cash_balances() -> list[CashBalance]`: el `get_cash_balance(currency)`
+ya existente devuelve una sola moneda, y `analyze()` necesita el
+conjunto completo. `repair(issue_codes, timestamp, dry_run=True)`:
+
+1. Vuelve a llamar `inspect()` (estado fresco, nunca reutiliza un
+   reporte viejo pasado por el llamador -- evita reparar contra datos
+   obsoletos).
+2. Filtra los issues reparables (§22.7) que además están en
+   `issue_codes` (o todos los reparables si `issue_codes` es `None`).
+3. Calcula el `CashBalance`/`Position` corregidos (recomputados desde
+   cero a partir de las Órdenes PENDING vigentes, nunca por
+   incrementos/decrementos aproximados) y normaliza `Decimal("-0")` a
+   `Decimal("0")` exacto.
+4. Si `dry_run=True` (por defecto): no escribe nada.
+   `ReconciliationRepairResult.operations_applied` describe lo que se
+   *haría*; `success=True` si el plan se pudo construir sin error.
+5. Si `dry_run=False`: antes de escribir, vuelve a leer
+   `CashBalance`/`Position` una última vez y compara contra los valores
+   usados al planear (control optimista, Paso 28); si difieren, aborta
+   con `ReconciliationConflictError` sin escribir nada y sin hacer
+   rollback parcial (nunca llegó a abrir la transacción). Si coinciden,
+   ejecuta `save_reconciliation_transaction()` (única, atómica) y
+   registra el resultado en la tabla de auditoría.
+
+Idempotencia (Paso 27): tras una reparación exitosa, `CashBalance.reserved_balance`/
+`Position.reserved_quantity` ya son exactamente la suma correcta de las
+PENDING vigentes; una segunda `inspect()` no encuentra el mismo issue
+(el estado ya es consistente), y una segunda `repair()` sobre el mismo
+código no encuentra nada que reparar (`repaired_issue_codes` vacío,
+`operations_applied` vacío, `success=True` -- no es un error volver a
+pedir una reparación ya aplicada, simplemente no hay nada que hacer).
+
+### 22.7 Reparaciones permitidas y prohibidas
+
+Permitidas (únicas, deterministas, Paso 17):
+
+1. `CASH_RESERVED_BALANCE_MISMATCH`/`ORPHAN_CASH_RESERVATION` →
+   recalcular `CashBalance.reserved_balance` como la suma exacta de
+   `reserved_notional + reserved_fee` de las BUY `PENDING` vigentes.
+2. `POSITION_RESERVED_QUANTITY_MISMATCH`/`ORPHAN_POSITION_RESERVATION`
+   → recalcular `Position.reserved_quantity` como la suma exacta de
+   `reserved_quantity` de las SELL `PENDING` vigentes de ese símbolo.
+
+Todo lo demás (`PENDING_*_MISSING_RESERVATION`,
+`PENDING_ORDER_INVALID_RESERVED_PRICE`, `ORDER_RESERVATION_SIDE_MISMATCH`,
+`TERMINAL_ORDER_HAS_RESERVATION`, cualquier issue de Execution/Trade/PnL,
+`NEGATIVE_AVAILABLE_*`) es **no reparable automáticamente**
+(`repairable=False`): exigiría crear una Execution/Trade, cambiar un
+`OrderStatus`, inventar un precio/fee histórico o reescribir un campo de
+`Order` -- todas explícitamente prohibidas (Paso 17) -- y por tanto
+requiere intervención manual (una migración de datos escrita a mano,
+revisada por el usuario, fuera del alcance de este subsistema).
+
+### 22.8 Atomicidad, rollback y concurrencia
+
+`save_reconciliation_transaction(cash_balances, positions, audit_record)`
+es la única operación de escritura: una única conexión SQLite, upsert de
+cada `CashBalance`/`Position` corregido más un `INSERT` en
+`paper_trading_reconciliation_audit`, un único `commit()`; cualquier
+excepción dispara `rollback()` antes de relanzar. Nunca toca
+`paper_trading_orders`/`_executions`/`_trades`/`_portfolio_snapshots`/
+`_pnl_snapshots`. El control optimista de concurrencia (Paso 28) vive en
+`ReconciliationService.repair()`, no en el repositorio: el repositorio
+solo ofrece la transacción; decidir si los valores siguen vigentes es
+responsabilidad del Service, que ya tiene el reporte fresco.
+
+### 22.9 Auditoría persistente
+
+Tabla nueva `paper_trading_reconciliation_audit` (columnas del Paso 20).
+Se persiste **tanto en dry-run como en reparación real** (`dry_run` es
+una columna, no una condición para omitir el registro): un dry-run que
+detectó problemas pero no aplicó nada también queda auditado. `report_json`/
+`operations_json` usan `serialize_reconciliation_report()`/
+`serialize_repair_operations()` nuevos en `serialization.py`, siguiendo
+las mismas reglas ya vigentes (Decimal como string, datetime ISO8601,
+enum `.value`, `json.dumps(..., sort_keys=True)` para que el JSON sea
+determinista). `id`/`started_at`/`completed_at` siempre inyectados por
+quien llama (`IdGenerator`/`Clock`), nunca generados dentro del
+repositorio.
+
+### 22.10 CLI administrativa
+
+`src/paper_trading/reconciliation_cli.py`, separada del Dashboard (que
+sigue sin ningún botón administrativo) y de `main.py` (que sigue sin
+scheduler ni ejecución automática). `--apply` obligatorio para escribir;
+sin él, `repair` siempre corre en `dry_run=True`. Construye su propio
+`PaperTradingContext` vía `build_paper_trading_context()` (mismo patrón
+que `main.py`), usando `SystemClock`/`UUIDIdGenerator` reales -- nunca
+conecta Binance, nunca importa Streamlit/Dashboard, nunca inicia un
+scheduler.
+
+### 22.11 Arranque normal y Dashboard
+
+`build_paper_trading_context()` construye `ReconciliationEngine`/
+`ReconciliationService` (agregados a `PaperTradingContext` como un campo
+más) pero **nunca** llama `inspect()` ni `repair()` durante la
+construcción -- ver Paso 24. El Dashboard no cambia en esta etapa (se
+prefiere no tocarlo, ver Paso 25): no importa `ReconciliationService`,
+no expone ningún botón de inspección/reparación, sigue siendo
+estrictamente de solo lectura sobre las 7 tablas ya existentes.
+
+### 22.12 Excepciones nuevas
+
+`ReconciliationError` (base), `ReconciliationConflictError` (control
+optimista de concurrencia falló), `UnsupportedRepairError` (se pidió
+reparar un `issue_code` que no está en la lista de reparaciones
+permitidas), `ReconciliationAuditError` (falló la escritura de la fila
+de auditoría). No heredan de `PaperTradingDomainError` (no son un error
+del dominio de trading, son del subsistema de reconciliación) ni se
+mezclan con rechazos de riesgo normales.
+
+### 22.13 Limitaciones documentadas
+
+- `reserved_fee` de una BUY PENDING no se valida contra `fee_rate`
+  actual (§22.5): `fee_rate` no se persiste por orden.
+- `Position.realized_pnl_to_date` nunca se corrige automáticamente en
+  esta etapa (Paso 14): solo se reporta la diferencia.
+- Ninguna Execution/Trade faltante se crea nunca: `SELL_FILLED_WITHOUT_TRADE`/
+  `FILLED_ORDER_WITHOUT_EXECUTION` quedan como diagnóstico permanente
+  hasta una intervención manual explícita, fuera de este subsistema.
+- La automatización de la reconciliación (ejecutarla periódicamente,
+  alertar, o exponerla en el Dashboard de alguna forma read-only) queda
+  pendiente para una etapa futura (6.9+).

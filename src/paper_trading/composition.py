@@ -12,6 +12,15 @@ No mantiene conexiones SQLite abiertas ni usa singletons: cada llamada
 a `build_paper_trading_context()` construye un repositorio nuevo (que,
 como el resto del proyecto, abre una conexión SQLite por operación, ver
 sqlite_repository.py) y un `PaperTradingContext` nuevo.
+
+Etapa 6.8: también construye e inyecta `ReconciliationService` (con
+`ReconciliationEngine` real), agregado a `PaperTradingContext` como
+`reconciliation_service`. Esta función **nunca** llama
+`reconciliation_service.inspect()`/`.repair()` durante la construcción
+(ver docs/ARQUITECTURA_PAPER_TRADING.md §22.11, Paso 24): el arranque
+normal no repara nada, ni siquiera detecta nada -- solo deja el
+servicio listo para que la CLI administrativa (u otro caller explícito)
+lo invoque.
 """
 
 import logging
@@ -26,6 +35,8 @@ from src.paper_trading.models import CashBalance
 from src.paper_trading.pnl_engine import PnLEngine
 from src.paper_trading.position_engine import PositionEngine
 from src.paper_trading.price_provider import MarketPriceProvider
+from src.paper_trading.reconciliation_engine import ReconciliationEngine
+from src.paper_trading.reconciliation_service import ReconciliationService
 from src.paper_trading.reservation_engine import ReservationEngine
 from src.paper_trading.risk_engine import RiskEngine
 from src.paper_trading.runtime import Clock, IdGenerator
@@ -44,6 +55,7 @@ class PaperTradingContext:
     service: PaperTradingService
     application: PaperTradingApplication
     config: PaperTradingConfig
+    reconciliation_service: ReconciliationService
 
 
 def seed_initial_cash_balance(
@@ -111,6 +123,8 @@ def build_paper_trading_context(
         reservation_engine=ReservationEngine,
     )
 
+    reconciliation_service = ReconciliationService(repository=repository, engine=ReconciliationEngine)
+
     application = PaperTradingApplication(
         service=service,
         repository=repository,
@@ -118,8 +132,10 @@ def build_paper_trading_context(
         clock=clock,
         id_generator=id_generator,
         config=config,
+        reconciliation_service=reconciliation_service,
     )
 
     return PaperTradingContext(
         repository=repository, service=service, application=application, config=config,
+        reconciliation_service=reconciliation_service,
     )

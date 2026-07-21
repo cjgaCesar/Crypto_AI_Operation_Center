@@ -366,3 +366,76 @@ class TestReservationSurvivesRestart:
         assert result.order.status == OrderStatus.CANCELLED
         assert result.cash_balance.reserved_balance == D("0")
         assert result.cash_balance.total_balance == D("10000")
+
+
+class TestReconciliationServiceInjection:
+    def test_context_exposes_a_reconciliation_service(self, tmp_path):
+        from src.paper_trading.reconciliation_service import ReconciliationService
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert isinstance(context.reconciliation_service, ReconciliationService)
+
+    def test_service_uses_the_real_reconciliation_engine(self, tmp_path):
+        from src.paper_trading.reconciliation_engine import ReconciliationEngine
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context.reconciliation_service._engine is ReconciliationEngine
+
+    def test_application_exposes_reconciliation_use_cases(self, tmp_path):
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert hasattr(context.application, "inspect_reconciliation")
+        assert hasattr(context.application, "repair_reconciliation")
+
+
+class TestBuildDoesNotRunReconciliation:
+    """Paso 24: build_paper_trading_context() nunca ejecuta inspect()/repair()."""
+
+    def test_build_does_not_inspect_or_repair_on_construction(self, tmp_path, monkeypatch):
+        from src.paper_trading import reconciliation_service as reconciliation_service_module
+
+        calls = []
+        monkeypatch.setattr(
+            reconciliation_service_module.ReconciliationService, "inspect",
+            lambda self, timestamp: calls.append("inspect"),
+        )
+        monkeypatch.setattr(
+            reconciliation_service_module.ReconciliationService, "repair",
+            lambda self, *a, **k: calls.append("repair"),
+        )
+
+        build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert calls == []
+
+    def test_restart_over_inconsistent_data_leaves_it_untouched(self, tmp_path):
+        """Reconstruir la Composition Root sobre datos con reservas
+        inconsistentes no las repara: build_paper_trading_context() no
+        detecta ni corrige nada por sí sola (Paso 24)."""
+        from decimal import Decimal as D
+        from src.paper_trading.models import CashBalance
+
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        corrupted = CashBalance(
+            currency="USDT", total_balance=D("10000"), reserved_balance=D("999"), updated_at=_now(),
+        )
+        context.repository.save_cash_balance(corrupted)
+
+        restarted_context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert restarted_context.repository.get_cash_balance("USDT").reserved_balance == D("999")
+        assert restarted_context.repository.get_cash_balance("USDT").total_balance == D("10000")

@@ -18,6 +18,7 @@ import pytest
 
 from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType, PositionSide, TradeSide
 from src.paper_trading.models import CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade
+from src.paper_trading.reconciliation_models import ReconciliationAuditRecord
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 
 
@@ -105,6 +106,16 @@ def _pnl_snapshot(**overrides) -> PnLSnapshot:
     )
     defaults.update(overrides)
     return PnLSnapshot(**defaults)
+
+
+def _audit_record(**overrides) -> ReconciliationAuditRecord:
+    now = _now()
+    defaults = dict(
+        id="audit-1", started_at=now, completed_at=now, dry_run=True, success=True,
+        issue_count=1, repaired_count=0, report_json="{}", operations_json="[]",
+    )
+    defaults.update(overrides)
+    return ReconciliationAuditRecord(**defaults)
 
 
 # --- INIT --------------------------------------------------------------------
@@ -914,6 +925,148 @@ class TestLimitValidation:
         repo = _repo(tmp_path)
         with pytest.raises(ValueError):
             repo.fetch_orders(limit=-1)
+
+
+# --- RECONCILIACIÓN (Etapa 6.8) --------------------------------------------
+
+class TestFetchCashBalances:
+    def test_empty_when_nothing_saved(self, tmp_path):
+        repo = _repo(tmp_path)
+        assert repo.fetch_cash_balances() == []
+
+    def test_returns_all_currencies_saved(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance(currency="USDT"))
+        repo.save_cash_balance(_cash_balance(currency="BUSD", total_balance=Decimal("500")))
+        balances = repo.fetch_cash_balances()
+        assert {b.currency for b in balances} == {"USDT", "BUSD"}
+
+    def test_decimal_round_trip_exact(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance(total_balance=Decimal("10000.123456789")))
+        balances = repo.fetch_cash_balances()
+        assert balances[0].total_balance == Decimal("10000.123456789")
+
+
+class TestReconciliationAuditRecord:
+    def test_save_and_persist_dry_run_record(self, tmp_path):
+        repo = _repo(tmp_path)
+        record = _audit_record(dry_run=True, success=True, issue_count=2, repaired_count=0)
+        repo.save_reconciliation_audit_record(record)
+
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        try:
+            row = conn.execute(
+                "SELECT id, dry_run, success, issue_count, repaired_count, error_message "
+                "FROM paper_trading_reconciliation_audit WHERE id = ?",
+                ("audit-1",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("audit-1", 1, 1, 2, 0, None)
+
+    def test_save_failure_record_with_error_message(self, tmp_path):
+        repo = _repo(tmp_path)
+        record = _audit_record(id="audit-fail", dry_run=False, success=False, error_message="boom")
+        repo.save_reconciliation_audit_record(record)
+
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        try:
+            row = conn.execute(
+                "SELECT success, error_message FROM paper_trading_reconciliation_audit WHERE id = ?",
+                ("audit-fail",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == (0, "boom")
+
+    def test_audit_table_is_insert_only_duplicate_id_fails(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_reconciliation_audit_record(_audit_record(id="dup"))
+        with pytest.raises(sqlite3.IntegrityError):
+            repo.save_reconciliation_audit_record(_audit_record(id="dup"))
+
+    def test_report_json_and_operations_json_round_trip(self, tmp_path):
+        repo = _repo(tmp_path)
+        record = _audit_record(report_json='{"a": 1}', operations_json='[{"b": 2}]')
+        repo.save_reconciliation_audit_record(record)
+
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        try:
+            row = conn.execute(
+                "SELECT report_json, operations_json FROM paper_trading_reconciliation_audit WHERE id = ?",
+                ("audit-1",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ('{"a": 1}', '[{"b": 2}]')
+
+
+class TestSaveReconciliationTransaction:
+    def test_updates_cash_balances_and_positions_atomically(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance(reserved_balance=Decimal("100")))
+        repo.save_position(_position(reserved_quantity=Decimal("0.05")))
+
+        corrected_cash = CashBalance(**{**_cash_balance().model_dump(), "reserved_balance": Decimal("0")})
+        corrected_position = Position(**{**_position().model_dump(), "reserved_quantity": Decimal("0")})
+        audit_record = _audit_record(id="audit-repair", dry_run=False, repaired_count=2)
+
+        repo.save_reconciliation_transaction(
+            cash_balances=[corrected_cash], positions=[corrected_position], audit_record=audit_record,
+        )
+
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("0")
+        assert repo.get_position("Binance", "BTCUSDT").reserved_quantity == Decimal("0")
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        try:
+            row = conn.execute(
+                "SELECT id FROM paper_trading_reconciliation_audit WHERE id = ?", ("audit-repair",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+
+    def test_never_touches_orders_executions_or_trades(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance())
+        repo.save_order(_order())
+        repo.save_execution(_execution())
+
+        corrected_cash = CashBalance(**{**_cash_balance().model_dump(), "reserved_balance": Decimal("0")})
+        repo.save_reconciliation_transaction(
+            cash_balances=[corrected_cash], positions=[], audit_record=_audit_record(id="audit-x"),
+        )
+
+        assert repo.get_order("order-1") is not None
+        assert repo.fetch_executions_by_order("order-1") != []
+
+    def test_rollback_on_failure_leaves_no_partial_write(self, tmp_path, monkeypatch):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(_cash_balance(reserved_balance=Decimal("100")))
+        corrected_cash = CashBalance(**{**_cash_balance().model_dump(), "reserved_balance": Decimal("0")})
+
+        def _boom(conn, audit_record):
+            raise RuntimeError("simulated audit failure")
+
+        monkeypatch.setattr(SQLitePaperTradingRepository, "_insert_reconciliation_audit", staticmethod(_boom))
+
+        with pytest.raises(RuntimeError):
+            repo.save_reconciliation_transaction(
+                cash_balances=[corrected_cash], positions=[], audit_record=_audit_record(),
+            )
+
+        # El rollback deja reserved_balance sin corregir (no queda a medio aplicar).
+        assert repo.get_cash_balance("USDT").reserved_balance == Decimal("100")
+
+
+class TestReconciliationAuditMigration:
+    def test_init_creates_audit_table_idempotently(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.init()
+        repo.init()
+        repo.save_reconciliation_audit_record(_audit_record())
+        assert repo.fetch_cash_balances() == []  # tabla nueva, sin datos previos
 
 
 # --- AISLAMIENTO ----------------------------------------------------------

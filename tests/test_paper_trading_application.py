@@ -34,7 +34,7 @@ class DeterministicIdGenerator:
     PaperTradingApplication."""
 
     def __init__(self):
-        self._counters = {"order": 0, "exec": 0, "trade": 0}
+        self._counters = {"order": 0, "exec": 0, "trade": 0, "audit": 0}
 
     def _next(self, prefix: str) -> str:
         self._counters[prefix] += 1
@@ -52,6 +52,9 @@ class DeterministicIdGenerator:
 
     def new_trade_id(self) -> str:
         return self._next("trade")
+
+    def new_reconciliation_audit_id(self) -> str:
+        return self._next("audit")
 
 
 class FakePriceProvider:
@@ -544,3 +547,93 @@ class TestReinitializationAfterRestart:
         )
         result = new_application.fill_manual_pending_order(order_id=accept_result.order.id)
         assert result.order.status == OrderStatus.FILLED
+
+
+class TestInspectReconciliation:
+    def test_inspect_on_clean_account_is_consistent(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        report = application.inspect_reconciliation()
+        assert report.is_consistent is True
+
+    def test_inspect_never_queries_prices(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        application.inspect_reconciliation()
+        assert price_provider.queried_symbols == []
+
+    def test_inspect_does_not_require_enabled(self, tmp_path):
+        """Política documentada (§22): reconciliar no es una acción de
+        trading nueva, sigue disponible con enabled=False."""
+        application, repository, price_provider, id_generator = _app(
+            tmp_path, config=_config(enabled=False),
+        )
+        report = application.inspect_reconciliation()
+        assert report is not None
+
+    def test_inspect_uses_injected_clock(self, tmp_path):
+        fixed = datetime(2030, 5, 5, tzinfo=timezone.utc)
+        repository = SQLitePaperTradingRepository(str(tmp_path / "test.db"))
+        repository.init()
+        repository.save_cash_balance(CashBalance(total_balance=Decimal("10000"), updated_at=_now()))
+        application = PaperTradingApplication(
+            service=PaperTradingService(repository=repository), repository=repository,
+            price_provider=FakePriceProvider({}), clock=FixedClock(fixed),
+            id_generator=DeterministicIdGenerator(), config=_config(),
+        )
+        report = application.inspect_reconciliation()
+        assert report.generated_at == fixed
+
+
+class TestRepairReconciliation:
+    def test_dry_run_by_default(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        repository.save_cash_balance(CashBalance(
+            total_balance=Decimal("10000"), reserved_balance=Decimal("999"), updated_at=_now(),
+        ))
+        result = application.repair_reconciliation()
+        assert result.dry_run is True
+        assert repository.get_cash_balance("USDT").reserved_balance == Decimal("999")
+
+    def test_apply_writes_when_dry_run_false(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        repository.save_cash_balance(CashBalance(
+            total_balance=Decimal("10000"), reserved_balance=Decimal("999"), updated_at=_now(),
+        ))
+        result = application.repair_reconciliation(dry_run=False)
+        assert result.dry_run is False
+        assert repository.get_cash_balance("USDT").reserved_balance == Decimal("0")
+
+    def test_uses_id_generator_for_audit(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        application.repair_reconciliation()
+        assert id_generator._counters["audit"] == 1
+
+    def test_does_not_query_prices(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        application.repair_reconciliation()
+        assert price_provider.queried_symbols == []
+
+    def test_does_not_generate_order_execution_or_trade_ids(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        application.repair_reconciliation()
+        assert id_generator._counters["order"] == 0
+        assert id_generator._counters["exec"] == 0
+        assert id_generator._counters["trade"] == 0
+
+    def test_does_not_touch_order_status(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(tmp_path)
+        accept_result = application.accept_manual_market_order(
+            exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, quantity=Decimal("0.1"),
+        )
+        application.repair_reconciliation(dry_run=False)
+        assert repository.get_order(accept_result.order.id).status == OrderStatus.PENDING
+
+    def test_does_not_require_enabled(self, tmp_path):
+        application, repository, price_provider, id_generator = _app(
+            tmp_path, config=_config(enabled=False),
+        )
+        repository.save_cash_balance(CashBalance(
+            total_balance=Decimal("10000"), reserved_balance=Decimal("999"), updated_at=_now(),
+        ))
+        result = application.repair_reconciliation(dry_run=False)
+        assert result.success is True
+        assert repository.get_cash_balance("USDT").reserved_balance == Decimal("0")

@@ -35,21 +35,29 @@ antes de avanzar a la siguiente. No se salta ningún paso.
   Estado Técnico), diseño responsive con selector de vista compartido y
   centralizado. Ver [docs/ALCANCE_ETAPA_5.md](docs/ALCANCE_ETAPA_5.md) y
   [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md).
-- 🛠️ **Etapas 6.0-6.7 (implementación en curso)** — Paper Trading
+- 🛠️ **Etapas 6.0-6.8 (implementación en curso)** — Paper Trading
   (compra/venta simulada, sin dinero real, sin conexión a un exchange
   para operar): dominio (`src/paper_trading/models.py`), motores puros
-  (fill/position/PnL/risk/**reservation**), persistencia SQLite propia
-  (`paper_trading_*`), `PaperTradingService` y una Composition Root con
-  `PaperTradingApplication` para someter una orden manual, más una
-  página de Dashboard **estrictamente de solo lectura** ("Paper
-  Trading": saldo, patrimonio, posiciones, órdenes, trades, gráficos y
-  auditoría de consistencia del PnL, sin ningún botón ni formulario de
-  operación) — todo con pruebas automatizadas. **6.7** introdujo el
-  ciclo de vida explícito de una orden MARKET con reservas reales
-  (`NEW → PENDING con reserva → FILLED/CANCELLED con liberación`), vía
-  `ReservationEngine` (motor puro) y transacciones atómicas nuevas en el
-  repositorio. `config.yaml -> paper_trading.enabled` es `false` por
-  defecto: **ninguna orden se ejecuta automáticamente ni desde el
+  (fill/position/PnL/risk/**reservation**/**reconciliation**), persistencia
+  SQLite propia (`paper_trading_*`), `PaperTradingService` y una
+  Composition Root con `PaperTradingApplication` para someter una orden
+  manual, más una página de Dashboard **estrictamente de solo lectura**
+  ("Paper Trading": saldo, patrimonio, posiciones, órdenes, trades,
+  gráficos y auditoría de consistencia del PnL, sin ningún botón ni
+  formulario de operación) — todo con pruebas automatizadas. **6.7**
+  introdujo el ciclo de vida explícito de una orden MARKET con reservas
+  reales (`NEW → PENDING con reserva → FILLED/CANCELLED con
+  liberación`), vía `ReservationEngine` (motor puro) y transacciones
+  atómicas nuevas en el repositorio. **6.8** agregó un subsistema de
+  reconciliación (`ReconciliationEngine`/`ReconciliationService`) que
+  detecta inconsistencias entre órdenes/reservas/ejecuciones/trades/PnL
+  y permite repararlas solo mediante una acción explícita (nunca
+  automática ni al arrancar): dry-run por defecto, auditoría persistente
+  de cada corrida (`paper_trading_reconciliation_audit`), y una CLI
+  administrativa separada (`python -m src.paper_trading.reconciliation_cli`)
+  -- el Dashboard sigue sin ningún botón de inspección/reparación.
+  `config.yaml -> paper_trading.enabled` es `false` por defecto:
+  **ninguna orden se ejecuta automáticamente ni desde el
   Dashboard** (sin Strategy Engine, sin señales ni IA ejecutando
   órdenes). Ver [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
   [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
@@ -412,7 +420,7 @@ las 5 páginas que lo usan (`layout.render_view_mode_selector()`). Ver
 [docs/ARQUITECTURA_DASHBOARD.md](docs/ARQUITECTURA_DASHBOARD.md) para el
 detalle completo de cada iteración.
 
-🛠️ **Etapas 6.0-6.7 (implementación en curso)**: Paper Trading (compra/
+🛠️ **Etapas 6.0-6.8 (implementación en curso)**: Paper Trading (compra/
 venta simulada, sin dinero real, sin conexión a un exchange para
 operar). 6.0 diseñó la arquitectura (auditada en 6.0.1); desde entonces
 se implementó, con pruebas automatizadas en cada paso: **6.1** dominio
@@ -439,15 +447,31 @@ BUY y `Position.reserved_quantity` en SELL, guardado en 4 campos nuevos
 del propio `Order`) y nuevas transacciones atómicas del repositorio
 (`save_order_acceptance_transaction`/`save_order_cancellation_transaction`);
 `submit_market_order`/`submit_manual_market_order` se conservan como
-fachadas de compatibilidad. **Ninguna orden se ejecuta automáticamente
+fachadas de compatibilidad; **6.8** agregó reconciliación y recuperación
+de estado: `ReconciliationEngine` (motor puro) detecta -- nunca repara
+por sí solo -- inconsistencias entre órdenes PENDING/reservas
+agregadas/ejecuciones/trades/PnL, con 20 códigos estables y 4 niveles de
+severidad; `ReconciliationService.inspect()` es de solo lectura,
+`.repair()` corre en `dry_run=True` por defecto y solo corrige
+`CashBalance.reserved_balance`/`Position.reserved_quantity` (recálculo
+exacto desde las órdenes PENDING vigentes, nunca crea Execution/Trade ni
+cambia un `OrderStatus`), con control optimista de concurrencia y una
+tabla de auditoría inmutable (`paper_trading_reconciliation_audit`) que
+registra tanto los dry-run como las reparaciones reales.
+`build_paper_trading_context()` construye el servicio pero nunca lo
+ejecuta al arrancar; una CLI administrativa nueva y separada
+(`python -m src.paper_trading.reconciliation_cli inspect|repair`,
+`--apply` obligatorio para escribir) es la única forma de invocarlo. El
+Dashboard no cambia (sigue estrictamente de solo lectura, sin ningún
+botón administrativo). **Ninguna orden se ejecuta automáticamente
 todavía**: sin Strategy Engine, sin señales ni IA ejecutando órdenes,
 sin cambios en el Dashboard (sigue de solo lectura). Ver
 [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
 [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
-Pendiente tu auditoría y aprobación formal de la Etapa 6.7 antes de
+Pendiente tu auditoría y aprobación formal de la Etapa 6.8 antes de
 continuar.
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
-de conectar un proveedor de IA real; aprobación de la Etapa 6.7 antes de
+de conectar un proveedor de IA real; aprobación de la Etapa 6.8 antes de
 continuar con Paper Trading (automatización, migración PostgreSQL
 real).

@@ -1,6 +1,7 @@
 """
 PaperTradingApplication -- casos de uso de aplicación para Paper Trading
-(Etapa 6.5, ampliado en 6.7 con el ciclo explícito aceptar/llenar/cancelar).
+(Etapa 6.5, ampliado en 6.7 con el ciclo explícito aceptar/llenar/cancelar
+y en 6.8 con reconciliación administrativa).
 
 No es lógica de negocio (eso vive en los motores, Etapa 6.2, orquestada
 por PaperTradingService, Etapas 6.4/6.7): esta capa solo traduce una
@@ -13,6 +14,12 @@ No calcula riesgo, fees, PnL ni CashBalance; no actualiza `Position`;
 no persiste nada por su cuenta; no abre conexiones sqlite3 (todo el
 acceso a datos pasa por `PaperTradingRepository`/`PaperTradingService`,
 ya inyectados).
+
+`inspect_reconciliation()`/`repair_reconciliation()` (Etapa 6.8) delegan
+a `ReconciliationService`: no calculan ningún hallazgo por sí mismos, no
+consultan `MarketPriceProvider`, no generan `order_id`/`execution_id`/
+`trade_id`, y no llaman a `accept_market_order`/`fill_pending_order`/
+`cancel_pending_order` -- ver docs/ARQUITECTURA_PAPER_TRADING.md §22.
 """
 
 import logging
@@ -23,6 +30,8 @@ from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
 from src.paper_trading.models import Order
 from src.paper_trading.price_provider import MarketPriceProvider
+from src.paper_trading.reconciliation_models import IssueCode, ReconciliationReport, ReconciliationRepairResult
+from src.paper_trading.reconciliation_service import ReconciliationService
 from src.paper_trading.runtime import Clock, IdGenerator
 from src.paper_trading.service import PaperTradingService
 from src.paper_trading.service_results import (
@@ -60,6 +69,7 @@ class PaperTradingApplication:
         clock: Clock,
         id_generator: IdGenerator,
         config: PaperTradingConfig,
+        reconciliation_service: Optional[ReconciliationService] = None,
     ):
         self._service = service
         self._repository = repository
@@ -67,6 +77,7 @@ class PaperTradingApplication:
         self._clock = clock
         self._id_generator = id_generator
         self._config = config
+        self._reconciliation_service = reconciliation_service or ReconciliationService(repository=repository)
 
     def _require_enabled(self, action_description: str) -> None:
         if not self._config.enabled:
@@ -226,6 +237,36 @@ class PaperTradingApplication:
 
         logger.info("Orden manual de Paper Trading cancelada: %s.", order_id)
         return result
+
+    # --- Reconciliación administrativa (Etapa 6.8) -------------------------
+    #
+    # Deliberadamente NO gatea con _require_enabled(): a diferencia de las
+    # órdenes manuales de arriba, inspeccionar/reparar no es una acción de
+    # trading nueva -- es mantenimiento de datos que debe seguir disponible
+    # incluso si `paper_trading.enabled=false` (ej. se deshabilitó
+    # precisamente porque se detectó una inconsistencia que hay que poder
+    # diagnosticar/reparar antes de reactivar). No expuesto desde el
+    # Dashboard (ver §22.11): solo lo usa la CLI administrativa.
+
+    def inspect_reconciliation(self) -> ReconciliationReport:
+        """Diagnóstico de solo lectura: nunca escribe nada (§22.6)."""
+        timestamp = self._clock.now()
+        return self._reconciliation_service.inspect(timestamp)
+
+    def repair_reconciliation(
+        self,
+        issue_codes: Optional[list[IssueCode]] = None,
+        dry_run: bool = True,
+    ) -> ReconciliationRepairResult:
+        """Repara los issues reparables (§22.7); `dry_run=True` por defecto
+        (nunca escribe salvo que se pida explícitamente `dry_run=False`).
+        No consulta precios, no genera Order/Execution/Trade ids, no llama
+        a ningún método del ciclo de vida de órdenes (accept/fill/cancel)."""
+        timestamp = self._clock.now()
+        audit_id = self._id_generator.new_reconciliation_audit_id()
+        return self._reconciliation_service.repair(
+            audit_id=audit_id, timestamp=timestamp, issue_codes=issue_codes, dry_run=dry_run,
+        )
 
     # --- API de compatibilidad (Etapa 6.5) ---------------------------------
 

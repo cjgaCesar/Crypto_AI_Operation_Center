@@ -55,6 +55,7 @@ from src.paper_trading.enums import OrderStatus, PositionSide
 from src.paper_trading.models import (
     CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
 )
+from src.paper_trading.reconciliation_models import ReconciliationAuditRecord
 from src.paper_trading.serialization import (
     datetime_to_text, decimal_to_text, optional_datetime_to_text, optional_decimal_to_text,
     optional_text_to_datetime, optional_text_to_decimal, text_to_datetime, text_to_decimal,
@@ -89,6 +90,10 @@ _POSITION_COLUMNS = (
     "average_entry_price", "realized_pnl_to_date", "opened_at", "updated_at",
 )
 _CASH_BALANCE_COLUMNS = ("currency", "total_balance", "reserved_balance", "updated_at")
+_RECONCILIATION_AUDIT_COLUMNS = (
+    "id", "started_at", "completed_at", "dry_run", "success",
+    "issue_count", "repaired_count", "report_json", "operations_json", "error_message",
+)
 _PORTFOLIO_SNAPSHOT_COLUMNS = (
     "id", "timestamp", "cash_balance", "positions_value",
     "total_equity", "unrealized_pnl_total", "realized_pnl_cumulative",
@@ -225,6 +230,22 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trading_reconciliation_audit (
+                    id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL,
+                    success INTEGER NOT NULL,
+                    issue_count INTEGER NOT NULL,
+                    repaired_count INTEGER NOT NULL,
+                    report_json TEXT NOT NULL,
+                    operations_json TEXT NOT NULL,
+                    error_message TEXT
+                )
+                """
+            )
             self._migrate_missing_columns(conn)
             self._create_indexes(conn)
             conn.commit()
@@ -267,6 +288,10 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_paper_trading_pnl_snapshots_lookup "
             "ON paper_trading_pnl_snapshots(exchange, symbol, timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trading_reconciliation_audit_started_at "
+            "ON paper_trading_reconciliation_audit(started_at)"
         )
 
     @staticmethod
@@ -649,6 +674,17 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
             reserved_balance=text_to_decimal(row[2]), updated_at=text_to_datetime(row[3]),
         )
 
+    def fetch_cash_balances(self) -> list[CashBalance]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {', '.join(_CASH_BALANCE_COLUMNS)} FROM paper_trading_cash_balances ORDER BY currency ASC"
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._row_to_cash_balance(row) for row in rows]
+
     # --- PortfolioSnapshot --------------------------------------------------
 
     def save_portfolio_snapshot(self, snapshot: PortfolioSnapshot) -> None:
@@ -909,3 +945,53 @@ class SQLitePaperTradingRepository(PaperTradingRepository):
             return False
         recalculated = self.calculate_realized_pnl(exchange=exchange, symbol=symbol)
         return position.realized_pnl_to_date == recalculated
+
+    # --- Reconciliación (Etapa 6.8) ----------------------------------------
+
+    def save_reconciliation_audit_record(self, audit_record: ReconciliationAuditRecord) -> None:
+        conn = self._get_connection()
+        try:
+            self._insert_reconciliation_audit(conn, audit_record)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_reconciliation_audit(conn: sqlite3.Connection, audit_record: ReconciliationAuditRecord) -> None:
+        """INSERT simple, sin ON CONFLICT: la tabla de auditoría es
+        histórica e inmutable (§22.9), como paper_trading_executions/_trades."""
+        conn.execute(
+            f"""
+            INSERT INTO paper_trading_reconciliation_audit ({', '.join(_RECONCILIATION_AUDIT_COLUMNS)})
+            VALUES ({', '.join(['?'] * len(_RECONCILIATION_AUDIT_COLUMNS))})
+            """,
+            (
+                audit_record.id, datetime_to_text(audit_record.started_at),
+                datetime_to_text(audit_record.completed_at), int(audit_record.dry_run),
+                int(audit_record.success), audit_record.issue_count, audit_record.repaired_count,
+                audit_record.report_json, audit_record.operations_json, audit_record.error_message,
+            ),
+        )
+
+    def save_reconciliation_transaction(
+        self,
+        cash_balances: list[CashBalance],
+        positions: list[Position],
+        audit_record: ReconciliationAuditRecord,
+    ) -> None:
+        """Persiste atómicamente los CashBalance/Position ya recalculados por
+        una reparación real, junto con su fila de auditoría (§22.8). Nunca
+        toca Order/Execution/Trade/snapshots."""
+        conn = self._get_connection()
+        try:
+            for cash_balance in cash_balances:
+                self._upsert_cash_balance(conn, cash_balance)
+            for position in positions:
+                self._upsert_position(conn, position)
+            self._insert_reconciliation_audit(conn, audit_record)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()

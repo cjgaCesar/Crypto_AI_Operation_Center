@@ -23,6 +23,7 @@ from src.paper_trading.enums import OrderStatus
 from src.paper_trading.models import (
     CashBalance, Execution, Order, PnLSnapshot, PortfolioSnapshot, Position, Trade,
 )
+from src.paper_trading.reconciliation_models import ReconciliationAuditRecord
 
 
 class PaperTradingRepository(ABC):
@@ -108,6 +109,12 @@ class PaperTradingRepository(ABC):
     def get_cash_balance(self, currency: str = "USDT") -> Optional[CashBalance]:
         """Devuelve el saldo actual de esa moneda, o None si nunca se guardó."""
 
+    @abstractmethod
+    def fetch_cash_balances(self) -> list[CashBalance]:
+        """Devuelve todos los saldos guardados, uno por moneda (Etapa 6.8:
+        ReconciliationEngine.analyze() necesita el conjunto completo, no
+        solo el de una moneda)."""
+
     # --- Snapshots ------------------------------------------------------
 
     @abstractmethod
@@ -184,3 +191,23 @@ class PaperTradingRepository(ABC):
         False si no coincide, o si no existe una Position para ese símbolo.
         No modifica nada: solo informa.
         """
+
+    # --- Reconciliación (Etapa 6.8, ver ARQUITECTURA_PAPER_TRADING.md §22) --
+
+    @abstractmethod
+    def save_reconciliation_audit_record(self, audit_record: ReconciliationAuditRecord) -> None:
+        """Inserta una fila inmutable en paper_trading_reconciliation_audit,
+        sin tocar CashBalance/Position. Usado tanto para dry-run (nada más
+        cambia) como para registrar una reparación real que falló antes de
+        poder aplicarse (ver §22.6/§22.9)."""
+
+    @abstractmethod
+    def save_reconciliation_transaction(
+        self,
+        cash_balances: list[CashBalance],
+        positions: list[Position],
+        audit_record: ReconciliationAuditRecord,
+    ) -> None:
+        """Persiste atómicamente (todo o nada) los CashBalance/Position ya
+        recalculados por una reparación real, junto con su fila de
+        auditoría. Nunca toca Order/Execution/Trade/snapshots (§22.8)."""
