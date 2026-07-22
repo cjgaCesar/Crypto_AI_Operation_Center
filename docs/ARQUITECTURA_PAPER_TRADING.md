@@ -2821,9 +2821,10 @@ misma idempotencia por canal, mismo criterio de terminalidad, mismo
 `try/except` alrededor de cada `channel.deliver()`. El único cambio es
 el tipo que recibe y reenvía a cada canal (`NotificationMessage` en vez
 de `InspectionAlert`). El `alert_id` que necesita para sus consultas a
-`get_alert_channel_delivery()`/`upsert_alert_channel_delivery()` ahora
-se obtiene de `message.metadata["alert_id"]` -- `DefaultInspectionNotificationTemplate`
-garantiza esa clave en todo mensaje que produce, precisamente para que
+`get_alert_channel_delivery()`/`upsert_alert_channel_delivery()` se
+obtiene de `message.alert_id` (campo explícito desde la Etapa 6.11.1,
+§26.x -- originalmente vivía en `message.metadata["alert_id"]`, ver
+§26.x para el motivo del cambio), precisamente para que
 `CompositeNotificationChannel` pueda seguir haciendo su trabajo sin
 volver a conocer `InspectionAlert`.
 
@@ -2861,3 +2862,98 @@ alternativa a `DefaultInspectionNotificationTemplate` (se evalúa la
 extensibilidad en §26.6, pero no se implementa ninguna otra plantilla
 en esta etapa); ningún cambio de comportamiento funcional (mismo
 resultado de entrega, mismos estados, misma idempotencia).
+
+### 26.x Validación y robustez del contrato Template (Etapa 6.11.1)
+
+Corrección posterior a la auditoría formal de la Etapa 6.11 (veredicto
+"APROBADA CON CORRECCIONES"). Resuelve 4 riesgos confirmados por
+prueba directa durante la auditoría, sin implementar ningún canal real
+ni tocar Dashboard/Trading Engine/Reconciliation/Signals/AI.
+
+**H1 -- excepciones de `template.render()` sin controlar.** Antes de
+esta corrección, `AlertDeliveryService.deliver_pending_alerts()`
+llamaba a `self._template.render(alert)` **fuera** del `try/except` que
+protegía `channel.deliver()`. Una excepción del template (ej. un
+`KeyError` de `_TITLES_BY_ALERT_TYPE` si se agregara un `AlertType`
+nuevo sin actualizar el mapa) se propagaba sin control, abortando
+`deliver_pending_alerts()` completo -- las demás alertas del lote ni
+siquiera se procesaban. Corrección: `template.render(alert)` y su
+validación (ver H4 más abajo) se movieron dentro del mismo
+`try/except` que ya envolvía `channel.deliver()`. Cualquier excepción
+del template se convierte ahora en un `AlertDeliveryResult(success=False, ...)`
+sintético, exactamente igual que un fallo de canal: `delivery_attempts`
+se incrementa, `last_error` se guarda, el estado pasa a `FAILED` al
+agotar `max_attempts`, ningún canal se invoca, y el resto del lote
+continúa sin interrupción.
+
+**H2 -- `alert_id` sin validar permitía invocar un canal antes de fallar.**
+Antes, `alert_id` vivía únicamente en `metadata["alert_id"]`, un valor
+de tipo `Mapping[str, str]` sin ninguna garantía ni validación. Un
+template que produjera un `alert_id` distinto al de la alerta real
+hacía que `CompositeNotificationChannel` invocara el canal real
+primero (efecto secundario ya ejecutado) y solo después fallara la
+persistencia por violación de `FOREIGN KEY` -- sin que nada quedara
+guardado, el siguiente intento repetía la invocación del canal real.
+Corrección: `alert_id` pasa a ser un campo explícito, obligatorio e
+inmutable de `NotificationMessage` (ya no vive en `metadata`).
+`AlertDeliveryService` valida `message.alert_id == alert.id`
+**antes** de llamar a `channel.deliver()`; si no coincide, se lanza un
+`ValueError` interno ("NotificationMessage.alert_id does not match
+InspectionAlert.id") que el mismo `try/except` de H1 convierte en un
+fallo de entrega controlado -- ningún canal se invoca nunca con un
+`alert_id` incorrecto, y por lo tanto tampoco se llega a violar ninguna
+`FOREIGN KEY`. `CompositeNotificationChannel` deja de depender de
+`metadata["alert_id"]` y usa directamente `message.alert_id`.
+
+**H3 -- mensajes de error poco diagnosticables.** Al ser `alert_id` un
+campo obligatorio de `NotificationMessage` (validado en su propio
+`__post_init__`, ver más abajo), ya no puede faltar silenciosamente:
+un `alert_id` vacío o compuesto solo de espacios lanza
+`ValueError("NotificationMessage.alert_id must be a non-empty string.")`
+al momento de construir el mensaje, con un texto que identifica
+exactamente el campo y la causa -- nunca solo la palabra `"alert_id"`
+como único rastro del error.
+
+**H4 -- un template podía devolver `None` o un tipo incorrecto.**
+`AlertDeliveryService` valida ahora `isinstance(message, NotificationMessage)`
+inmediatamente después de `template.render(alert)`, antes de invocar
+cualquier canal. Si el resultado no es una instancia de
+`NotificationMessage` (`None`, un `str`, un `int`, etc.), se lanza un
+`TypeError` interno ("InspectionNotificationTemplate.render() must
+return NotificationMessage"), capturado por el mismo `try/except` de
+H1: fallo controlado, sin invocar ningún canal, con el mismo
+tratamiento de reintentos/`FAILED` que cualquier otro fallo de
+entrega. Esta validación es una verificación del **contrato de la
+plantilla**, no una rama por tipo de canal -- no reintroduce el patrón
+`if`/`isinstance` por canal concreto que `AlertDeliveryService` tiene
+prohibido (§24.2); una prueba dedicada (`test_paper_trading_composition.py`)
+confirma que la única aparición de `isinstance(` en el archivo es
+exactamente esa validación.
+
+**`NotificationMessage.alert_id`**: campo `str` explícito, validado en
+`__post_init__` (no vacío, no compuesto solo de espacios, debe ser
+`str`), inmutable igual que el resto de los campos (dataclass frozen).
+Ya no se duplica dentro de `metadata` -- `metadata` conserva únicamente
+`alert_type`/`run_id` (información adicional no crítica para la
+idempotencia). No se usa `assert` en ninguna de estas validaciones
+(se desactivaría con `python -O`): todas usan `ValueError`/`TypeError`
+explícitos.
+
+**Por qué el canal nunca se invoca con un mensaje inválido**: las tres
+validaciones (excepción de template, tipo incorrecto, `alert_id`
+no coincidente) ocurren estrictamente antes de la línea
+`self._channel.deliver(message)` dentro del mismo bloque `try`; si
+cualquiera de ellas falla, el flujo salta directo al `except` sin
+llegar jamás a invocar `deliver()`. Esto es lo que garantiza que, para
+canales reales futuros, ningún efecto secundario externo (envío real a
+Telegram/Slack/Email/un webhook) pueda ocurrir a partir de un mensaje
+mal formado.
+
+**Continuidad del lote e idempotencia**: ninguno de estos cambios
+afecta la iteración `for alert in alerts:` de `deliver_pending_alerts()`
+-- un fallo (de cualquiera de los 3 tipos) en una alerta nunca detiene
+el procesamiento de las siguientes. La idempotencia por canal
+(§25.2/§26.4) tampoco cambia: `CompositeNotificationChannel` sigue
+usando `(alert_id, channel_name)` como clave compuesta, solo cambia de
+dónde lee `alert_id` (`message.alert_id` en vez de
+`message.metadata["alert_id"]`).

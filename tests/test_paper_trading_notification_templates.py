@@ -1,8 +1,9 @@
 """
-Pruebas para src/paper_trading/notification_templates.py (Etapa 6.11):
-NotificationMessage (inmutable, agnóstico a cualquier canal) y
-DefaultInspectionNotificationTemplate (renderiza los 7 AlertType
-actuales). Ver docs/ARQUITECTURA_PAPER_TRADING.md §26.
+Pruebas para src/paper_trading/notification_templates.py (Etapa 6.11,
+endurecida en 6.11.1 -- §26.x): NotificationMessage (inmutable,
+agnóstico a cualquier canal, con `alert_id` como campo explícito y
+obligatorio) y DefaultInspectionNotificationTemplate (renderiza los 7
+AlertType actuales). Ver docs/ARQUITECTURA_PAPER_TRADING.md §26.
 """
 
 import dataclasses
@@ -36,44 +37,74 @@ def _alert(**overrides) -> InspectionAlert:
     return InspectionAlert(**defaults)
 
 
+class TestNotificationMessageAlertId:
+    """Etapa 6.11.1 (§26.x): alert_id es un campo explícito, obligatorio
+    e inmutable de NotificationMessage -- no vive dentro de metadata."""
+
+    def test_valid_alert_id_works(self):
+        message = NotificationMessage(alert_id="alert-1", title="T", body="B", severity=None)
+        assert message.alert_id == "alert-1"
+
+    @pytest.mark.parametrize("bad_alert_id", ["", "   "])
+    def test_empty_or_blank_alert_id_raises_value_error(self, bad_alert_id):
+        with pytest.raises(ValueError):
+            NotificationMessage(alert_id=bad_alert_id, title="T", body="B", severity=None)
+
+    @pytest.mark.parametrize("bad_alert_id", [None, 123])
+    def test_non_string_alert_id_raises_value_error(self, bad_alert_id):
+        with pytest.raises(ValueError):
+            NotificationMessage(alert_id=bad_alert_id, title="T", body="B", severity=None)
+
+    def test_alert_id_cannot_be_reassigned(self):
+        message = NotificationMessage(alert_id="alert-1", title="T", body="B", severity=None)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            message.alert_id = "other"
+
+
 class TestNotificationMessageImmutability:
     def test_cannot_reassign_a_field(self):
-        message = NotificationMessage(title="t", body="b", severity=None, metadata={})
+        message = NotificationMessage(alert_id="a1", title="t", body="b", severity=None, metadata={})
         with pytest.raises(dataclasses.FrozenInstanceError):
             message.title = "other"
 
     def test_metadata_dict_cannot_be_mutated(self):
-        message = NotificationMessage(title="t", body="b", severity=None, metadata={"alert_id": "a1"})
+        message = NotificationMessage(alert_id="a1", title="t", body="b", severity=None, metadata={"run_id": "r1"})
         with pytest.raises(TypeError):
-            message.metadata["alert_id"] = "other"
+            message.metadata["run_id"] = "other"
 
     def test_mutating_the_source_dict_after_construction_does_not_affect_the_message(self):
-        source = {"alert_id": "a1"}
-        message = NotificationMessage(title="t", body="b", severity=None, metadata=source)
-        source["alert_id"] = "mutated"
-        assert message.metadata["alert_id"] == "a1"
+        source = {"run_id": "r1"}
+        message = NotificationMessage(alert_id="a1", title="t", body="b", severity=None, metadata=source)
+        source["run_id"] = "mutated"
+        assert message.metadata["run_id"] == "r1"
 
     def test_metadata_defaults_to_empty(self):
-        message = NotificationMessage(title="t", body="b", severity=None)
+        message = NotificationMessage(alert_id="a1", title="t", body="b", severity=None)
         assert dict(message.metadata) == {}
 
 
 class TestNotificationMessageEquality:
     def test_equal_when_all_fields_match(self):
-        m1 = NotificationMessage(title="t", body="b", severity=IssueSeverity.WARNING, metadata={"alert_id": "a1"})
-        m2 = NotificationMessage(title="t", body="b", severity=IssueSeverity.WARNING, metadata={"alert_id": "a1"})
+        m1 = NotificationMessage(alert_id="a1", title="t", body="b", severity=IssueSeverity.WARNING, metadata={"run_id": "r1"})
+        m2 = NotificationMessage(alert_id="a1", title="t", body="b", severity=IssueSeverity.WARNING, metadata={"run_id": "r1"})
         assert m1 == m2
 
     def test_not_equal_when_a_field_differs(self):
-        m1 = NotificationMessage(title="t", body="b", severity=None, metadata={})
-        m2 = NotificationMessage(title="t", body="different", severity=None, metadata={})
+        m1 = NotificationMessage(alert_id="a1", title="t", body="b", severity=None, metadata={})
+        m2 = NotificationMessage(alert_id="a1", title="t", body="different", severity=None, metadata={})
+        assert m1 != m2
+
+    def test_not_equal_when_alert_id_differs(self):
+        m1 = NotificationMessage(alert_id="a1", title="t", body="b", severity=None, metadata={})
+        m2 = NotificationMessage(alert_id="a2", title="t", body="b", severity=None, metadata={})
         assert m1 != m2
 
 
 class TestNotificationMessageRepresentation:
     def test_repr_includes_all_fields(self):
-        message = NotificationMessage(title="titulo", body="cuerpo", severity=IssueSeverity.ERROR, metadata={"k": "v"})
+        message = NotificationMessage(alert_id="a1", title="titulo", body="cuerpo", severity=IssueSeverity.ERROR, metadata={"k": "v"})
         text = repr(message)
+        assert "a1" in text
         assert "titulo" in text
         assert "cuerpo" in text
         assert "ERROR" in text
@@ -149,12 +180,22 @@ class TestDefaultTemplateSeverityAndMetadata:
         message = DefaultInspectionNotificationTemplate().render(alert)
         assert message.severity is None
 
-    def test_metadata_includes_alert_id_run_id_and_alert_type(self):
+    def test_alert_id_matches_the_alert_exactly(self):
+        alert = _alert(id="alert-42")
+        message = DefaultInspectionNotificationTemplate().render(alert)
+        assert message.alert_id == "alert-42"
+        assert message.alert_id == alert.id
+
+    def test_metadata_includes_run_id_and_alert_type(self):
         alert = _alert(id="alert-42", run_id="run-7", alert_type=AlertType.VALUE_CHANGED)
         message = DefaultInspectionNotificationTemplate().render(alert)
-        assert message.metadata["alert_id"] == "alert-42"
         assert message.metadata["run_id"] == "run-7"
         assert message.metadata["alert_type"] == "VALUE_CHANGED"
+
+    def test_metadata_no_longer_needs_to_contain_alert_id(self):
+        alert = _alert(id="alert-42")
+        message = DefaultInspectionNotificationTemplate().render(alert)
+        assert "alert_id" not in message.metadata
 
 
 class TestDefaultTemplateWorksForAllAlertTypes:

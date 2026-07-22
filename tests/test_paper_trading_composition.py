@@ -567,18 +567,33 @@ class TestNotificationChannelWiring:
 
     def test_alert_delivery_service_never_imports_notification_channels_by_name(self):
         """AlertDeliveryService no debe conocer ningún canal concreto por
-        nombre (nunca un if/isinstance por tipo de canal, ver §24.2)."""
+        nombre (nunca un if/isinstance por TIPO DE CANAL, ver §24.2).
+
+        Etapa 6.11.1 (§26.x): el servicio ahora valida
+        `isinstance(message, NotificationMessage)` -- una validación del
+        contrato de la plantilla, no una rama por tipo de canal. Esa
+        única forma de `isinstance(...)` es la excepción explícitamente
+        permitida; ninguna otra puede aparecer, y ninguna puede mencionar
+        un canal concreto."""
+        import re
+
         import src.paper_trading.alert_delivery_service as module
+        source = open(module.__file__, encoding="utf-8").read()
         import_lines = [
-            line for line in open(module.__file__, encoding="utf-8").read().splitlines()
-            if line.strip().startswith(("import ", "from "))
+            line for line in source.splitlines() if line.strip().startswith(("import ", "from "))
         ]
-        for forbidden in (
+        forbidden_channel_names = (
             "LoggingNotificationChannel", "EmailNotificationChannel", "SlackNotificationChannel",
             "TelegramNotificationChannel", "WebhookNotificationChannel", "CompositeNotificationChannel",
-        ):
+        )
+        for forbidden in forbidden_channel_names:
             assert not any(forbidden in line for line in import_lines)
-        assert "isinstance(" not in open(module.__file__, encoding="utf-8").read()
+
+        isinstance_calls = re.findall(r"isinstance\(([^)]*)\)", source)
+        assert isinstance_calls == ["message, NotificationMessage"]
+        for call in isinstance_calls:
+            for forbidden in forbidden_channel_names:
+                assert forbidden not in call
 
 
 class TestPlaceholderChannelsBlockedAtStartup:

@@ -49,7 +49,7 @@ class SucceedingSink:
         self.delivered_alerts = []
 
     def deliver(self, message):
-        self.delivered_alerts.append(message.metadata["alert_id"])
+        self.delivered_alerts.append(message.alert_id)
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
@@ -175,7 +175,7 @@ class TestMultipleAlertsAndBatchLimit:
 
         class MixedSink:
             def deliver(self, message):
-                if message.metadata["alert_id"] == "alert-0":
+                if message.alert_id == "alert-0":
                     raise RuntimeError("boom")
                 return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
@@ -322,12 +322,259 @@ class TestUsesInjectedTemplate:
         service = AlertDeliveryService(repo, SucceedingSink(), max_attempts=3)
         assert isinstance(service._template, DefaultInspectionNotificationTemplate)
 
+
+class TestTemplateExceptionIsControlled:
+    """Etapa 6.11.1 (§26.x): una excepción de template.render() se trata
+    exactamente igual que una excepción de canal -- nunca se propaga,
+    nunca invoca ningún canal, y el resto del lote sigue procesándose."""
+
+    def test_two_pending_alerts_both_survive_a_raising_template(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-a", dedup_key="dedup-a", run_id="run-a")
+        _seed_alert(repo, alert_id="alert-b", dedup_key="dedup-b", run_id="run-b")
+
+        class RaisingTemplate:
+            def render(self, alert):
+                raise RuntimeError("template failure")
+
+        spy = SucceedingSink()
+        try:
+            service = AlertDeliveryService(repo, spy, max_attempts=3, template=RaisingTemplate())
+            result = service.deliver_pending_alerts()
+        except Exception as exc:
+            pytest.fail(f"deliver_pending_alerts() must never propagate a template exception: {exc!r}")
+
+        assert result.failed_count == 2
+        alert_a = repo.get_inspection_alert_by_deduplication_key("dedup-a")
+        alert_b = repo.get_inspection_alert_by_deduplication_key("dedup-b")
+        for alert in (alert_a, alert_b):
+            assert alert.delivery_attempts == 1
+            assert alert.status == AlertStatus.PENDING
+            assert "template failure" in alert.last_error
+        assert spy.delivered_alerts == []  # el canal nunca se invoca
+
+    def test_raising_template_reaches_failed_at_max_attempts(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-a", dedup_key="dedup-a", run_id="run-a")
+        _seed_alert(repo, alert_id="alert-b", dedup_key="dedup-b", run_id="run-b")
+
+        class RaisingTemplate:
+            def render(self, alert):
+                raise RuntimeError("template failure")
+
+        spy = SucceedingSink()
+        service = AlertDeliveryService(repo, spy, max_attempts=2, template=RaisingTemplate())
+
+        service.deliver_pending_alerts()
+        service.deliver_pending_alerts()
+
+        alert_a = repo.get_inspection_alert_by_deduplication_key("dedup-a")
+        alert_b = repo.get_inspection_alert_by_deduplication_key("dedup-b")
+        for alert in (alert_a, alert_b):
+            assert alert.status == AlertStatus.FAILED
+            assert alert.delivery_attempts == 2
+        assert spy.delivered_alerts == []
+
+        # ninguna alerta ya FAILED se vuelve a procesar.
+        result = service.deliver_pending_alerts()
+        assert result.delivered_count == 0
+        assert result.failed_count == 0
+
+
+class TestTemplateReturnsInvalidType:
+    """Etapa 6.11.1 (§26.x): si render() no devuelve un NotificationMessage,
+    AlertDeliveryService lo detecta antes de invocar cualquier canal."""
+
+    @pytest.mark.parametrize("bad_value", [None, "texto", 123])
+    def test_invalid_return_value_is_a_controlled_failure(self, tmp_path, bad_value):
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+
+        class BadTemplate:
+            def render(self, alert):
+                return bad_value
+
+        spy = SucceedingSink()
+        service = AlertDeliveryService(repo, spy, max_attempts=3, template=BadTemplate())
+        result = service.deliver_pending_alerts()
+
+        assert result.failed_count == 1
+        alert = repo.get_inspection_alert_by_deduplication_key("key-1")
+        assert alert.status == AlertStatus.PENDING
+        assert alert.delivery_attempts == 1
+        assert "NotificationMessage" in alert.last_error
+        assert spy.delivered_alerts == []
+
+    def test_invalid_return_value_reaches_failed_at_max_attempts(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+
+        class BadTemplate:
+            def render(self, alert):
+                return None
+
+        spy = SucceedingSink()
+        service = AlertDeliveryService(repo, spy, max_attempts=2, template=BadTemplate())
+        service.deliver_pending_alerts()
+        service.deliver_pending_alerts()
+
+        alert = repo.get_inspection_alert_by_deduplication_key("key-1")
+        assert alert.status == AlertStatus.FAILED
+        assert alert.delivery_attempts == 2
+        assert spy.delivered_alerts == []
+
+    def test_other_alerts_in_the_batch_continue_despite_invalid_template_return(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-bad", dedup_key="dedup-bad", run_id="run-bad")
+        _seed_alert(repo, alert_id="alert-good", dedup_key="dedup-good", run_id="run-good")
+
+        class SelectivelyBadTemplate:
+            def render(self, alert):
+                if alert.id == "alert-bad":
+                    return "not a message"
+                return DefaultInspectionNotificationTemplate().render(alert)
+
+        spy = SucceedingSink()
+        service = AlertDeliveryService(repo, spy, max_attempts=3, template=SelectivelyBadTemplate())
+        result = service.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert result.failed_count == 1
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-good").status == AlertStatus.DELIVERED
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-bad").status == AlertStatus.PENDING
+        assert spy.delivered_alerts == ["alert-good"]
+
+
+class TestTemplateReturnsWrongAlertId:
+    """Etapa 6.11.1 (§26.x, punto obligatorio): un NotificationMessage
+    con alert_id distinto al de la InspectionAlert real nunca llega a
+    invocar ningún canal ni a crear ninguna fila de estado por canal."""
+
+    def test_mismatched_alert_id_is_a_controlled_failure(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-real", dedup_key="dedup-real")
+
+        class WrongIdTemplate:
+            def render(self, alert):
+                return NotificationMessage(alert_id="otro-id", title="T", body="B", severity=None)
+
+        spy = SucceedingSink()
+        service = AlertDeliveryService(repo, spy, max_attempts=3, template=WrongIdTemplate())
+        result = service.deliver_pending_alerts()
+
+        assert result.failed_count == 1
+        alert = repo.get_inspection_alert_by_deduplication_key("dedup-real")
+        assert alert.status == AlertStatus.PENDING
+        assert alert.delivery_attempts == 1
+        assert "alert_id" in alert.last_error
+        assert spy.delivered_alerts == []  # el canal nunca se invoca
+
+    def test_mismatched_alert_id_never_creates_a_per_channel_row(self, tmp_path):
+        from src.paper_trading.notification_channels import CompositeNotificationChannel
+
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-real", dedup_key="dedup-real")
+
+        class WrongIdTemplate:
+            def render(self, alert):
+                return NotificationMessage(alert_id="otro-id", title="T", body="B", severity=None)
+
+        composite = CompositeNotificationChannel([SucceedingSink()], repository=repo, max_attempts=3)
+        service = AlertDeliveryService(repo, composite, max_attempts=3, template=WrongIdTemplate())
+        service.deliver_pending_alerts()
+
+        assert repo.get_alert_channel_delivery("otro-id", "SucceedingSink") is None
+        assert repo.get_alert_channel_delivery("alert-real", "SucceedingSink") is None
+        assert repo.fetch_alert_channel_deliveries("alert-real") == []
+
+    def test_mismatched_alert_id_reaches_failed_at_max_attempts(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-real", dedup_key="dedup-real")
+
+        class WrongIdTemplate:
+            def render(self, alert):
+                return NotificationMessage(alert_id="otro-id", title="T", body="B", severity=None)
+
+        service = AlertDeliveryService(repo, SucceedingSink(), max_attempts=2, template=WrongIdTemplate())
+        service.deliver_pending_alerts()
+        service.deliver_pending_alerts()
+
+        alert = repo.get_inspection_alert_by_deduplication_key("dedup-real")
+        assert alert.status == AlertStatus.FAILED
+        assert alert.delivery_attempts == 2
+
+    def test_other_alerts_continue_despite_mismatched_alert_id(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo, alert_id="alert-bad", dedup_key="dedup-bad", run_id="run-bad")
+        _seed_alert(repo, alert_id="alert-good", dedup_key="dedup-good", run_id="run-good")
+
+        class SelectivelyWrongIdTemplate:
+            def render(self, alert):
+                if alert.id == "alert-bad":
+                    return NotificationMessage(alert_id="otro-id", title="T", body="B", severity=None)
+                return DefaultInspectionNotificationTemplate().render(alert)
+
+        spy = SucceedingSink()
+        service = AlertDeliveryService(repo, spy, max_attempts=3, template=SelectivelyWrongIdTemplate())
+        result = service.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert result.failed_count == 1
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-good").status == AlertStatus.DELIVERED
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-bad").status == AlertStatus.PENDING
+
+
+class TestIdempotencyUnaffectedByAlertIdFieldChange:
+    """Etapa 6.11.1 (§26.x): mover alert_id de metadata a un campo
+    explícito no altera la idempotencia por canal ya establecida en la
+    Etapa 6.10.1."""
+
+    def test_channel_a_succeeds_once_channel_b_retries_then_succeeds_across_restart(self, tmp_path):
+        from src.paper_trading.notification_channels import CompositeNotificationChannel
+
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+        _seed_alert(repo1)
+
+        class ChannelA:
+            invocations = 0
+
+            def deliver(self, message):
+                ChannelA.invocations += 1
+                return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
+
+        class ChannelB:
+            invocations = 0
+
+            def deliver(self, message):
+                ChannelB.invocations += 1
+                if ChannelB.invocations <= 2:
+                    return AlertDeliveryResult(success=False, error_message="not yet", delivered_at=_now())
+                return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
+
+        composite1 = CompositeNotificationChannel([ChannelA(), ChannelB()], repository=repo1, max_attempts=5)
+        service1 = AlertDeliveryService(repo1, composite1, max_attempts=5)
+        service1.deliver_pending_alerts()
+        service1.deliver_pending_alerts()
+
+        # Reinicio: nueva instancia de repositorio + servicios sobre el mismo archivo.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel([ChannelA(), ChannelB()], repository=repo2, max_attempts=5)
+        service2 = AlertDeliveryService(repo2, composite2, max_attempts=5)
+        service2.deliver_pending_alerts()
+
+        assert ChannelA.invocations == 1
+        assert ChannelB.invocations == 3
+        assert repo2.get_inspection_alert_by_deduplication_key("key-1").status == AlertStatus.DELIVERED
+
     def test_channel_receives_exactly_what_the_template_rendered(self, tmp_path):
         repo = _repo(tmp_path)
         _seed_alert(repo)
 
         rendered = NotificationMessage(
-            title="titulo-fijo", body="cuerpo-fijo", severity=None, metadata={"alert_id": "alert-1"},
+            alert_id="alert-1", title="titulo-fijo", body="cuerpo-fijo", severity=None,
         )
 
         class RecordingTemplate:

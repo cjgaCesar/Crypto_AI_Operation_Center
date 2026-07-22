@@ -51,12 +51,12 @@ def _alert(**overrides) -> InspectionAlert:
 
 def _message(**overrides) -> NotificationMessage:
     """NotificationMessage aislado, para pruebas de canales que no
-    necesitan pasar por la plantilla real. `metadata["alert_id"]` por
-    defecto coincide con `_alert()` (ambas "alert-1"), para que
+    necesitan pasar por la plantilla real. `alert_id` por defecto
+    coincide con `_alert()` (ambas "alert-1"), para que
     CompositeNotificationChannel pueda persistir su idempotencia por
     canal contra un alert_id que además exista en la tabla de alertas
     (FOREIGN KEY)."""
-    defaults = dict(title="t", body="m", severity=None, metadata={"alert_id": "alert-1"})
+    defaults = dict(alert_id="alert-1", title="t", body="m", severity=None, metadata={})
     defaults.update(overrides)
     return NotificationMessage(**defaults)
 
@@ -76,7 +76,7 @@ class AlwaysSucceedsChannel:
         self.delivered = []
 
     def deliver(self, message):
-        self.delivered.append(message.metadata["alert_id"])
+        self.delivered.append(message.alert_id)
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
@@ -86,7 +86,7 @@ class AlwaysFailsChannel:
         self.delivered = []
 
     def deliver(self, message):
-        self.delivered.append(message.metadata["alert_id"])
+        self.delivered.append(message.alert_id)
         return AlertDeliveryResult(success=False, error_message=f"{self.name} failed", delivered_at=_now())
 
 
@@ -96,7 +96,7 @@ class RaisingChannel:
         self.delivered = []
 
     def deliver(self, message):
-        self.delivered.append(message.metadata["alert_id"])
+        self.delivered.append(message.alert_id)
         raise RuntimeError(f"{self.name} exploded")
 
 
@@ -123,7 +123,7 @@ class AlwaysSucceedsChannelA:
         self.delivered = []
 
     def deliver(self, message):
-        self.delivered.append(message.metadata["alert_id"])
+        self.delivered.append(message.alert_id)
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
@@ -132,7 +132,7 @@ class AlwaysSucceedsChannelB:
         self.delivered = []
 
     def deliver(self, message):
-        self.delivered.append(message.metadata["alert_id"])
+        self.delivered.append(message.alert_id)
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 

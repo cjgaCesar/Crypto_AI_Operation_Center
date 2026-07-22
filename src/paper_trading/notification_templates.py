@@ -1,6 +1,7 @@
 """
 Plantillas de notificación de alertas de inspección -- patrón Strategy
-(Etapa 6.11). Ver docs/ARQUITECTURA_PAPER_TRADING.md §26.
+(Etapa 6.11, endurecida en 6.11.1 -- ver §26.x). Ver
+docs/ARQUITECTURA_PAPER_TRADING.md §26.
 
 Separa "qué se comunica" (esta clase) de "cómo se comunica"
 (notification_channels.py). Un canal nunca vuelve a conocer
@@ -31,29 +32,51 @@ class NotificationMessage:
     presentación -- nunca HTML, Markdown específico, ni nada propio de
     un canal concreto (Telegram/Slack/Email/URLs).
 
-    `metadata` es la única vía por la que un canal puede recuperar
-    identificadores no presentacionales que necesite (ej. `alert_id`,
-    usado por `CompositeNotificationChannel` para su idempotencia por
-    canal, ver notification_channels.py) sin volver a conocer
-    `InspectionAlert`. Inmutable: `metadata` se congela con
-    `MappingProxyType` para que ni siquiera el dict subyacente pueda
-    mutarse después de construido el mensaje.
+    `alert_id` (Etapa 6.11.1, §26.x) es un campo explícito, obligatorio
+    e inmutable -- no vive dentro de `metadata`. Es la identidad que
+    `CompositeNotificationChannel` usa para su idempotencia por canal
+    (ver notification_channels.py); al ser un campo propio del
+    contrato, `AlertDeliveryService` puede validarlo contra
+    `alert.id` **antes** de invocar cualquier canal (§26.x), en vez de
+    descubrir un valor incorrecto recién dentro del Composite.
+
+    `metadata` sigue existiendo para cualquier otro identificador no
+    presentacional que un canal futuro pueda necesitar (ej.
+    `alert_type`, `run_id`), pero ya no es responsable de `alert_id`.
+    Inmutable: `metadata` se congela con `MappingProxyType` para que ni
+    siquiera el dict subyacente pueda mutarse después de construido el
+    mensaje.
     """
 
+    alert_id: str
     title: str
     body: str
     severity: Optional[IssueSeverity]
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.alert_id, str) or not self.alert_id.strip():
+            raise ValueError("NotificationMessage.alert_id must be a non-empty string.")
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 class InspectionNotificationTemplate(Protocol):
     def render(self, alert: InspectionAlert) -> NotificationMessage:
         """Construye el NotificationMessage correspondiente a `alert`.
-        Nunca lanza para una InspectionAlert válida: es una función pura
-        sobre datos ya validados por quien construyó la alerta."""
+
+        Contrato (Etapa 6.11.1, §26.x), validado en runtime por
+        `AlertDeliveryService` antes de invocar cualquier canal:
+
+        - debe devolver una instancia de `NotificationMessage`, nunca
+          `None` ni ningún otro tipo;
+        - `resultado.alert_id` debe ser exactamente `alert.id` (nunca
+          otro valor, nunca reconstruido);
+        - nunca modifica `alert`;
+        - nunca lanza para una `InspectionAlert` válida -- es una
+          función pura sobre datos ya validados por quien construyó la
+          alerta, y el mismo `alert` de entrada siempre produce el
+          mismo `NotificationMessage`.
+        """
         ...
 
 
@@ -98,8 +121,9 @@ class DefaultInspectionNotificationTemplate:
         lines.append(f"Fecha: {alert.created_at.isoformat()}")
 
         return NotificationMessage(
+            alert_id=alert.id,
             title=_TITLES_BY_ALERT_TYPE[alert.alert_type],
             body="\n".join(lines),
             severity=alert.severity,
-            metadata={"alert_id": alert.id, "alert_type": alert.alert_type.value, "run_id": alert.run_id},
+            metadata={"alert_type": alert.alert_type.value, "run_id": alert.run_id},
         )

@@ -38,8 +38,16 @@ Protocol) vuelve a conocer `InspectionAlert`. Reciben `NotificationMessage`
 `InspectionNotificationTemplate` -- separación completa de "qué se
 comunica" (plantilla) de "cómo se comunica" (canal).
 `CompositeNotificationChannel` recupera el `alert_id` que necesita para
-su idempotencia por canal desde `message.metadata["alert_id"]`, nunca
-de un objeto `InspectionAlert` directo.
+su idempotencia por canal desde `message.alert_id`, nunca de un objeto
+`InspectionAlert` directo.
+
+Etapa 6.11.1 (§26.x): `alert_id` pasa a ser un campo explícito de
+`NotificationMessage` (antes vivía en `metadata["alert_id"]`, sin
+validación). `AlertDeliveryService` ahora valida el resultado de la
+plantilla (tipo correcto y `alert_id` coincidente con la alerta real)
+antes de invocar cualquier canal -- ningún canal de esta lista se
+invoca jamás con un `NotificationMessage` inválido o con un `alert_id`
+que no corresponda a la alerta que se está entregando.
 """
 
 import logging
@@ -193,9 +201,12 @@ class CompositeNotificationChannel:
 
     Etapa 6.11 (§26): recibe un `NotificationMessage`, no un
     `InspectionAlert`. El `alert_id` que necesita para su idempotencia
-    por canal se recupera de `message.metadata["alert_id"]` -- la
-    plantilla (`InspectionNotificationTemplate`) garantiza esa clave en
-    todo mensaje que produce.
+    por canal se recupera de `message.alert_id` (campo explícito desde
+    la Etapa 6.11.1, §26.x -- antes vivía en `message.metadata["alert_id"]`,
+    sin garantía de tipo ni de validación). `AlertDeliveryService` ya
+    valida `message.alert_id == alert.id` antes de invocar `deliver()`,
+    así que este Composite puede confiar en que `message.alert_id`
+    corresponde exactamente a la alerta que se está entregando.
     """
 
     def __init__(
@@ -218,7 +229,7 @@ class CompositeNotificationChannel:
             # no-op exitoso, no un error -- no hay nada que pueda fallar.
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
 
-        alert_id = message.metadata["alert_id"]
+        alert_id = message.alert_id
         errors: list[str] = []
         all_delivered = True
         any_terminal_failure = False

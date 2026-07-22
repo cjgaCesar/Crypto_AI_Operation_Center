@@ -29,6 +29,15 @@ usa un `InspectionNotificationTemplate` inyectado para convertir la
 El servicio nunca construye el contenido del mensaje él mismo -- solo
 orquesta la secuencia `template.render() -> channel.deliver()`. El
 canal recibido nunca vuelve a ver una `InspectionAlert`.
+
+Etapa 6.11.1 (§26.x): `template.render(alert)` -- y su validación --
+quedan dentro del mismo `try/except` que ya protegía `channel.deliver()`.
+Cualquier excepción del template, cualquier resultado que no sea una
+instancia de `NotificationMessage`, y cualquier `NotificationMessage`
+cuyo `alert_id` no coincida exactamente con `alert.id`, se tratan
+exactamente igual que un fallo de canal: nunca se propagan, nunca se
+invoca ningún canal con ese mensaje, `delivery_attempts` se incrementa
+y `last_error` queda con un mensaje que identifica la causa.
 """
 
 from typing import NamedTuple, Optional
@@ -36,7 +45,9 @@ from typing import NamedTuple, Optional
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.notification_channels import InspectionNotificationChannel
-from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, InspectionNotificationTemplate
+from src.paper_trading.notification_templates import (
+    DefaultInspectionNotificationTemplate, InspectionNotificationTemplate, NotificationMessage,
+)
 from src.paper_trading.runtime import Clock, SystemClock
 
 
@@ -74,14 +85,23 @@ class AlertDeliveryService:
         failed_count = 0
 
         for alert in alerts:
-            message = self._template.render(alert)
             try:
+                message = self._template.render(alert)
+                if not isinstance(message, NotificationMessage):
+                    raise TypeError(
+                        "InspectionNotificationTemplate.render() must return NotificationMessage."
+                    )
+                if message.alert_id != alert.id:
+                    raise ValueError("NotificationMessage.alert_id does not match InspectionAlert.id.")
                 result = self._channel.deliver(message)
             except Exception as exc:
-                # Corrección Etapa 6.10.1 (§25.1): una excepción directa del
-                # canal (sin pasar por un Composite que la capture) nunca se
-                # descarta en silencio -- se trata como cualquier otro fallo
-                # de entrega, con su propio registro y conteo de intentos.
+                # Corrección Etapa 6.10.1 (§25.1), ampliada en 6.11.1 (§26.x):
+                # una excepción directa del canal, una excepción del template,
+                # un resultado de tipo incorrecto o un alert_id que no
+                # corresponde a la alerta real -- ninguno se descarta en
+                # silencio ni se propaga. Todos se tratan como cualquier otro
+                # fallo de entrega, con su propio registro y conteo de
+                # intentos; en ningún caso se llega a invocar el canal.
                 result = AlertDeliveryResult(
                     success=False, error_message=str(exc), delivered_at=self._clock.now(), terminal=False,
                 )
