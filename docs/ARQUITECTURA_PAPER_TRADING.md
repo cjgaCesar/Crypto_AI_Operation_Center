@@ -2723,3 +2723,141 @@ llega a instanciar el placeholder ni a intentar una entrega. Solo
   toca: sigue operando exclusivamente a nivel de creación de la alerta,
   antes y de forma completamente independiente de esta corrección (que
   opera después, a nivel de entrega).
+
+## 26. Arquitectura de plantillas de notificación (Etapa 6.11)
+
+Separación completa entre **qué se comunica** (contenido de una
+alerta) y **cómo se comunica** (transporte por un canal concreto).
+Hasta esta etapa, un canal recibía directamente una `InspectionAlert`
+y decidía por su cuenta qué texto construir a partir de ella (ver
+`LoggingNotificationChannel.deliver()` en la Etapa 6.10). Eso acoplaba
+el formato del mensaje al canal: agregar Telegram, Email o Slack en el
+futuro habría significado repetir la misma lógica de formateo en cada
+canal nuevo, con el riesgo de que cada uno mostrara un contenido
+ligeramente distinto para la misma alerta.
+
+### 26.1 Nuevo módulo: `notification_templates.py`
+
+Patrón Strategy, igual que `notification_channels.py` (§24), pero para
+el contenido en vez del transporte:
+
+- **`InspectionNotificationTemplate`** (`Protocol`): una única
+  responsabilidad, `render(alert: InspectionAlert) -> NotificationMessage`.
+  Nunca lanza para una alerta válida -- es una función pura sobre datos
+  ya validados por quien construyó la `InspectionAlert` (AlertBuilder,
+  Etapa 6.9).
+- **`NotificationMessage`** (dataclass congelada): el contrato de
+  contenido que cualquier canal puede transportar. Campos: `title`,
+  `body`, `severity` (reutiliza `IssueSeverity`), y `metadata`
+  (`Mapping[str, str]`, congelado con `MappingProxyType` para que ni
+  siquiera el dict subyacente pueda mutarse tras construir el mensaje).
+  Deliberadamente **no** contiene HTML, Markdown específico, URLs, ni
+  ninguna referencia a Telegram/Slack/Email -- es agnóstico a cualquier
+  canal concreto. `metadata` es la única vía por la que un canal puede
+  recuperar identificadores no presentacionales que necesite (ver
+  §26.4) sin volver a conocer `InspectionAlert`.
+- **`DefaultInspectionNotificationTemplate`**: única plantilla usada en
+  producción en esta etapa (sin configuración nueva, ver §26.5).
+  Genera un título fijo por `AlertType` (7 valores, ver
+  `_TITLES_BY_ALERT_TYPE`) y un cuerpo de texto plano con el mensaje de
+  la alerta más, cuando corresponden, una línea de código de issue, una
+  línea de entidad (tipo, id, exchange y símbolo si están presentes) y
+  la fecha de creación en ISO 8601. Para `INSPECTION_FAILED`/
+  `SYSTEM_RECOVERED` (sin `issue_identity`/`issue_code`, ver
+  `alert_models.py`), las líneas correspondientes simplemente se omiten
+  en vez de mostrar un placeholder vacío.
+
+### 26.2 Flujo antes y después
+
+Antes (Etapa 6.10/6.10.1):
+
+```
+alert (InspectionAlert)
+  -> channel.deliver(alert)
+```
+
+El canal conocía `InspectionAlert` por completo (`alert.title`,
+`alert.message`, `alert.severity`, `alert.alert_type`, ...) y construía
+su propio texto de salida.
+
+Después (Etapa 6.11):
+
+```
+alert (InspectionAlert)
+  -> template.render(alert) -> NotificationMessage
+  -> channel.deliver(message)
+```
+
+`AlertDeliveryService.deliver_pending_alerts()` recibe un
+`InspectionNotificationTemplate` inyectado (nuevo parámetro
+`template: InspectionNotificationTemplate = DefaultInspectionNotificationTemplate()`,
+con default para no romper ninguna construcción existente) y, por cada
+alerta, llama primero a `self._template.render(alert)` y pasa el
+`NotificationMessage` resultante a `self._channel.deliver(message)`. El
+servicio nunca construye el contenido él mismo: solo orquesta la
+secuencia. Ningún canal (`LoggingNotificationChannel`,
+`NullNotificationChannel`, los 4 placeholders, ni
+`CompositeNotificationChannel`) vuelve a recibir ni a importar
+`InspectionAlert`.
+
+### 26.3 Cambios en los canales
+
+- `LoggingNotificationChannel.deliver(message)`: escribe
+  `message.title`/`message.body` vía `logging`, eligiendo el nivel
+  (`error`/`warning`/`info`) según `message.severity` -- ya no
+  reconstruye ningún texto, solo transporta lo que la plantilla ya
+  produjo.
+- `NullNotificationChannel.deliver(message)`: ignora el mensaje por
+  completo, sigue reportando éxito siempre (sin cambio de
+  comportamiento).
+- Los 4 placeholders (`Email`/`Slack`/`Telegram`/`WebhookNotificationChannel`)
+  cambian únicamente el tipo del parámetro de `deliver()`; su cuerpo
+  sigue lanzando `NotImplementedError` sin excepción.
+
+### 26.4 `CompositeNotificationChannel`: sin cambios funcionales
+
+Sigue funcionando exactamente igual que en la Etapa 6.10.1 (§25.2):
+misma idempotencia por canal, mismo criterio de terminalidad, mismo
+`try/except` alrededor de cada `channel.deliver()`. El único cambio es
+el tipo que recibe y reenvía a cada canal (`NotificationMessage` en vez
+de `InspectionAlert`). El `alert_id` que necesita para sus consultas a
+`get_alert_channel_delivery()`/`upsert_alert_channel_delivery()` ahora
+se obtiene de `message.metadata["alert_id"]` -- `DefaultInspectionNotificationTemplate`
+garantiza esa clave en todo mensaje que produce, precisamente para que
+`CompositeNotificationChannel` pueda seguir haciendo su trabajo sin
+volver a conocer `InspectionAlert`.
+
+### 26.5 Composition Root y configuración
+
+`build_paper_trading_context()` construye `DefaultInspectionNotificationTemplate()`
+y lo inyecta explícitamente como `template=` en `AlertDeliveryService`
+-- ni el servicio ni ningún canal construyen su propia plantilla,
+igual que ya era el caso para los canales concretos (§24.5). No se
+agrega ninguna configuración nueva: `inspection_notifications` sigue
+controlando únicamente qué canales se arman: la plantilla usada es
+siempre `DefaultInspectionNotificationTemplate`, sin ningún flag para
+elegir otra.
+
+### 26.6 Por qué facilita Telegram, Email y Slack
+
+Cuando se implemente un canal real, su `deliver(message)` ya recibirá
+un `NotificationMessage` completo y agnóstico -- no necesitará saber
+nada de `InspectionAlert`, `AlertType`, `IssueIdentity` ni de cómo se
+arma el texto de una alerta. Un futuro `TelegramNotificationChannel`
+real solo necesita decidir cómo transportar `message.title`/
+`message.body` (ej. como un único mensaje de texto), y un futuro canal
+con necesidades de formato distintas (ej. HTML para Email) podría
+lograrlo con su propia plantilla alternativa que implemente
+`InspectionNotificationTemplate`, sin tocar ningún canal existente ni
+`AlertDeliveryService`.
+
+### 26.7 Explícitamente fuera de alcance
+
+Ninguna implementación real de Telegram/Slack/Email/Webhooks (sigue
+igual que en la Etapa 6.10/6.10.1); ninguna dependencia nueva (`jinja2`,
+`markdown`, `rich`, ni ninguna librería de plantillas externa); ningún
+formato HTML/Markdown específico de canal; ninguna plantilla
+alternativa a `DefaultInspectionNotificationTemplate` (se evalúa la
+extensibilidad en §26.6, pero no se implementa ninguna otra plantilla
+en esta etapa); ningún cambio de comportamiento funcional (mismo
+resultado de entrega, mismos estados, misma idempotencia).

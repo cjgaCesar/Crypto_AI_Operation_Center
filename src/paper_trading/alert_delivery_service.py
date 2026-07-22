@@ -22,6 +22,13 @@ sintético y se procesa exactamente igual que un fallo normal --
 `delivery_attempts` se incrementa, `last_error` se guarda, y el estado
 pasa a `FAILED` al agotar `max_attempts`. Nunca queda una alerta en
 reintento infinito sin rastro.
+
+Etapa 6.11 (§26): antes de llamar a `channel.deliver()`, este servicio
+usa un `InspectionNotificationTemplate` inyectado para convertir la
+`InspectionAlert` en un `NotificationMessage` (`template.render(alert)`).
+El servicio nunca construye el contenido del mensaje él mismo -- solo
+orquesta la secuencia `template.render() -> channel.deliver()`. El
+canal recibido nunca vuelve a ver una `InspectionAlert`.
 """
 
 from typing import NamedTuple, Optional
@@ -29,6 +36,7 @@ from typing import NamedTuple, Optional
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.notification_channels import InspectionNotificationChannel
+from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, InspectionNotificationTemplate
 from src.paper_trading.runtime import Clock, SystemClock
 
 
@@ -50,6 +58,7 @@ class AlertDeliveryService:
         channel: InspectionNotificationChannel,
         max_attempts: int,
         clock: Clock = SystemClock(),
+        template: InspectionNotificationTemplate = DefaultInspectionNotificationTemplate(),
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts debe ser >= 1.")
@@ -57,6 +66,7 @@ class AlertDeliveryService:
         self._channel = channel
         self._max_attempts = max_attempts
         self._clock = clock
+        self._template = template
 
     def deliver_pending_alerts(self, limit: Optional[int] = None) -> AlertDeliveryBatchResult:
         alerts = self._repository.fetch_pending_inspection_alerts(limit=limit)
@@ -64,8 +74,9 @@ class AlertDeliveryService:
         failed_count = 0
 
         for alert in alerts:
+            message = self._template.render(alert)
             try:
-                result = self._channel.deliver(alert)
+                result = self._channel.deliver(message)
             except Exception as exc:
                 # Corrección Etapa 6.10.1 (§25.1): una excepción directa del
                 # canal (sin pasar por un Composite que la capture) nunca se

@@ -1,7 +1,8 @@
 """
 Pruebas para AlertDeliveryService (Etapa 6.9, ampliado en 6.10 para
-depender de InspectionNotificationChannel): entrega de alertas PENDING
-con reintentos acotados. Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9/§24.
+depender de InspectionNotificationChannel, y en 6.11 para depender de
+InspectionNotificationTemplate): entrega de alertas PENDING con
+reintentos acotados. Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9/§24/§26.
 """
 
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, Ale
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.models import CashBalance, Order
 from src.paper_trading.enums import OrderSide, OrderSource, OrderStatus, OrderType
+from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, NotificationMessage
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 
 
@@ -46,18 +48,18 @@ class SucceedingSink:
     def __init__(self):
         self.delivered_alerts = []
 
-    def deliver(self, alert):
-        self.delivered_alerts.append(alert.id)
+    def deliver(self, message):
+        self.delivered_alerts.append(message.metadata["alert_id"])
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
 class FailingSink:
-    def deliver(self, alert):
+    def deliver(self, message):
         return AlertDeliveryResult(success=False, error_message="sink failure", delivered_at=_now())
 
 
 class RaisingSink:
-    def deliver(self, alert):
+    def deliver(self, message):
         raise RuntimeError("sink exploded")
 
 
@@ -172,8 +174,8 @@ class TestMultipleAlertsAndBatchLimit:
         repo.save_inspection_run_transaction(run, alerts)
 
         class MixedSink:
-            def deliver(self, alert):
-                if alert.id == "alert-0":
+            def deliver(self, message):
+                if message.metadata["alert_id"] == "alert-0":
                     raise RuntimeError("boom")
                 return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
@@ -285,7 +287,7 @@ class TestWorksWithCompositeNotificationChannel:
             def __init__(self):
                 self.calls = 0
 
-            def deliver(self, alert):
+            def deliver(self, message):
                 self.calls += 1
                 return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
@@ -293,7 +295,7 @@ class TestWorksWithCompositeNotificationChannel:
         flaky_calls = {"n": 0}
 
         class FlakyChannel:
-            def deliver(self, alert):
+            def deliver(self, message):
                 flaky_calls["n"] += 1
                 if flaky_calls["n"] < 2:
                     return AlertDeliveryResult(success=False, error_message="not yet", delivered_at=_now())
@@ -308,3 +310,56 @@ class TestWorksWithCompositeNotificationChannel:
         assert good.calls == 1  # nunca se reenvía al canal ya exitoso
         assert flaky_calls["n"] == 2
         assert repo.get_inspection_alert_by_deduplication_key("key-1").status == AlertStatus.DELIVERED
+
+
+class TestUsesInjectedTemplate:
+    """Etapa 6.11 (§26): AlertDeliveryService nunca construye el
+    contenido del mensaje él mismo -- delega en `template.render()` y
+    pasa el resultado, sin modificarlo, a `channel.deliver()`."""
+
+    def test_default_template_is_the_default_inspection_notification_template(self, tmp_path):
+        repo = _repo(tmp_path)
+        service = AlertDeliveryService(repo, SucceedingSink(), max_attempts=3)
+        assert isinstance(service._template, DefaultInspectionNotificationTemplate)
+
+    def test_channel_receives_exactly_what_the_template_rendered(self, tmp_path):
+        repo = _repo(tmp_path)
+        _seed_alert(repo)
+
+        rendered = NotificationMessage(
+            title="titulo-fijo", body="cuerpo-fijo", severity=None, metadata={"alert_id": "alert-1"},
+        )
+
+        class RecordingTemplate:
+            def __init__(self):
+                self.rendered_alerts = []
+
+            def render(self, alert):
+                self.rendered_alerts.append(alert.id)
+                return rendered
+
+        class RecordingChannel:
+            def __init__(self):
+                self.received = []
+
+            def deliver(self, message):
+                self.received.append(message)
+                return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
+
+        template = RecordingTemplate()
+        channel = RecordingChannel()
+        service = AlertDeliveryService(repo, channel, max_attempts=3, template=template)
+        service.deliver_pending_alerts()
+
+        assert template.rendered_alerts == ["alert-1"]
+        assert channel.received == [rendered]
+
+    def test_service_never_builds_message_content_itself(self):
+        """AlertDeliveryService no debe formatear texto de alertas: nunca
+        una referencia a NotificationMessage() construida directamente
+        dentro de su propio código (esa responsabilidad es exclusiva de
+        la plantilla)."""
+        import src.paper_trading.alert_delivery_service as module
+
+        source = open(module.__file__, encoding="utf-8").read()
+        assert "NotificationMessage(" not in source

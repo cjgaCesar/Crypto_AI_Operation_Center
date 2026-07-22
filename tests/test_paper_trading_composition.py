@@ -663,3 +663,24 @@ class TestPlaceholderChannelsBlockedAtStartup:
         assert context.alert_delivery_service._channel._channels == []
         result = context.application.deliver_pending_reconciliation_alerts()
         assert result.failed_count == 0
+
+
+class TestNotificationTemplateWiring:
+    """Etapa 6.11 (§26): la Composition Root construye e inyecta el
+    InspectionNotificationTemplate en AlertDeliveryService -- nunca lo
+    construye AlertDeliveryService por sí solo."""
+
+    def test_alert_delivery_service_receives_the_default_template(self, tmp_path):
+        from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate
+
+        context = build_paper_trading_context(
+            config=_config(tmp_path), clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert isinstance(context.alert_delivery_service._template, DefaultInspectionNotificationTemplate)
+
+    def test_composition_root_constructs_the_template(self):
+        import src.paper_trading.composition as module
+
+        source = open(module.__file__, encoding="utf-8").read()
+        assert "DefaultInspectionNotificationTemplate(" in source

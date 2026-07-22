@@ -40,6 +40,13 @@ construir ningún canal, que ningún placeholder (`email`/`slack`/
 `telegram`/`webhook`) esté habilitado -- si lo está, `build_paper_trading_context()`
 falla de inmediato con `ValueError` y un mensaje que nombra el canal.
 Nunca se llega a instanciar un placeholder ni a intentar una entrega.
+
+Etapa 6.11 (§26): esta función también construye e inyecta el
+`InspectionNotificationTemplate` (siempre `DefaultInspectionNotificationTemplate`,
+sin configuración nueva) en `AlertDeliveryService`. Ni `AlertDeliveryService`
+ni ningún canal construyen su propia plantilla -- la Composition Root es
+la única capa que decide qué plantilla se usa, igual que ya decide qué
+canales concretos entran en la lista.
 """
 
 import logging
@@ -59,6 +66,7 @@ from src.paper_trading.notification_channels import (
     LoggingNotificationChannel, SlackNotificationChannel, TelegramNotificationChannel,
     WebhookNotificationChannel,
 )
+from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate
 from src.paper_trading.pnl_engine import PnLEngine
 from src.paper_trading.position_engine import PositionEngine
 from src.paper_trading.price_provider import MarketPriceProvider
@@ -209,6 +217,7 @@ def build_paper_trading_context(
         ),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
         clock=clock,
+        template=DefaultInspectionNotificationTemplate(),
     )
     inspection_job = InspectionJob(
         inspection_service=inspection_service, alert_delivery_service=alert_delivery_service,

@@ -1,8 +1,9 @@
 """
 Pruebas para src/paper_trading/notification_channels.py (Etapa 6.10,
-ampliado en 6.10.1 con idempotencia de entrega por canal):
+ampliado en 6.10.1 con idempotencia de entrega por canal, y en 6.11
+para transportar NotificationMessage en vez de InspectionAlert):
 patrón Strategy para la entrega de alertas de inspección.
-Ver docs/ARQUITECTURA_PAPER_TRADING.md §24/§25.
+Ver docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26.
 """
 
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from src.paper_trading.notification_channels import (
     NullNotificationChannel, SlackNotificationChannel, TelegramNotificationChannel,
     WebhookNotificationChannel,
 )
+from src.paper_trading.notification_templates import NotificationMessage
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 
 
@@ -47,6 +49,18 @@ def _alert(**overrides) -> InspectionAlert:
     return InspectionAlert(**defaults)
 
 
+def _message(**overrides) -> NotificationMessage:
+    """NotificationMessage aislado, para pruebas de canales que no
+    necesitan pasar por la plantilla real. `metadata["alert_id"]` por
+    defecto coincide con `_alert()` (ambas "alert-1"), para que
+    CompositeNotificationChannel pueda persistir su idempotencia por
+    canal contra un alert_id que además exista en la tabla de alertas
+    (FOREIGN KEY)."""
+    defaults = dict(title="t", body="m", severity=None, metadata={"alert_id": "alert-1"})
+    defaults.update(overrides)
+    return NotificationMessage(**defaults)
+
+
 def _seed_alert(repo, alert) -> None:
     run = ScheduledInspectionRun(
         id=alert.run_id, started_at=_now(), completed_at=_now(), success=True, report=None,
@@ -61,8 +75,8 @@ class AlwaysSucceedsChannel:
         self.name = name
         self.delivered = []
 
-    def deliver(self, alert):
-        self.delivered.append(alert.id)
+    def deliver(self, message):
+        self.delivered.append(message.metadata["alert_id"])
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
@@ -71,8 +85,8 @@ class AlwaysFailsChannel:
         self.name = name
         self.delivered = []
 
-    def deliver(self, alert):
-        self.delivered.append(alert.id)
+    def deliver(self, message):
+        self.delivered.append(message.metadata["alert_id"])
         return AlertDeliveryResult(success=False, error_message=f"{self.name} failed", delivered_at=_now())
 
 
@@ -81,8 +95,8 @@ class RaisingChannel:
         self.name = name
         self.delivered = []
 
-    def deliver(self, alert):
-        self.delivered.append(alert.id)
+    def deliver(self, message):
+        self.delivered.append(message.metadata["alert_id"])
         raise RuntimeError(f"{self.name} exploded")
 
 
@@ -92,7 +106,7 @@ class FailsNTimesThenSucceeds:
         self.calls = 0
         self._fail_count = fail_count
 
-    def deliver(self, alert):
+    def deliver(self, message):
         self.calls += 1
         if self.calls <= self._fail_count:
             return AlertDeliveryResult(success=False, error_message=f"{self.name} attempt {self.calls}", delivered_at=_now())
@@ -108,8 +122,8 @@ class AlwaysSucceedsChannelA:
     def __init__(self):
         self.delivered = []
 
-    def deliver(self, alert):
-        self.delivered.append(alert.id)
+    def deliver(self, message):
+        self.delivered.append(message.metadata["alert_id"])
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
@@ -117,29 +131,29 @@ class AlwaysSucceedsChannelB:
     def __init__(self):
         self.delivered = []
 
-    def deliver(self, alert):
-        self.delivered.append(alert.id)
+    def deliver(self, message):
+        self.delivered.append(message.metadata["alert_id"])
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
 
 
 class TestLoggingChannel:
     def test_delivers_successfully(self):
         channel = LoggingNotificationChannel(clock=FixedClock(_now()))
-        result = channel.deliver(_alert())
+        result = channel.deliver(_message())
         assert result.success is True
         assert result.delivered_at == _now()
 
     def test_uses_injected_clock(self):
         fixed = datetime(2030, 5, 5, tzinfo=timezone.utc)
         channel = LoggingNotificationChannel(clock=FixedClock(fixed))
-        result = channel.deliver(_alert())
+        result = channel.deliver(_message())
         assert result.delivered_at == fixed
 
 
 class TestNullChannel:
     def test_always_succeeds(self):
         channel = NullNotificationChannel(clock=FixedClock(_now()))
-        result = channel.deliver(_alert())
+        result = channel.deliver(_message())
         assert result.success is True
         assert result.error_message is None
 
@@ -152,7 +166,7 @@ class TestPlaceholderChannelsRaiseNotImplemented:
     def test_deliver_raises_not_implemented(self, channel_class):
         channel = channel_class()
         with pytest.raises(NotImplementedError):
-            channel.deliver(_alert())
+            channel.deliver(_message())
 
     @pytest.mark.parametrize("channel_class", [
         EmailNotificationChannel, SlackNotificationChannel,
@@ -161,7 +175,7 @@ class TestPlaceholderChannelsRaiseNotImplemented:
     def test_error_message_is_clear(self, channel_class):
         channel = channel_class()
         with pytest.raises(NotImplementedError) as exc_info:
-            channel.deliver(_alert())
+            channel.deliver(_message())
         assert "etapa posterior" in str(exc_info.value)
 
 
@@ -179,7 +193,7 @@ class TestCompositeChannelBothSucceed:
         channel1 = AlwaysSucceedsChannelA()
         channel2 = AlwaysSucceedsChannelB()
         composite = CompositeNotificationChannel([channel1, channel2], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        result = composite.deliver(_alert())
+        result = composite.deliver(_message())
         assert channel1.delivered == ["alert-1"]
         assert channel2.delivered == ["alert-1"]
         assert result.success is True
@@ -192,7 +206,7 @@ class TestCompositeChannelOneFailsOtherRuns:
         channel1 = AlwaysFailsChannel("c1")
         channel2 = AlwaysSucceedsChannel("c2")
         composite = CompositeNotificationChannel([channel1, channel2], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        result = composite.deliver(_alert())
+        result = composite.deliver(_message())
         assert channel1.delivered == ["alert-1"]
         assert channel2.delivered == ["alert-1"]
         assert result.success is False
@@ -204,7 +218,7 @@ class TestCompositeChannelOneFailsOtherRuns:
         channel1 = RaisingChannel("c1")
         channel2 = AlwaysSucceedsChannel("c2")
         composite = CompositeNotificationChannel([channel1, channel2], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        result = composite.deliver(_alert())
+        result = composite.deliver(_message())
         assert channel1.delivered == ["alert-1"]
         assert channel2.delivered == ["alert-1"]
         assert result.success is False
@@ -225,7 +239,7 @@ class TestCompositeChannelThreeChannelsTwoFailOneWorks:
         composite = CompositeNotificationChannel(
             [channel1, channel2, channel3], repository=repo, max_attempts=3, clock=FixedClock(_now()),
         )
-        result = composite.deliver(_alert())
+        result = composite.deliver(_message())
         assert channel1.delivered == ["alert-1"]
         assert channel2.delivered == ["alert-1"]
         assert channel3.delivered == ["alert-1"]
@@ -238,7 +252,7 @@ class TestCompositeChannelEmpty:
     def test_no_channels_is_a_successful_noop(self, tmp_path):
         repo = _repo(tmp_path)
         composite = CompositeNotificationChannel([], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        result = composite.deliver(_alert())
+        result = composite.deliver(_message())
         assert result.success is True
         assert result.error_message is None
 
@@ -251,7 +265,7 @@ class TestCompositeChannelNeverRaises:
             [EmailNotificationChannel(), NullNotificationChannel(clock=FixedClock(_now()))],
             repository=repo, max_attempts=3, clock=FixedClock(_now()),
         )
-        result = composite.deliver(_alert())  # no debe lanzar NotImplementedError
+        result = composite.deliver(_message())  # no debe lanzar NotImplementedError
         assert result.success is False
         assert "EmailNotificationChannel" in result.error_message
 
@@ -265,8 +279,8 @@ class TestPerChannelIdempotency:
         _seed_alert(repo, alert)
         c1, c2 = AlwaysSucceedsChannelA(), AlwaysSucceedsChannelB()
         composite = CompositeNotificationChannel([c1, c2], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        composite.deliver(alert)
-        composite.deliver(alert)  # segunda pasada: no debería reinvocar a ninguno
+        composite.deliver(_message())
+        composite.deliver(_message())  # segunda pasada: no debería reinvocar a ninguno
         assert c1.delivered == ["alert-1"]
         assert c2.delivered == ["alert-1"]
 
@@ -278,12 +292,12 @@ class TestPerChannelIdempotency:
         flaky = FailsNTimesThenSucceeds(fail_count=1, name="flaky")
         composite = CompositeNotificationChannel([good, flaky], repository=repo, max_attempts=3, clock=FixedClock(_now()))
 
-        result1 = composite.deliver(alert)
+        result1 = composite.deliver(_message())
         assert good.delivered == ["alert-1"]
         assert flaky.calls == 1
         assert result1.success is False
 
-        result2 = composite.deliver(alert)
+        result2 = composite.deliver(_message())
         assert good.delivered == ["alert-1"]  # no se repite
         assert flaky.calls == 2  # solo el fallido se reintenta
         assert result2.success is True
@@ -296,14 +310,14 @@ class TestPerChannelIdempotency:
         _seed_alert(repo1, alert)
         good = AlwaysSucceedsChannel("good")
         composite1 = CompositeNotificationChannel([good], repository=repo1, max_attempts=3, clock=FixedClock(_now()))
-        composite1.deliver(alert)
+        composite1.deliver(_message())
         assert good.delivered == ["alert-1"]
 
         # "Reinicio": nueva instancia de repositorio + composite sobre el mismo archivo.
         repo2 = SQLitePaperTradingRepository(db_path)
         repo2.init()
         composite2 = CompositeNotificationChannel([good], repository=repo2, max_attempts=3, clock=FixedClock(_now()))
-        composite2.deliver(alert)
+        composite2.deliver(_message())
         assert good.delivered == ["alert-1"]  # sigue sin repetirse tras el reinicio
 
     def test_channel_reaches_failed_when_attempts_exhausted(self, tmp_path):
@@ -313,18 +327,18 @@ class TestPerChannelIdempotency:
         always_fails = AlwaysFailsChannel("bad")
         composite = CompositeNotificationChannel([always_fails], repository=repo, max_attempts=2, clock=FixedClock(_now()))
 
-        result1 = composite.deliver(alert)
+        result1 = composite.deliver(_message())
         assert result1.terminal is False
         state1 = repo.get_alert_channel_delivery("alert-1", "AlwaysFailsChannel")
         assert state1.status == AlertStatus.PENDING
 
-        result2 = composite.deliver(alert)
+        result2 = composite.deliver(_message())
         assert result2.terminal is True
         state2 = repo.get_alert_channel_delivery("alert-1", "AlwaysFailsChannel")
         assert state2.status == AlertStatus.FAILED
 
         # Un tercer intento no vuelve a invocar el canal ya FAILED (terminal).
-        result3 = composite.deliver(alert)
+        result3 = composite.deliver(_message())
         assert always_fails.delivered == ["alert-1", "alert-1"]  # 2 invocaciones, no 3
         assert result3.terminal is True
 
@@ -334,7 +348,7 @@ class TestPerChannelIdempotency:
         _seed_alert(repo, alert)
         c1, c2, c3 = AlwaysSucceedsChannel("c1"), AlwaysSucceedsChannel("c2"), AlwaysSucceedsChannel("c3")
         composite = CompositeNotificationChannel([c1, c2, c3], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        result = composite.deliver(alert)
+        result = composite.deliver(_message())
         assert result.success is True
         assert result.terminal is False
 
@@ -344,7 +358,7 @@ class TestPerChannelIdempotency:
         _seed_alert(repo, alert)
         raiser = RaisingChannel("boom")
         composite = CompositeNotificationChannel([raiser], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        composite.deliver(alert)
+        composite.deliver(_message())
         state = repo.get_alert_channel_delivery("alert-1", "RaisingChannel")
         assert state.delivery_attempts == 1
         assert "boom exploded" in state.last_error
@@ -358,7 +372,7 @@ class TestPerChannelIdempotency:
 
         def _make_tracking_channel(label):
             class _TrackingChannel:
-                def deliver(self, alert):
+                def deliver(self, message):
                     order.append(label)
                     return AlertDeliveryResult(success=True, error_message=None, delivered_at=_now())
             _TrackingChannel.__name__ = f"TrackingChannel{label}"
@@ -366,7 +380,7 @@ class TestPerChannelIdempotency:
 
         c_a, c_b, c_c = _make_tracking_channel("A"), _make_tracking_channel("B"), _make_tracking_channel("C")
         composite = CompositeNotificationChannel([c_a, c_b, c_c], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        composite.deliver(alert)
+        composite.deliver(_message())
         assert order == ["A", "B", "C"]
 
     def test_empty_or_all_disabled_channels_is_explicit_success(self, tmp_path):
@@ -374,7 +388,7 @@ class TestPerChannelIdempotency:
         alert = _alert()
         _seed_alert(repo, alert)
         composite = CompositeNotificationChannel([], repository=repo, max_attempts=3, clock=FixedClock(_now()))
-        result = composite.deliver(alert)
+        result = composite.deliver(_message())
         assert result.success is True
         assert result.error_message is None
         # Sin canales, no se persiste ningún estado por canal.
@@ -402,15 +416,17 @@ class TestPerChannelIdempotency:
 class TestConstructorSignatureCompatibility:
     """Etapa 6.10.1 (§25.4): `channel` queda como nombre oficial del
     parámetro; `sink=` no se restaura (sin uso interno, confirmado por
-    auditoría). Esta prueba fija la firma actual para detectar cualquier
-    cambio accidental futuro."""
+    auditoría). Etapa 6.11 (§26) agrega `template` al final (con default
+    `DefaultInspectionNotificationTemplate()`), sin alterar ninguno de
+    los parámetros anteriores. Esta prueba fija la firma actual para
+    detectar cualquier cambio accidental futuro."""
 
-    def test_current_signature_is_repository_channel_max_attempts_clock(self):
+    def test_current_signature_is_repository_channel_max_attempts_clock_template(self):
         import inspect
         from src.paper_trading.alert_delivery_service import AlertDeliveryService
 
         params = list(inspect.signature(AlertDeliveryService.__init__).parameters)
-        assert params == ["self", "repository", "channel", "max_attempts", "clock"]
+        assert params == ["self", "repository", "channel", "max_attempts", "clock", "template"]
 
     def test_sink_keyword_no_longer_works(self, tmp_path):
         from src.paper_trading.alert_delivery_service import AlertDeliveryService
@@ -446,6 +462,6 @@ class TestLegacyAliasesStillWork:
         from src.paper_trading.alert_sink import NullInspectionAlertSink
 
         channel = NullInspectionAlertSink(clock=FixedClock(_now()))
-        result = channel.deliver(_alert())
+        result = channel.deliver(_message())
         assert result.success is True
         assert result.delivered_at == _now()
