@@ -623,17 +623,6 @@ class TestPlaceholderChannelsBlockedAtStartup:
             )
         assert "SlackNotificationChannel" in str(exc_info.value)
 
-    def test_telegram_true_fails_to_build_context(self, tmp_path):
-        from src.utils.config import InspectionNotificationsConfig
-
-        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(telegram=True))
-        with pytest.raises(ValueError) as exc_info:
-            build_paper_trading_context(
-                config=config, clock=FixedClock(_now()),
-                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-            )
-        assert "TelegramNotificationChannel" in str(exc_info.value)
-
     def test_webhook_true_fails_to_build_context(self, tmp_path):
         from src.utils.config import InspectionNotificationsConfig
 
@@ -649,14 +638,14 @@ class TestPlaceholderChannelsBlockedAtStartup:
         from src.utils.config import InspectionNotificationsConfig
 
         config = _config(
-            tmp_path, inspection_notifications=InspectionNotificationsConfig(telegram=True, slack=True),
+            tmp_path, inspection_notifications=InspectionNotificationsConfig(webhook=True, slack=True),
         )
         with pytest.raises(ValueError) as exc_info:
             build_paper_trading_context(
                 config=config, clock=FixedClock(_now()),
                 id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
             )
-        assert "TelegramNotificationChannel" in str(exc_info.value)
+        assert "WebhookNotificationChannel" in str(exc_info.value)
         assert "SlackNotificationChannel" in str(exc_info.value)
 
     def test_logging_true_works(self, tmp_path):
@@ -678,6 +667,162 @@ class TestPlaceholderChannelsBlockedAtStartup:
         assert context.alert_delivery_service._channel._channels == []
         result = context.application.deliver_pending_reconciliation_alerts()
         assert result.failed_count == 0
+
+
+class TestTelegramChannelWiring:
+    """Etapa 6.12 (§27): TelegramNotificationChannel deja de ser
+    placeholder -- se construye e inyecta como canal real cuando
+    inspection_notifications.telegram=True y las credenciales son
+    válidas."""
+
+    def test_disabled_by_default_telegram_not_constructed(self, tmp_path):
+        from src.paper_trading.notification_channels import TelegramNotificationChannel
+
+        config = _config(tmp_path)  # default: telegram=False
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert not any(isinstance(c, TelegramNotificationChannel) for c in channels)
+
+    def test_disabled_by_default_does_not_require_token_or_chat_id(self, tmp_path):
+        from src.utils.config import TelegramSettings
+
+        config = _config(tmp_path, telegram=TelegramSettings(bot_token=None, chat_id=None))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_disabled_preserves_previous_behavior(self, tmp_path):
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        from src.paper_trading.notification_channels import LoggingNotificationChannel
+
+        channels = context.alert_delivery_service._channel._channels
+        assert len(channels) == 1
+        assert isinstance(channels[0], LoggingNotificationChannel)
+
+    def test_enabled_and_configured_builds_telegram_channel(self, tmp_path):
+        from src.paper_trading.notification_channels import TelegramNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat", timeout_seconds=7.5),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        telegram_channels = [c for c in channels if isinstance(c, TelegramNotificationChannel)]
+        assert len(telegram_channels) == 1
+        telegram_channel = telegram_channels[0]
+        assert telegram_channel._bot_token == "tok"
+        assert telegram_channel._chat_id == "chat"
+        assert telegram_channel._timeout_seconds == 7.5
+
+    def test_enabled_incorporates_into_composite_after_logging(self, tmp_path):
+        from src.paper_trading.notification_channels import LoggingNotificationChannel, TelegramNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(logging=True, telegram=True),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat"),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert [type(c) for c in channels] == [LoggingNotificationChannel, TelegramNotificationChannel]
+
+    def test_enabled_without_token_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token=None, chat_id="chat"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "bot token" in str(exc_info.value).lower()
+
+    def test_enabled_without_chat_id_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token="tok", chat_id=None),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "chat id" in str(exc_info.value).lower()
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5])
+    def test_enabled_with_invalid_timeout_fails_to_build_context(self, tmp_path, bad_timeout):
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat", timeout_seconds=bad_timeout),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_telegram_error_never_includes_the_token(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token=None, chat_id="chat"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "chat" not in str(exc_info.value)  # el chat_id real tampoco se filtra por accidente
+
+    def test_other_placeholders_remain_blocked_at_startup(self, tmp_path):
+        """Etapa 6.12 (§27, punto 20): Email/Slack/Webhook deben seguir
+        bloqueados como placeholders -- solo Telegram deja de estarlo."""
+        from src.utils.config import InspectionNotificationsConfig
+
+        for flag, class_name in (
+            ("email", "EmailNotificationChannel"),
+            ("slack", "SlackNotificationChannel"),
+            ("webhook", "WebhookNotificationChannel"),
+        ):
+            config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(**{flag: True}))
+            with pytest.raises(ValueError) as exc_info:
+                build_paper_trading_context(
+                    config=config, clock=FixedClock(_now()),
+                    id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+                )
+            assert class_name in str(exc_info.value)
 
 
 class TestNotificationTemplateWiring:

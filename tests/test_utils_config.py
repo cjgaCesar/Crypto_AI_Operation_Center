@@ -115,6 +115,51 @@ def test_load_settings_reads_credentials_from_env_file(tmp_path, monkeypatch):
     assert settings.ai_engine.future_api_key == "futura_clave"
 
 
+def test_telegram_settings_default_timeout_when_env_unset(tmp_path, monkeypatch):
+    for var in ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_TIMEOUT_SECONDS"]:
+        monkeypatch.delenv(var, raising=False)
+
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    assert settings.telegram.bot_token is None
+    assert settings.telegram.chat_id is None
+    assert settings.telegram.timeout_seconds == 10.0
+
+
+def test_telegram_settings_reads_all_fields_from_env(tmp_path, monkeypatch):
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "TELEGRAM_BOT_TOKEN=token_de_prueba\nTELEGRAM_CHAT_ID=chat_de_prueba\nTELEGRAM_TIMEOUT_SECONDS=15.5\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert settings.telegram.bot_token == "token_de_prueba"
+    assert settings.telegram.chat_id == "chat_de_prueba"
+    assert settings.telegram.timeout_seconds == 15.5
+
+
+def test_paper_trading_telegram_mirrors_top_level_telegram_settings(tmp_path, monkeypatch):
+    """Etapa 6.12: `paper_trading.telegram` reutiliza la misma
+    `TelegramSettings` que `settings.telegram` -- nunca un segundo
+    sistema de credenciales."""
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "TELEGRAM_BOT_TOKEN=token_de_prueba\nTELEGRAM_CHAT_ID=chat_de_prueba\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert settings.paper_trading.telegram == settings.telegram
+    assert settings.paper_trading.telegram.bot_token == "token_de_prueba"
+    assert settings.paper_trading.telegram.chat_id == "chat_de_prueba"
+
+
 def test_missing_config_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_settings(config_path=tmp_path / "no_existe.yaml", env_path=tmp_path / ".env")

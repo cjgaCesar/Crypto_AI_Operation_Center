@@ -1,24 +1,27 @@
 """
 Pruebas para src/paper_trading/notification_channels.py (Etapa 6.10,
-ampliado en 6.10.1 con idempotencia de entrega por canal, y en 6.11
-para transportar NotificationMessage en vez de InspectionAlert):
-patrón Strategy para la entrega de alertas de inspección.
-Ver docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26.
+ampliado en 6.10.1 con idempotencia de entrega por canal, en 6.11 para
+transportar NotificationMessage en vez de InspectionAlert, y en 6.12
+con el canal real de Telegram): patrón Strategy para la entrega de
+alertas de inspección. Ver docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27.
 """
 
 from datetime import datetime, timezone
 
 import pytest
 
+from src.paper_trading.alert_delivery_service import AlertDeliveryService
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertType, AlertStatus, InspectionAlert
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.notification_channels import (
-    CompositeNotificationChannel, EmailNotificationChannel, LoggingNotificationChannel,
-    NullNotificationChannel, SlackNotificationChannel, TelegramNotificationChannel,
-    WebhookNotificationChannel,
+    TELEGRAM_MAX_MESSAGE_LENGTH, CompositeNotificationChannel, EmailNotificationChannel,
+    LoggingNotificationChannel, NullNotificationChannel, SlackNotificationChannel,
+    TelegramNotificationChannel, WebhookNotificationChannel, _format_telegram_text,
 )
-from src.paper_trading.notification_templates import NotificationMessage
+from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, NotificationMessage
+from src.paper_trading.reconciliation_models import IssueSeverity
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
+from src.paper_trading.telegram_transport import TelegramTransportError
 
 
 class FixedClock:
@@ -159,9 +162,12 @@ class TestNullChannel:
 
 
 class TestPlaceholderChannelsRaiseNotImplemented:
+    """Etapa 6.12 (§27): TelegramNotificationChannel deja de ser
+    placeholder -- ya no aparece en esta lista, tiene sus propias
+    pruebas en TestTelegramNotificationChannel."""
+
     @pytest.mark.parametrize("channel_class", [
-        EmailNotificationChannel, SlackNotificationChannel,
-        TelegramNotificationChannel, WebhookNotificationChannel,
+        EmailNotificationChannel, SlackNotificationChannel, WebhookNotificationChannel,
     ])
     def test_deliver_raises_not_implemented(self, channel_class):
         channel = channel_class()
@@ -169,8 +175,7 @@ class TestPlaceholderChannelsRaiseNotImplemented:
             channel.deliver(_message())
 
     @pytest.mark.parametrize("channel_class", [
-        EmailNotificationChannel, SlackNotificationChannel,
-        TelegramNotificationChannel, WebhookNotificationChannel,
+        EmailNotificationChannel, SlackNotificationChannel, WebhookNotificationChannel,
     ])
     def test_error_message_is_clear(self, channel_class):
         channel = channel_class()
@@ -465,3 +470,266 @@ class TestLegacyAliasesStillWork:
         result = channel.deliver(_message())
         assert result.success is True
         assert result.delivered_at == _now()
+
+
+class FakeTelegramTransport:
+    """Doble de TelegramTransport: nunca realiza ninguna conexión real."""
+
+    def __init__(self, fail_times: int = 0, error_message: str = "Telegram API returned an unsuccessful response."):
+        self.calls: list = []
+        self._fail_times = fail_times
+        self._error_message = error_message
+
+    def send_message(self, *, bot_token, chat_id, text, timeout_seconds):
+        self.calls.append(dict(bot_token=bot_token, chat_id=chat_id, text=text, timeout_seconds=timeout_seconds))
+        if len(self.calls) <= self._fail_times:
+            raise TelegramTransportError(self._error_message)
+
+
+class TestTelegramTextFormat:
+    """Etapa 6.12 (§27): _format_telegram_text() es pura, determinista,
+    nunca HTML/Markdown, nunca incluye metadata/alert_id."""
+
+    def test_includes_title_and_body(self):
+        message = NotificationMessage(alert_id="a1", title="Titulo", body="Cuerpo", severity=None)
+        text = _format_telegram_text(message)
+        assert "Titulo" in text
+        assert "Cuerpo" in text
+
+    def test_includes_severity_when_present(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        text = _format_telegram_text(message)
+        assert "Severidad: CRITICAL" in text
+
+    def test_omits_severity_line_when_none(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        text = _format_telegram_text(message)
+        assert "Severidad" not in text
+
+    def test_does_not_include_metadata_or_alert_id(self):
+        message = NotificationMessage(
+            alert_id="alert-secreto", title="T", body="B", severity=None,
+            metadata={"run_id": "run-1", "alert_type": "NEW_ISSUE"},
+        )
+        text = _format_telegram_text(message)
+        assert "alert-secreto" not in text
+        assert "run-1" not in text
+        assert "alert_type" not in text
+
+    def test_never_contains_html_or_telegram_markdown(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        text = _format_telegram_text(message)
+        for forbidden in ("<b>", "<i>", "*bold*", "_italic_", "```", "[link]("):
+            assert forbidden not in text
+
+    def test_is_deterministic(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        assert _format_telegram_text(message) == _format_telegram_text(message)
+
+
+class TestTelegramTextLength:
+    def test_short_text_is_not_altered(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="cuerpo corto", severity=None)
+        text = _format_telegram_text(message)
+        assert text == "T\n\ncuerpo corto"
+
+    def test_text_at_exact_limit_is_not_truncated(self):
+        body = "x" * (TELEGRAM_MAX_MESSAGE_LENGTH - len("T\n\n"))
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_telegram_text(message)
+        assert len(text) == TELEGRAM_MAX_MESSAGE_LENGTH
+        assert "truncado" not in text
+
+    def test_text_over_limit_is_truncated_with_mark(self):
+        body = "x" * (TELEGRAM_MAX_MESSAGE_LENGTH * 2)
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_telegram_text(message)
+        assert len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH
+        assert text.endswith("[Mensaje truncado]")
+
+    def test_truncated_text_never_exceeds_max_length(self):
+        body = "y" * (TELEGRAM_MAX_MESSAGE_LENGTH + 1)
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_telegram_text(message)
+        assert len(text) == TELEGRAM_MAX_MESSAGE_LENGTH
+
+
+class TestTelegramNotificationChannelConstructor:
+    def test_requires_bot_token(self):
+        with pytest.raises(ValueError):
+            TelegramNotificationChannel(bot_token="", chat_id="c", transport=FakeTelegramTransport())
+
+    def test_requires_chat_id(self):
+        with pytest.raises(ValueError):
+            TelegramNotificationChannel(bot_token="t", chat_id="", transport=FakeTelegramTransport())
+
+    def test_rejects_blank_bot_token(self):
+        with pytest.raises(ValueError):
+            TelegramNotificationChannel(bot_token="   ", chat_id="c", transport=FakeTelegramTransport())
+
+    def test_requires_positive_timeout(self):
+        with pytest.raises(ValueError):
+            TelegramNotificationChannel(bot_token="t", chat_id="c", transport=FakeTelegramTransport(), timeout_seconds=0)
+
+    def test_rejects_negative_timeout(self):
+        with pytest.raises(ValueError):
+            TelegramNotificationChannel(
+                bot_token="t", chat_id="c", transport=FakeTelegramTransport(), timeout_seconds=-1,
+            )
+
+    def test_valid_configuration_constructs_successfully(self):
+        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=FakeTelegramTransport())
+        assert channel is not None
+
+
+class TestTelegramNotificationChannelDelivery:
+    def test_successful_delivery_invokes_transport_once(self):
+        transport = FakeTelegramTransport()
+        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()))
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        result = channel.deliver(message)
+        assert result.success is True
+        assert len(transport.calls) == 1
+
+    def test_uses_injected_clock_for_delivered_at(self):
+        fixed = datetime(2030, 6, 6, tzinfo=timezone.utc)
+        channel = TelegramNotificationChannel(
+            bot_token="t", chat_id="c", transport=FakeTelegramTransport(), clock=FixedClock(fixed),
+        )
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.delivered_at == fixed
+
+    def test_does_not_modify_the_message(self):
+        transport = FakeTelegramTransport()
+        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport)
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        channel.deliver(message)
+        assert message == NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+
+    def test_transport_receives_chat_id_and_bot_token(self):
+        transport = FakeTelegramTransport()
+        channel = TelegramNotificationChannel(bot_token="secret-token", chat_id="chat-42", transport=transport)
+        channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert transport.calls[0]["bot_token"] == "secret-token"
+        assert transport.calls[0]["chat_id"] == "chat-42"
+        assert transport.calls[0]["timeout_seconds"] == 10.0
+
+    def test_transport_failure_returns_failed_result_without_raising(self):
+        transport = FakeTelegramTransport(fail_times=99)
+        channel = TelegramNotificationChannel(bot_token="secret-token", chat_id="c", transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+        assert "secret-token" not in result.error_message
+
+    def test_transport_failure_never_leaks_bot_token(self):
+        transport = FakeTelegramTransport(fail_times=99, error_message="Telegram API request failed (HTTP 401).")
+        channel = TelegramNotificationChannel(bot_token="MY-SUPER-SECRET", chat_id="c", transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert "MY-SUPER-SECRET" not in result.error_message
+
+    def test_deliver_never_retries_internally(self):
+        transport = FakeTelegramTransport(fail_times=1)
+        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+        assert len(transport.calls) == 1  # una sola solicitud por llamada a deliver()
+
+
+class TestTelegramChannelIdentity:
+    """Etapa 6.12 (§27, punto 14): la identidad persistente del canal
+    sigue siendo type(channel).__name__ == 'TelegramNotificationChannel'."""
+
+    def test_persisted_identity_is_the_class_name(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-tg", deduplication_key="k-tg")
+        _seed_alert(repo, alert)
+        transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()))
+        composite = CompositeNotificationChannel([telegram_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()))
+        composite.deliver(_message(alert_id="alert-tg"))
+        state = repo.get_alert_channel_delivery("alert-tg", "TelegramNotificationChannel")
+        assert state is not None
+        assert state.status == AlertStatus.DELIVERED
+
+
+class TestTelegramEndToEndWithoutInternet:
+    """Punto 21: integración interna completa (repositorio real,
+    DefaultInspectionNotificationTemplate real, TelegramNotificationChannel
+    con FakeTelegramTransport, CompositeNotificationChannel,
+    AlertDeliveryService), sin ninguna conexión real a internet."""
+
+    def test_full_pipeline_delivers_and_never_resends(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+
+        alert = InspectionAlert(
+            id="alert-e2e", run_id="run-e2e", alert_type=AlertType.NEW_ISSUE, issue_identity=None,
+            issue_code=None, severity=None, title="t", message="Inconsistencia detectada.",
+            deduplication_key="dedup-e2e", status=AlertStatus.PENDING, delivery_attempts=0,
+            last_error=None, created_at=_now(),
+        )
+        _seed_alert(repo1, alert)
+
+        transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(
+            bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()),
+        )
+        composite1 = CompositeNotificationChannel([telegram_channel], repository=repo1, max_attempts=3, clock=FixedClock(_now()))
+        service1 = AlertDeliveryService(
+            repo1, composite1, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+
+        result = service1.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(transport.calls) == 1
+        assert "Inconsistencia detectada." in transport.calls[0]["text"]
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-e2e").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-e2e", "TelegramNotificationChannel").status == AlertStatus.DELIVERED
+
+        # Segundo procesamiento: no reenvía (ya no queda PENDING).
+        service1.deliver_pending_alerts()
+        assert len(transport.calls) == 1
+
+        # "Reinicio": nueva instancia de repositorio + servicios sobre el mismo archivo.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel([telegram_channel], repository=repo2, max_attempts=3, clock=FixedClock(_now()))
+        service2 = AlertDeliveryService(
+            repo2, composite2, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+        service2.deliver_pending_alerts()
+        assert len(transport.calls) == 1  # Telegram no se vuelve a invocar tras el reinicio.
+
+
+class TestTelegramFailThenSucceed:
+    """Punto 22: intento 1 falla, intento 2 tiene éxito."""
+
+    def test_first_attempt_fails_second_succeeds(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-retry", deduplication_key="dedup-retry")
+        _seed_alert(repo, alert)
+
+        transport = FakeTelegramTransport(fail_times=1)
+        telegram_channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()))
+        good_channel = AlwaysSucceedsChannel("good")
+        composite = CompositeNotificationChannel(
+            [good_channel, telegram_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service = AlertDeliveryService(repo, composite, max_attempts=3, clock=FixedClock(_now()))
+
+        service.deliver_pending_alerts()
+        telegram_state_1 = repo.get_alert_channel_delivery("alert-retry", "TelegramNotificationChannel")
+        assert telegram_state_1.status == AlertStatus.PENDING
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-retry").status == AlertStatus.PENDING
+        assert good_channel.delivered == ["alert-retry"]
+
+        service.deliver_pending_alerts()
+        telegram_state_2 = repo.get_alert_channel_delivery("alert-retry", "TelegramNotificationChannel")
+        assert telegram_state_2.status == AlertStatus.DELIVERED
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-retry").status == AlertStatus.DELIVERED
+        assert good_channel.delivered == ["alert-retry"]  # el canal exitoso nunca se repite
+        assert len(transport.calls) == 2

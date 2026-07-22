@@ -16,14 +16,23 @@ la misma implementación que `LoggingInspectionAlertSink`/
 `NullInspectionAlertSink` (Etapa 6.9, ver alert_sink.py, que ahora las
 reexporta como alias por compatibilidad hacia atrás).
 
-Los 4 canales placeholder (`EmailNotificationChannel`,
-`SlackNotificationChannel`, `TelegramNotificationChannel`,
-`WebhookNotificationChannel`) NO realizan ninguna conexión real: no
-importan `smtplib`, `requests`, `slack_sdk`, `telegram` ni `aiohttp`.
-Simplemente lanzan `NotImplementedError` con un mensaje explícito --
-quedan preparados para una etapa posterior (fuera de alcance de la
-6.10/6.10.1/6.11: SMTP, Slack API, Telegram API, webhooks HTTP reales,
+Los placeholders restantes (`EmailNotificationChannel`,
+`SlackNotificationChannel`, `WebhookNotificationChannel`) NO realizan
+ninguna conexión real: no importan `smtplib`, `requests`, `slack_sdk`
+ni `aiohttp`. Simplemente lanzan `NotImplementedError` con un mensaje
+explícito -- quedan preparados para una etapa posterior (fuera de
+alcance de la 6.10/6.10.1/6.11: SMTP, Slack API, webhooks HTTP reales,
 secretos/tokens/OAuth).
+
+Etapa 6.12 (§27): `TelegramNotificationChannel` deja de ser un
+placeholder. Es un canal real que transporta un `NotificationMessage`
+ya renderizado vía la API de Telegram, a través de un
+`TelegramTransport` inyectado (telegram_transport.py, único módulo que
+conoce `urllib`/el endpoint HTTP oficial). Nunca conoce
+`InspectionAlert`, nunca accede al repositorio, nunca decide
+reintentos (eso sigue siendo exclusivo de `AlertDeliveryService`/
+`CompositeNotificationChannel`) -- `deliver()` realiza como máximo una
+solicitud HTTP por llamada.
 
 Etapa 6.10.1 (§25.2): `CompositeNotificationChannel` deja de llevar la
 lógica de reintentos únicamente en memoria. Ahora recibe `repository` y
@@ -57,8 +66,12 @@ from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, Ins
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.notification_templates import NotificationMessage
 from src.paper_trading.runtime import Clock, SystemClock
+from src.paper_trading.telegram_transport import TelegramTransport
 
 logger = logging.getLogger(__name__)
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+_TELEGRAM_TRUNCATION_MARK = "\n[Mensaje truncado]"
 
 
 class InspectionNotificationChannel(Protocol):
@@ -136,17 +149,71 @@ class SlackNotificationChannel:
         )
 
 
-class TelegramNotificationChannel:
-    """Placeholder: la API real de Telegram queda fuera de alcance de la Etapa 6.10.
+def _format_telegram_text(message: NotificationMessage) -> str:
+    """Adapta un NotificationMessage ya renderizado al texto plano que
+    Telegram transporta (§27). Pura y determinista: nunca HTML, nunca
+    Markdown específico de Telegram, nunca incluye metadata completa ni
+    `alert_id` (decisión explícita, ver §27 -- el texto es solo para
+    lectura humana, no para correlación). Trunca de forma controlada si
+    el resultado supera TELEGRAM_MAX_MESSAGE_LENGTH, marcando el corte
+    con `_TELEGRAM_TRUNCATION_MARK`; nunca divide en varios mensajes."""
+    lines = [message.title, "", message.body]
+    if message.severity is not None:
+        lines.append("")
+        lines.append(f"Severidad: {message.severity.value}")
+    text = "\n".join(lines)
 
-    No importa `telegram` ni realiza ninguna llamada HTTP. `deliver()`
-    siempre lanza `NotImplementedError`."""
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        return text
+
+    truncated_length = TELEGRAM_MAX_MESSAGE_LENGTH - len(_TELEGRAM_TRUNCATION_MARK)
+    return text[:truncated_length] + _TELEGRAM_TRUNCATION_MARK
+
+
+class TelegramNotificationChannel:
+    """Canal real (Etapa 6.12, §27): entrega vía la API de Telegram a
+    través de un `TelegramTransport` inyectado (telegram_transport.py).
+
+    Nunca conoce `InspectionAlert` (solo `NotificationMessage`, igual
+    que el resto de los canales), nunca accede al repositorio, nunca
+    persiste estado directamente, y nunca decide reintentos globales ni
+    por canal -- eso es responsabilidad exclusiva de
+    `AlertDeliveryService`/`CompositeNotificationChannel` (§25.2).
+    `deliver()` realiza como máximo UNA solicitud HTTP por llamada: no
+    reintenta internamente.
+    """
+
+    def __init__(
+        self,
+        *,
+        bot_token: str,
+        chat_id: str,
+        transport: TelegramTransport,
+        clock: Clock = SystemClock(),
+        timeout_seconds: float = 10.0,
+    ):
+        if not bot_token or not bot_token.strip():
+            raise ValueError("Telegram bot token is required when Telegram notifications are enabled.")
+        if not chat_id or not chat_id.strip():
+            raise ValueError("Telegram chat ID is required when Telegram notifications are enabled.")
+        if timeout_seconds <= 0:
+            raise ValueError("Telegram timeout must be greater than zero.")
+        self._bot_token = bot_token
+        self._chat_id = chat_id
+        self._transport = transport
+        self._clock = clock
+        self._timeout_seconds = timeout_seconds
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        raise NotImplementedError(
-            "TelegramNotificationChannel todavía no está implementado (la integración con Telegram "
-            "queda para una etapa posterior)."
-        )
+        text = _format_telegram_text(message)
+        try:
+            self._transport.send_message(
+                bot_token=self._bot_token, chat_id=self._chat_id, text=text,
+                timeout_seconds=self._timeout_seconds,
+            )
+            return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
+        except Exception as exc:
+            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
 
 
 class WebhookNotificationChannel:

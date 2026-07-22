@@ -47,6 +47,18 @@ sin configuración nueva) en `AlertDeliveryService`. Ni `AlertDeliveryService`
 ni ningún canal construyen su propia plantilla -- la Composition Root es
 la única capa que decide qué plantilla se usa, igual que ya decide qué
 canales concretos entran en la lista.
+
+Etapa 6.12 (§27): `TelegramNotificationChannel` deja de ser un
+placeholder bloqueado en el arranque. Cuando
+`inspection_notifications.telegram` es `true`, esta función valida
+`config.telegram` (bot_token/chat_id/timeout_seconds -- mismas
+credenciales que `Settings.telegram`, ver src/utils/config.py, nunca un
+segundo sistema de configuración), construye el
+`UrllibTelegramTransport` real y agrega `TelegramNotificationChannel` a
+la lista, después de `LoggingNotificationChannel` si ambos están
+habilitados (orden determinista, ver §27). Cuando está deshabilitado
+(default), no se construye nada relacionado con Telegram y no se
+requiere ningún token/chat_id.
 """
 
 import logging
@@ -77,7 +89,8 @@ from src.paper_trading.risk_engine import RiskEngine
 from src.paper_trading.runtime import Clock, IdGenerator
 from src.paper_trading.service import PaperTradingService
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
-from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig
+from src.paper_trading.telegram_transport import UrllibTelegramTransport
+from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig, TelegramSettings
 
 logger = logging.getLogger(__name__)
 
@@ -128,18 +141,19 @@ def seed_initial_cash_balance(
 
 
 # Nombre de config -> nombre de clase placeholder, para el mensaje de
-# error de _build_notification_channel() (§25.3). Ninguno de estos 4
-# canales tiene una conexión real todavía.
+# error de _build_notification_channel() (§25.3). Ninguno de estos 3
+# canales tiene una conexión real todavía. `telegram` sale de esta
+# lista en la Etapa 6.12 (§27): ya es un canal real, no un placeholder.
 _PLACEHOLDER_CHANNEL_NAMES = {
     "email": "EmailNotificationChannel",
     "slack": "SlackNotificationChannel",
-    "telegram": "TelegramNotificationChannel",
     "webhook": "WebhookNotificationChannel",
 }
 
 
 def _build_notification_channel(
     config: InspectionNotificationsConfig,
+    telegram_settings: TelegramSettings,
     repository: PaperTradingRepository,
     max_attempts: int,
     clock: Clock,
@@ -151,7 +165,16 @@ def _build_notification_channel(
 
     Etapa 6.10.1 (§25.3): falla de inmediato, antes de construir nada,
     si algún placeholder está habilitado -- nunca espera a la primera
-    alerta para descubrir que ese canal no está implementado."""
+    alerta para descubrir que ese canal no está implementado.
+
+    Etapa 6.12 (§27): si `config.telegram` es `true`, construye
+    `TelegramNotificationChannel` con `UrllibTelegramTransport()`
+    (único punto de construcción del transporte real) y las
+    credenciales de `telegram_settings`. La validación de
+    bot_token/chat_id/timeout_seconds ocurre dentro del propio
+    constructor de `TelegramNotificationChannel` -- si falta algo, esta
+    función también falla de inmediato, antes de construir el resto del
+    contexto, con el mismo criterio que los placeholders."""
     enabled_placeholders = [
         class_name for flag, class_name in _PLACEHOLDER_CHANNEL_NAMES.items() if getattr(config, flag)
     ]
@@ -166,6 +189,14 @@ def _build_notification_channel(
     channels: list[InspectionNotificationChannel] = []
     if config.logging:
         channels.append(LoggingNotificationChannel(clock=clock))
+    if config.telegram:
+        channels.append(TelegramNotificationChannel(
+            bot_token=telegram_settings.bot_token,
+            chat_id=telegram_settings.chat_id,
+            transport=UrllibTelegramTransport(),
+            clock=clock,
+            timeout_seconds=telegram_settings.timeout_seconds,
+        ))
     return CompositeNotificationChannel(channels, repository=repository, max_attempts=max_attempts, clock=clock)
 
 
@@ -212,7 +243,7 @@ def build_paper_trading_context(
     alert_delivery_service = AlertDeliveryService(
         repository=repository,
         channel=_build_notification_channel(
-            config.inspection_notifications, repository,
+            config.inspection_notifications, config.telegram, repository,
             config.reconciliation_inspection.max_alert_delivery_attempts, clock,
         ),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,

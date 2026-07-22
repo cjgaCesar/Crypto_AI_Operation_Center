@@ -2957,3 +2957,185 @@ el procesamiento de las siguientes. La idempotencia por canal
 usando `(alert_id, channel_name)` como clave compuesta, solo cambia de
 dónde lee `alert_id` (`message.alert_id` en vez de
 `message.metadata["alert_id"]`).
+
+## 27. Canal de notificaciones Telegram (Etapa 6.12)
+
+Primer canal externo real de `inspection_notifications`, construido
+sobre la arquitectura ya aprobada (§24-§26.x): `AlertDeliveryService`
+sigue sin conocer canales concretos, `TelegramNotificationChannel`
+sigue sin conocer `InspectionAlert`, y la idempotencia por canal
+(§25.2) sigue operando exactamente igual. Deshabilitado por defecto;
+no requiere ninguna credencial mientras esté deshabilitado.
+
+### 27.1 Flujo completo
+
+```
+InspectionAlert
+  ↓
+DefaultInspectionNotificationTemplate   (§26 -- sin cambios en 6.12)
+  ↓
+NotificationMessage                     (§26.x -- alert_id explícito, sin cambios en 6.12)
+  ↓
+TelegramNotificationChannel             (nuevo en 6.12: adapta el mensaje a texto plano)
+  ↓
+TelegramTransport (Protocol)            (nuevo en 6.12: abstracción de transporte)
+  ↓
+UrllibTelegramTransport                 (nuevo en 6.12: única implementación real)
+  ↓
+Telegram Bot API (POST /bot<token>/sendMessage)
+```
+
+### 27.2 Responsabilidades por capa
+
+- **Template** (`notification_templates.py`, sin cambios en esta
+  etapa): sigue siendo el único responsable de construir
+  `title`/`body`/`severity` a partir de `InspectionAlert`. Telegram
+  nunca reconstruye contenido de dominio -- solo adapta lo que la
+  plantilla ya produjo.
+- **`TelegramNotificationChannel`** (`notification_channels.py`):
+  recibe únicamente `NotificationMessage`, nunca `InspectionAlert`. Su
+  única responsabilidad de formato es `_format_telegram_text()` (una
+  función privada y pura, ver §27.3). No accede al repositorio, no
+  persiste estado, no decide reintentos (eso sigue siendo exclusivo de
+  `CompositeNotificationChannel`/`AlertDeliveryService`, §25.2/§26.x) y
+  realiza como máximo **una** solicitud HTTP por llamada a `deliver()`
+  (ver §27.6). Valida `bot_token`/`chat_id`/`timeout_seconds` en su
+  propio constructor, nunca contra la red.
+- **`TelegramTransport`** (`telegram_transport.py`, `Protocol` +
+  `UrllibTelegramTransport`): única capa que conoce `urllib`/el
+  endpoint HTTP oficial de Telegram. Construye la solicitud POST,
+  aplica el timeout, interpreta la respuesta JSON y convierte
+  cualquier fallo en `TelegramTransportError` con un mensaje
+  sanitizado. No conoce el formato del mensaje, no reintenta, no
+  persiste, no lee variables de entorno.
+- **Telegram Bot API**: el servicio externo real -- fuera del alcance
+  del proyecto, solo se le habla vía HTTP estándar.
+
+### 27.3 Formato del mensaje (`_format_telegram_text`)
+
+Función privada y pura en `notification_channels.py`:
+
+```
+{message.title}
+
+{message.body}
+
+Severidad: {message.severity.value}   -- solo si severity is not None
+```
+
+Texto plano únicamente: nunca HTML, nunca Markdown específico de
+Telegram (`*bold*`, `_italic_`, etc.), nunca incluye `metadata`
+completa ni `alert_id` (decisión explícita: el texto es para lectura
+humana, no para correlación -- `alert_id` ya vive fuera del mensaje
+transportado, en el campo propio de `NotificationMessage`, §26.x).
+
+### 27.4 Límite de longitud
+
+`TELEGRAM_MAX_MESSAGE_LENGTH = 4096`. Si el texto formateado supera el
+límite, se trunca de forma controlada y se agrega la marca
+`"\n[Mensaje truncado]"` al final, garantizando que el resultado nunca
+exceda `TELEGRAM_MAX_MESSAGE_LENGTH`. Esta etapa no divide un mensaje
+largo en varios envíos (evita entregas parciales y una idempotencia
+más compleja) -- queda para una etapa futura si se necesitara.
+
+### 27.5 Timeout obligatorio
+
+Toda solicitud real usa `urlopen(request, timeout=timeout_seconds)`
+-- nunca una llamada sin timeout. `timeout_seconds` se valida (`> 0`)
+en el constructor de `TelegramNotificationChannel`, con default
+`10.0` si no se especifica.
+
+### 27.6 Ausencia de reintentos internos
+
+Ni `TelegramTransport` ni `TelegramNotificationChannel` reintentan
+nada por sí mismos. Cada llamada a `deliver()` genera como máximo una
+solicitud HTTP. Toda la lógica de reintentos (intentos globales,
+intentos por canal, `PENDING`/`FAILED`, idempotencia) sigue siendo
+exclusiva de `AlertDeliveryService`/`CompositeNotificationChannel`
+(§25.2) -- Telegram encaja en esa arquitectura sin ningún cambio en
+ninguna de las dos clases.
+
+### 27.7 Idempotencia externa
+
+La identidad persistente del canal (§25.2, tabla
+`paper_trading_inspection_alert_channel_deliveries`) sigue siendo
+`type(channel).__name__ == "TelegramNotificationChannel"` -- sin
+cambios de diseño en esta etapa (la limitación conocida de identidad
+por clase, documentada en `CompositeNotificationChannel`, sigue
+aplicando igual que a los demás canales). Un envío ya `DELIVERED`
+nunca se reintenta, sobrevive reinicios y reconstrucciones de la
+Composition Root, exactamente igual que `LoggingNotificationChannel`.
+
+### 27.8 Manejo y sanitización de errores
+
+`UrllibTelegramTransport` distingue: HTTP no exitoso, timeout, error de
+red/DNS, JSON inválido (incluida una respuesta vacía) y `{"ok": false}`/
+ausencia del campo `"ok"`. Todos se convierten en `TelegramTransportError`
+con un mensaje claro (ej. `"Telegram API request failed (HTTP 401)."`,
+`"Telegram API returned invalid JSON."`) que **nunca** incluye el
+token, la URL completa, encabezados ni el cuerpo completo de la
+respuesta -- solo, cuando está disponible, el código HTTP.
+`TelegramNotificationChannel.deliver()` captura cualquier excepción del
+transporte (incluida `TelegramTransportError`) y la convierte en un
+`AlertDeliveryResult(success=False, ...)`, igual que
+`LoggingNotificationChannel`.
+
+### 27.9 Configuración
+
+Reutiliza el sistema de configuración existente (`src/utils/config.py`),
+sin crear uno nuevo:
+
+- **Activación**: `paper_trading.inspection_notifications.telegram`
+  (config.yaml, booleano, ya existía desde la Etapa 6.10) -- `false`
+  por defecto. Se eligió reutilizar este flag en vez de agregar una
+  variable de entorno `PAPER_TRADING_TELEGRAM_ENABLED` nueva, para no
+  duplicar el mecanismo que ya decide qué canales entran en la lista.
+- **Credenciales**: `TelegramSettings` (`bot_token`, `chat_id`), ya
+  existente y reservada desde la Etapa 1.5 para "la futura integración
+  con Telegram" -- esta etapa es esa integración. Se leen de
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` en `.env` (mismas variables
+  que ya estaban documentadas en `.env.example`), nunca desde
+  config.yaml. `PaperTradingConfig.telegram` reutiliza exactamente la
+  misma instancia de `TelegramSettings` que `Settings.telegram`
+  (construida una sola vez en `load_settings()`) -- nunca un segundo
+  sistema de credenciales paralelo.
+- **Timeout**: `TelegramSettings.timeout_seconds` (nuevo campo, default
+  `10.0`), leído de `TELEGRAM_TIMEOUT_SECONDS` (nueva variable, opcional).
+- **Validación**: `bot_token`/`chat_id`/`timeout_seconds` solo se
+  validan cuando `inspection_notifications.telegram=true` -- si está
+  deshabilitado (default), no se requiere ninguna credencial y
+  `_build_notification_channel()` ni siquiera intenta construir
+  `TelegramNotificationChannel`. La validación ocurre en el propio
+  constructor del canal (mensajes claros, sin exponer el secreto,
+  §27.8), nunca contra la red.
+
+### 27.10 Orden determinista de canales
+
+`_build_notification_channel()` (composition.py) agrega
+`LoggingNotificationChannel` primero (si `logging=true`) y
+`TelegramNotificationChannel` después (si `telegram=true`) -- mismo
+orden documentado en el ejemplo conceptual de esta etapa. Cambiar este
+orden en el futuro debe documentarse aquí explícitamente.
+
+### 27.11 Seguridad de secretos
+
+El token nunca aparece en: logs (`TelegramTransportError` sanitiza
+antes de que `TelegramNotificationChannel` lo convierta en
+`AlertDeliveryResult.error_message`), mensajes de excepción,
+representación de objetos, documentación (esta sección no incluye
+ningún token de ejemplo con formato real), pruebas (usan valores
+claramente ficticios como `"SECRET-TOKEN-VALUE"`/`"tok"`) ni commits.
+`.env` está ignorado por git (`.gitignore`); `.env.example` solo
+contiene placeholders vacíos. Ninguna prueba automatizada realiza una
+conexión real (`urllib.request.urlopen` siempre se reemplaza por un
+doble en las pruebas del transporte; el canal siempre recibe un
+`FakeTelegramTransport` en las pruebas del canal).
+
+### 27.12 Explícitamente fuera de alcance
+
+Slack/Email/Webhooks siguen bloqueados como placeholders (§25.3, sin
+cambios); ninguna dependencia nueva (`requests`/`httpx`/`aiohttp`/
+`telegram`/`python-telegram-bot`/`telebot` -- solo `urllib`/`json` de
+la biblioteca estándar); ningún reintento interno en transporte/canal;
+ninguna división de mensajes largos en múltiples envíos; ningún envío
+real durante la implementación de esta etapa.

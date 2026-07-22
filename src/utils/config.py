@@ -66,9 +66,20 @@ class AlertThresholds:
 
 @dataclass(frozen=True)
 class TelegramSettings:
-    # Reservados para la futura integración con Telegram. Hoy siempre None.
+    """Credenciales/configuración de Telegram, leídas desde `.env`.
+
+    `bot_token`/`chat_id` quedan reservados en `None` a menos que se
+    definan `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` en `.env` -- desde
+    la Etapa 6.12, `paper_trading.inspection_notifications.telegram`
+    (config.yaml) es lo que decide si el canal real de Paper Trading se
+    activa; estas credenciales son obligatorias solo cuando ese flag es
+    `true` (validado por `TelegramNotificationChannel`, ver
+    src/paper_trading/notification_channels.py y
+    docs/ARQUITECTURA_PAPER_TRADING.md §27), nunca por esta clase."""
+
     bot_token: Optional[str] = None
     chat_id: Optional[str] = None
+    timeout_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -347,6 +358,12 @@ class PaperTradingConfig:
     inspection_notifications: InspectionNotificationsConfig = field(
         default_factory=InspectionNotificationsConfig
     )
+    # Etapa 6.12: mismas credenciales que `Settings.telegram` (reutiliza
+    # `TelegramSettings`, nunca un segundo sistema de configuración). El
+    # flag que decide si el canal se activa sigue siendo
+    # `inspection_notifications.telegram` (config.yaml), no una
+    # variable de entorno nueva.
+    telegram: TelegramSettings = field(default_factory=TelegramSettings)
 
 
 @dataclass(frozen=True)
@@ -682,6 +699,12 @@ def load_settings(
 
     config = _load_yaml_config(config_path)
 
+    telegram_settings = TelegramSettings(
+        bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
+        chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+        timeout_seconds=float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10")),
+    )
+
     return Settings(
         symbols=config["symbols"],
         interval_minutes=config["interval_minutes"],
@@ -704,10 +727,7 @@ def load_settings(
             price_change_percent_low=config["alerts"]["price_change_percent_low"],
             price_change_percent_high=config["alerts"]["price_change_percent_high"],
         ),
-        telegram=TelegramSettings(
-            bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
-            chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
-        ),
+        telegram=telegram_settings,
         ai=AISettings(
             openai_api_key=os.getenv("OPENAI_API_KEY") or None,
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
@@ -788,5 +808,6 @@ def load_settings(
             rules_version=config["paper_trading"]["rules_version"],
             reconciliation_inspection=_parse_reconciliation_inspection_config(config["paper_trading"]),
             inspection_notifications=_parse_inspection_notifications_config(config["paper_trading"]),
+            telegram=telegram_settings,
         ),
     )
