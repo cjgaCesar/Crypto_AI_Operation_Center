@@ -3139,3 +3139,103 @@ cambios); ninguna dependencia nueva (`requests`/`httpx`/`aiohttp`/
 la biblioteca estándar); ningún reintento interno en transporte/canal;
 ninguna división de mensajes largos en múltiples envíos; ningún envío
 real durante la implementación de esta etapa.
+
+### 27.x Endurecimiento de credenciales (Etapa 6.12.1)
+
+Corrección posterior a la Etapa 6.12: no cambia el comportamiento
+funcional del canal (mismo formato, mismo límite de 4096 caracteres,
+misma marca `[Mensaje truncado]`, misma política de reintentos, mismos
+estados por canal/globales, misma idempotencia, mismo orden de
+canales, mismas variables de entorno). El objetivo es reducir la
+exposición **accidental** del token, no prometer su eliminación de
+memoria (ver "Limitación real" más abajo).
+
+**Diagrama**:
+
+```
+Settings
+   ↓
+Composition Root
+   ↓
+TelegramCredentials ──→ UrllibTelegramTransport
+                              ↓
+NotificationMessage ──→ TelegramNotificationChannel
+                              ↓
+                    transport.send_message(text)
+```
+
+**`TelegramCredentials`** (nuevo, `telegram_transport.py`): value object
+inmutable (`@dataclass(frozen=True)`) con `bot_token`/`chat_id`.
+`bot_token` usa `field(repr=False)`: la representación por defecto de
+la dataclass (`repr()`/`str()`, que reutiliza `repr()` al no definirse
+`__str__`) nunca muestra el token, solo `chat_id`. Valida en
+`__post_init__` que ambos campos sean strings no vacíos ni compuestos
+solo de espacios, con los mismos mensajes ya aceptados en la Etapa
+6.12 (`"Telegram bot token is required..."`/`"Telegram chat ID is
+required..."`), sin incluir nunca el valor rechazado. No expone
+`get_token()` ni ninguna propiedad pública adicional -- concentra el
+secreto en un único lugar, sin copias.
+
+**`TelegramTransport`/`UrllibTelegramTransport`**: el contrato cambia a
+`send_message(*, text: str) -> None` -- ya no recibe
+`bot_token`/`chat_id`/`timeout_seconds` en cada llamada.
+`UrllibTelegramTransport.__init__(*, credentials: TelegramCredentials,
+timeout_seconds: float = 10.0)` recibe la configuración **una sola
+vez**; conserva `self._credentials` (un único objeto), nunca una
+segunda copia como `self._bot_token`/`self._chat_id`. Valida el timeout
+con `math.isfinite(timeout_seconds) and timeout_seconds > 0` --
+rechaza `0`, negativos, `NaN` y ambos infinitos con
+`"Telegram timeout must be a finite number greater than zero."`. Sigue
+generando como máximo una solicitud HTTP por llamada, sin reintentos
+internos. `__repr__` personalizado (`UrllibTelegramTransport(timeout_seconds=...)`)
+muestra el timeout (no sensible) pero nunca el token.
+
+**`TelegramNotificationChannel`**: constructor reducido a `(*, transport:
+TelegramTransport, clock: Clock = SystemClock())` -- ya no acepta
+`bot_token`/`chat_id`/`timeout_seconds` (confirmado con una prueba que
+fija la firma exacta). `deliver()` pasa a `transport.send_message(text=text)`,
+sin ninguna credencial. El canal no posee ningún atributo relacionado
+con credenciales (`_bot_token`/`_chat_id`/`_timeout_seconds`); sus
+únicos atributos son `_transport`/`_clock`. Como no define `__repr__`
+propio, la representación por defecto de Python (`<...TelegramNotificationChannel
+object at 0x...>`) ya es segura -- no muestra ningún atributo. La
+identidad persistente (§25.2) no cambia: sigue siendo
+`type(channel).__name__ == "TelegramNotificationChannel"`.
+
+**Sanitización defensiva ampliada**: además de los mensajes ya
+sanitizados por categoría (HTTP/timeout/red/JSON inválido/`ok: false`),
+`UrllibTelegramTransport.send_message()` agrega un `except Exception`
+final que convierte cualquier excepción no anticipada (de una capa
+inferior que pudiera incluir accidentalmente el token/la URL completa/
+el chat ID en su propio `str()`) en un mensaje genérico sin detalles
+-- nunca se persiste `str(exc)` directamente cuando existe esa
+posibilidad.
+
+**Pureza del formatter**: `_format_telegram_text()` no cambió
+funcionalmente, pero esta etapa agrega pruebas que la demuestran
+explícitamente pura: mismo resultado en llamadas repetidas, su firma
+(`(message) -> str`) no admite un `Clock` inyectado, el resultado no
+cambia con `TZ`/`LANG`/`LC_ALL`/`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`
+modificadas, no muta el `NotificationMessage` recibido, y su código
+fuente no referencia logging/red/filesystem/repositorio.
+
+**Limitación real (no una promesa de seguridad)**: Python no garantiza
+el borrado físico de un `str` de la memoria del proceso -- un `str` en
+CPython es inmutable y puede persistir en memoria (por interning,
+fragmentos de memoria no sobrescritos, copias en tracebacks de
+excepciones no capturadas, etc.) más allá de la vida útil "lógica" del
+objeto que lo referencia. `TelegramCredentials`/esta etapa **reducen la
+superficie de exposición accidental** (dónde aparece el token en el
+código, en qué objetos vive, qué aparece en `repr`/logs/errores) --
+**no** eliminan el secreto de la memoria del proceso, no lo hacen
+"imposible de inspeccionar", y no se documenta ni se afirma lo
+contrario en ningún lugar de este proyecto.
+
+**Compatibilidad con la idempotencia existente**: sin cambios.
+`CompositeNotificationChannel` sigue usando `(alert_id, channel_name)`
+como clave compuesta; `channel_name` sigue siendo
+`"TelegramNotificationChannel"` (la clase no se renombró); los estados
+`PENDING`/`DELIVERED`/`FAILED` por canal y globales, el conteo de
+intentos, y la persistencia tras reinicio se comportan exactamente
+igual que en la Etapa 6.12 (verificado reejecutando los mismos
+escenarios de entrega/reintento/reinicio contra el nuevo contrato).

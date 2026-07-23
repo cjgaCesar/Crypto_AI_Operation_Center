@@ -473,15 +473,17 @@ class TestLegacyAliasesStillWork:
 
 
 class FakeTelegramTransport:
-    """Doble de TelegramTransport: nunca realiza ninguna conexión real."""
+    """Doble de TelegramTransport (Etapa 6.12.1): nunca realiza ninguna
+    conexión real. Ya no recibe ni conserva credenciales -- solo
+    `text`, igual que el contrato real de `send_message()`."""
 
     def __init__(self, fail_times: int = 0, error_message: str = "Telegram API returned an unsuccessful response."):
         self.calls: list = []
         self._fail_times = fail_times
         self._error_message = error_message
 
-    def send_message(self, *, bot_token, chat_id, text, timeout_seconds):
-        self.calls.append(dict(bot_token=bot_token, chat_id=chat_id, text=text, timeout_seconds=timeout_seconds))
+    def send_message(self, *, text):
+        self.calls.append(dict(text=text))
         if len(self.calls) <= self._fail_times:
             raise TelegramTransportError(self._error_message)
 
@@ -527,6 +529,63 @@ class TestTelegramTextFormat:
         assert _format_telegram_text(message) == _format_telegram_text(message)
 
 
+class TestTelegramFormatterPurity:
+    """Etapa 6.12.1 (§27.x, punto 9/10): _format_telegram_text() depende
+    exclusivamente de `message` y de constantes inmutables del módulo --
+    nunca de clock, entorno, locale, red ni estado global."""
+
+    def test_determinism_across_repeated_calls(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        result_1 = _format_telegram_text(message)
+        result_2 = _format_telegram_text(message)
+        assert result_1 == result_2
+
+    def test_independent_of_any_clock(self):
+        """El formatter no recibe ni consulta ningún Clock -- su firma
+        (message) -> str no admite inyectar uno, y el resultado no
+        depende de ningún reloj real ni simulado."""
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        import inspect
+
+        params = list(inspect.signature(_format_telegram_text).parameters)
+        assert params == ["message"]
+        assert _format_telegram_text(message) == _format_telegram_text(message)
+
+    def test_independent_of_environment_variables(self, monkeypatch):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        before = _format_telegram_text(message)
+
+        for var, value in (
+            ("TZ", "America/Argentina/Buenos_Aires"), ("LANG", "es_AR.UTF-8"), ("LC_ALL", "es_AR.UTF-8"),
+            ("TELEGRAM_BOT_TOKEN", "deberia-ser-ignorado"), ("TELEGRAM_CHAT_ID", "deberia-ser-ignorado"),
+        ):
+            monkeypatch.setenv(var, value)
+
+        after = _format_telegram_text(message)
+        assert before == after
+
+    def test_does_not_mutate_the_message(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        before = repr(message)
+        _format_telegram_text(message)
+        after = repr(message)
+        assert before == after
+
+    def test_has_no_side_effects_source_inspection(self):
+        """Inspección estructural razonable (no basada en buscar
+        substrings arbitrarios): el cuerpo de la función no importa ni
+        referencia ningún módulo de red/filesystem/logging/persistencia."""
+        import inspect
+
+        source = inspect.getsource(_format_telegram_text)
+        forbidden_identifiers = (
+            "logger.", "logging.", "print(", "open(", "socket.", "urllib.", "requests.",
+            "self._repository", "repository.", "os.environ", "os.getenv",
+        )
+        for forbidden in forbidden_identifiers:
+            assert forbidden not in source
+
+
 class TestTelegramTextLength:
     def test_short_text_is_not_altered(self):
         message = NotificationMessage(alert_id="a1", title="T", body="cuerpo corto", severity=None)
@@ -555,37 +614,36 @@ class TestTelegramTextLength:
 
 
 class TestTelegramNotificationChannelConstructor:
-    def test_requires_bot_token(self):
-        with pytest.raises(ValueError):
-            TelegramNotificationChannel(bot_token="", chat_id="c", transport=FakeTelegramTransport())
+    """Etapa 6.12.1 (§27.x): el constructor ya no acepta bot_token/
+    chat_id/timeout_seconds -- solo transport/clock."""
 
-    def test_requires_chat_id(self):
-        with pytest.raises(ValueError):
-            TelegramNotificationChannel(bot_token="t", chat_id="", transport=FakeTelegramTransport())
+    def test_only_accepts_transport_and_clock(self):
+        import inspect
 
-    def test_rejects_blank_bot_token(self):
-        with pytest.raises(ValueError):
-            TelegramNotificationChannel(bot_token="   ", chat_id="c", transport=FakeTelegramTransport())
+        params = list(inspect.signature(TelegramNotificationChannel.__init__).parameters)
+        assert params == ["self", "transport", "clock"]
 
-    def test_requires_positive_timeout(self):
-        with pytest.raises(ValueError):
-            TelegramNotificationChannel(bot_token="t", chat_id="c", transport=FakeTelegramTransport(), timeout_seconds=0)
+    def test_bot_token_keyword_no_longer_works(self):
+        with pytest.raises(TypeError):
+            TelegramNotificationChannel(bot_token="t", transport=FakeTelegramTransport())
 
-    def test_rejects_negative_timeout(self):
-        with pytest.raises(ValueError):
-            TelegramNotificationChannel(
-                bot_token="t", chat_id="c", transport=FakeTelegramTransport(), timeout_seconds=-1,
-            )
+    def test_chat_id_keyword_no_longer_works(self):
+        with pytest.raises(TypeError):
+            TelegramNotificationChannel(chat_id="c", transport=FakeTelegramTransport())
+
+    def test_timeout_seconds_keyword_no_longer_works(self):
+        with pytest.raises(TypeError):
+            TelegramNotificationChannel(timeout_seconds=5.0, transport=FakeTelegramTransport())
 
     def test_valid_configuration_constructs_successfully(self):
-        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=FakeTelegramTransport())
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport())
         assert channel is not None
 
 
 class TestTelegramNotificationChannelDelivery:
     def test_successful_delivery_invokes_transport_once(self):
         transport = FakeTelegramTransport()
-        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()))
+        channel = TelegramNotificationChannel(transport=transport, clock=FixedClock(_now()))
         message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
         result = channel.deliver(message)
         assert result.success is True
@@ -593,46 +651,76 @@ class TestTelegramNotificationChannelDelivery:
 
     def test_uses_injected_clock_for_delivered_at(self):
         fixed = datetime(2030, 6, 6, tzinfo=timezone.utc)
-        channel = TelegramNotificationChannel(
-            bot_token="t", chat_id="c", transport=FakeTelegramTransport(), clock=FixedClock(fixed),
-        )
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport(), clock=FixedClock(fixed))
         result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
         assert result.delivered_at == fixed
 
     def test_does_not_modify_the_message(self):
         transport = FakeTelegramTransport()
-        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport)
+        channel = TelegramNotificationChannel(transport=transport)
         message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
         channel.deliver(message)
         assert message == NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
 
-    def test_transport_receives_chat_id_and_bot_token(self):
+    def test_transport_receives_only_text(self):
         transport = FakeTelegramTransport()
-        channel = TelegramNotificationChannel(bot_token="secret-token", chat_id="chat-42", transport=transport)
+        channel = TelegramNotificationChannel(transport=transport)
         channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
-        assert transport.calls[0]["bot_token"] == "secret-token"
-        assert transport.calls[0]["chat_id"] == "chat-42"
-        assert transport.calls[0]["timeout_seconds"] == 10.0
+        assert list(transport.calls[0].keys()) == ["text"]
+        assert transport.calls[0]["text"] == "T\n\nB"
+
+    def test_channel_never_passes_credentials_to_transport(self):
+        transport = FakeTelegramTransport()
+        channel = TelegramNotificationChannel(transport=transport)
+        channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert "bot_token" not in transport.calls[0]
+        assert "chat_id" not in transport.calls[0]
+        assert "timeout_seconds" not in transport.calls[0]
 
     def test_transport_failure_returns_failed_result_without_raising(self):
         transport = FakeTelegramTransport(fail_times=99)
-        channel = TelegramNotificationChannel(bot_token="secret-token", chat_id="c", transport=transport)
+        channel = TelegramNotificationChannel(transport=transport)
         result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
         assert result.success is False
-        assert "secret-token" not in result.error_message
 
-    def test_transport_failure_never_leaks_bot_token(self):
+    def test_transport_failure_message_passes_through_unmodified(self):
+        """El canal nunca conoce credenciales, así que no puede
+        agregarlas al error -- solo transmite el mensaje ya sanitizado
+        que produjo el transporte."""
         transport = FakeTelegramTransport(fail_times=99, error_message="Telegram API request failed (HTTP 401).")
-        channel = TelegramNotificationChannel(bot_token="MY-SUPER-SECRET", chat_id="c", transport=transport)
+        channel = TelegramNotificationChannel(transport=transport)
         result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
-        assert "MY-SUPER-SECRET" not in result.error_message
+        assert result.error_message == "Telegram API request failed (HTTP 401)."
 
     def test_deliver_never_retries_internally(self):
         transport = FakeTelegramTransport(fail_times=1)
-        channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport)
+        channel = TelegramNotificationChannel(transport=transport)
         result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
         assert result.success is False
         assert len(transport.calls) == 1  # una sola solicitud por llamada a deliver()
+
+
+class TestTelegramChannelHasNoCredentials:
+    """Etapa 6.12.1 (§27.x): el canal no posee ningún atributo de
+    credencial, ni siquiera indirectamente."""
+
+    def test_channel_has_no_credential_attributes(self):
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport())
+        forbidden_attrs = ("_bot_token", "bot_token", "_chat_id", "chat_id", "_timeout_seconds", "timeout_seconds")
+        for attr in forbidden_attrs:
+            assert not hasattr(channel, attr), f"el canal no debería tener el atributo {attr!r}"
+
+    def test_channel_only_has_transport_and_clock(self):
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport())
+        assert set(vars(channel).keys()) == {"_transport", "_clock"}
+
+    def test_repr_does_not_contain_token(self):
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport())
+        assert "MY-SUPER-SECRET" not in repr(channel)
+
+    def test_str_does_not_contain_token(self):
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport())
+        assert "MY-SUPER-SECRET" not in str(channel)
 
 
 class TestTelegramChannelIdentity:
@@ -644,7 +732,7 @@ class TestTelegramChannelIdentity:
         alert = _alert(id="alert-tg", deduplication_key="k-tg")
         _seed_alert(repo, alert)
         transport = FakeTelegramTransport()
-        telegram_channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()))
+        telegram_channel = TelegramNotificationChannel(transport=transport, clock=FixedClock(_now()))
         composite = CompositeNotificationChannel([telegram_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()))
         composite.deliver(_message(alert_id="alert-tg"))
         state = repo.get_alert_channel_delivery("alert-tg", "TelegramNotificationChannel")
@@ -672,9 +760,7 @@ class TestTelegramEndToEndWithoutInternet:
         _seed_alert(repo1, alert)
 
         transport = FakeTelegramTransport()
-        telegram_channel = TelegramNotificationChannel(
-            bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()),
-        )
+        telegram_channel = TelegramNotificationChannel(transport=transport, clock=FixedClock(_now()))
         composite1 = CompositeNotificationChannel([telegram_channel], repository=repo1, max_attempts=3, clock=FixedClock(_now()))
         service1 = AlertDeliveryService(
             repo1, composite1, max_attempts=3, clock=FixedClock(_now()),
@@ -714,7 +800,7 @@ class TestTelegramFailThenSucceed:
         _seed_alert(repo, alert)
 
         transport = FakeTelegramTransport(fail_times=1)
-        telegram_channel = TelegramNotificationChannel(bot_token="t", chat_id="c", transport=transport, clock=FixedClock(_now()))
+        telegram_channel = TelegramNotificationChannel(transport=transport, clock=FixedClock(_now()))
         good_channel = AlwaysSucceedsChannel("good")
         composite = CompositeNotificationChannel(
             [good_channel, telegram_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()),

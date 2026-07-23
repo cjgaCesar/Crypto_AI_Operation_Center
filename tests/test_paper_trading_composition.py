@@ -6,6 +6,7 @@ No usa datetime.now()/uuid.uuid4() reales: inyecta FixedClock/
 DeterministicIdGenerator para que todo sea determinista y verificable.
 """
 
+import math
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -724,10 +725,59 @@ class TestTelegramChannelWiring:
         channels = context.alert_delivery_service._channel._channels
         telegram_channels = [c for c in channels if isinstance(c, TelegramNotificationChannel)]
         assert len(telegram_channels) == 1
-        telegram_channel = telegram_channels[0]
-        assert telegram_channel._bot_token == "tok"
-        assert telegram_channel._chat_id == "chat"
-        assert telegram_channel._timeout_seconds == 7.5
+
+    def test_channel_does_not_retain_the_token(self, tmp_path):
+        """Etapa 6.12.1 (§27.x): el canal no conserva el token -- solo
+        posee `transport`/`clock`."""
+        from src.paper_trading.notification_channels import TelegramNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat"),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        telegram_channel = next(c for c in channels if isinstance(c, TelegramNotificationChannel))
+        assert set(vars(telegram_channel).keys()) == {"_transport", "_clock"}
+        assert "tok" not in repr(telegram_channel)
+
+    def test_transport_receives_the_correct_configuration(self, tmp_path, monkeypatch):
+        """Confirma la configuración correcta sin inspeccionar
+        directamente el atributo sensible en el objeto ya construido:
+        se intercepta la llamada al constructor del transporte (spy),
+        no se lee `bot_token` de un objeto vivo."""
+        import src.paper_trading.composition as composition_module
+        from src.paper_trading.telegram_transport import TelegramCredentials, UrllibTelegramTransport
+        from src.utils.config import InspectionNotificationsConfig, TelegramSettings
+
+        captured = {}
+        real_transport_cls = UrllibTelegramTransport
+
+        def _spy_transport(*, credentials, timeout_seconds=10.0):
+            captured["chat_id"] = credentials.chat_id
+            captured["bot_token_matches_expected"] = (credentials.bot_token == "tok-esperado")
+            captured["timeout_seconds"] = timeout_seconds
+            return real_transport_cls(credentials=credentials, timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(composition_module, "UrllibTelegramTransport", _spy_transport)
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(telegram=True),
+            telegram=TelegramSettings(bot_token="tok-esperado", chat_id="chat-esperado", timeout_seconds=7.5),
+        )
+        build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert captured["chat_id"] == "chat-esperado"
+        assert captured["bot_token_matches_expected"] is True
+        assert captured["timeout_seconds"] == 7.5
 
     def test_enabled_incorporates_into_composite_after_logging(self, tmp_path):
         from src.paper_trading.notification_channels import LoggingNotificationChannel, TelegramNotificationChannel
@@ -775,7 +825,7 @@ class TestTelegramChannelWiring:
             )
         assert "chat id" in str(exc_info.value).lower()
 
-    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5])
+    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5, math.nan, math.inf, -math.inf])
     def test_enabled_with_invalid_timeout_fails_to_build_context(self, tmp_path, bad_timeout):
         from src.utils.config import InspectionNotificationsConfig, TelegramSettings
 

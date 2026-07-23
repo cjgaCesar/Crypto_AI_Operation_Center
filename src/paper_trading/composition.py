@@ -59,6 +59,13 @@ la lista, después de `LoggingNotificationChannel` si ambos están
 habilitados (orden determinista, ver §27). Cuando está deshabilitado
 (default), no se construye nada relacionado con Telegram y no se
 requiere ningún token/chat_id.
+
+Etapa 6.12.1 (§27.x): esta función sigue siendo la única capa que lee
+`config.telegram` y decide construir las credenciales. El flujo pasa a
+ser `TelegramSettings -> TelegramCredentials -> UrllibTelegramTransport
+(configurado con credenciales+timeout) -> TelegramNotificationChannel
+(solo transport+clock)` -- el canal ya no recibe ni conserva ninguna
+credencial.
 """
 
 import logging
@@ -89,7 +96,7 @@ from src.paper_trading.risk_engine import RiskEngine
 from src.paper_trading.runtime import Clock, IdGenerator
 from src.paper_trading.service import PaperTradingService
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
-from src.paper_trading.telegram_transport import UrllibTelegramTransport
+from src.paper_trading.telegram_transport import TelegramCredentials, UrllibTelegramTransport
 from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig, TelegramSettings
 
 logger = logging.getLogger(__name__)
@@ -167,14 +174,14 @@ def _build_notification_channel(
     si algún placeholder está habilitado -- nunca espera a la primera
     alerta para descubrir que ese canal no está implementado.
 
-    Etapa 6.12 (§27): si `config.telegram` es `true`, construye
-    `TelegramNotificationChannel` con `UrllibTelegramTransport()`
-    (único punto de construcción del transporte real) y las
-    credenciales de `telegram_settings`. La validación de
-    bot_token/chat_id/timeout_seconds ocurre dentro del propio
-    constructor de `TelegramNotificationChannel` -- si falta algo, esta
-    función también falla de inmediato, antes de construir el resto del
-    contexto, con el mismo criterio que los placeholders."""
+    Etapa 6.12 (§27), endurecida en 6.12.1 (§27.x): si `config.telegram`
+    es `true`, construye `TelegramCredentials` a partir de
+    `telegram_settings` (bot_token/chat_id -- valida no vacíos),
+    `UrllibTelegramTransport` ya configurado con esas credenciales y el
+    timeout, y finalmente `TelegramNotificationChannel` recibiendo
+    únicamente ese transporte (nunca ninguna credencial). Si falta
+    algo, esta función falla de inmediato, antes de construir el resto
+    del contexto, con el mismo criterio que los placeholders."""
     enabled_placeholders = [
         class_name for flag, class_name in _PLACEHOLDER_CHANNEL_NAMES.items() if getattr(config, flag)
     ]
@@ -190,13 +197,13 @@ def _build_notification_channel(
     if config.logging:
         channels.append(LoggingNotificationChannel(clock=clock))
     if config.telegram:
-        channels.append(TelegramNotificationChannel(
-            bot_token=telegram_settings.bot_token,
-            chat_id=telegram_settings.chat_id,
-            transport=UrllibTelegramTransport(),
-            clock=clock,
-            timeout_seconds=telegram_settings.timeout_seconds,
-        ))
+        credentials = TelegramCredentials(
+            bot_token=telegram_settings.bot_token, chat_id=telegram_settings.chat_id,
+        )
+        transport = UrllibTelegramTransport(
+            credentials=credentials, timeout_seconds=telegram_settings.timeout_seconds,
+        )
+        channels.append(TelegramNotificationChannel(transport=transport, clock=clock))
     return CompositeNotificationChannel(channels, repository=repository, max_attempts=max_attempts, clock=clock)
 
 

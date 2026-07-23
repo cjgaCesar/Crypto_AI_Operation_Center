@@ -34,6 +34,13 @@ reintentos (eso sigue siendo exclusivo de `AlertDeliveryService`/
 `CompositeNotificationChannel`) -- `deliver()` realiza como máximo una
 solicitud HTTP por llamada.
 
+Etapa 6.12.1 (§27.x): `TelegramNotificationChannel` deja de conocer
+`bot_token`/`chat_id`/`timeout_seconds` por completo -- esas
+credenciales quedan encapsuladas exclusivamente en el
+`TelegramTransport` ya configurado (`telegram_transport.py`), inyectado
+por la Composition Root. El canal solo conoce `transport`/`clock`, y
+`transport.send_message()` recibe únicamente el texto ya formateado.
+
 Etapa 6.10.1 (§25.2): `CompositeNotificationChannel` deja de llevar la
 lógica de reintentos únicamente en memoria. Ahora recibe `repository` y
 `max_attempts`, y consulta/persiste `InspectionAlertChannelDelivery`
@@ -171,8 +178,9 @@ def _format_telegram_text(message: NotificationMessage) -> str:
 
 
 class TelegramNotificationChannel:
-    """Canal real (Etapa 6.12, §27): entrega vía la API de Telegram a
-    través de un `TelegramTransport` inyectado (telegram_transport.py).
+    """Canal real (Etapa 6.12, §27; endurecido en 6.12.1, §27.x): entrega
+    vía la API de Telegram a través de un `TelegramTransport` inyectado
+    y ya configurado (telegram_transport.py).
 
     Nunca conoce `InspectionAlert` (solo `NotificationMessage`, igual
     que el resto de los canales), nunca accede al repositorio, nunca
@@ -181,36 +189,27 @@ class TelegramNotificationChannel:
     `AlertDeliveryService`/`CompositeNotificationChannel` (§25.2).
     `deliver()` realiza como máximo UNA solicitud HTTP por llamada: no
     reintenta internamente.
+
+    Desde la Etapa 6.12.1, no conoce ni almacena `bot_token`/`chat_id`/
+    `timeout_seconds` -- esas credenciales quedan encapsuladas
+    exclusivamente en el `transport` ya construido por la Composition
+    Root (ver `TelegramCredentials`/`UrllibTelegramTransport`). El único
+    atributo propio de este canal, además de `transport`, es `clock`.
     """
 
     def __init__(
         self,
         *,
-        bot_token: str,
-        chat_id: str,
         transport: TelegramTransport,
         clock: Clock = SystemClock(),
-        timeout_seconds: float = 10.0,
     ):
-        if not bot_token or not bot_token.strip():
-            raise ValueError("Telegram bot token is required when Telegram notifications are enabled.")
-        if not chat_id or not chat_id.strip():
-            raise ValueError("Telegram chat ID is required when Telegram notifications are enabled.")
-        if timeout_seconds <= 0:
-            raise ValueError("Telegram timeout must be greater than zero.")
-        self._bot_token = bot_token
-        self._chat_id = chat_id
         self._transport = transport
         self._clock = clock
-        self._timeout_seconds = timeout_seconds
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
         text = _format_telegram_text(message)
         try:
-            self._transport.send_message(
-                bot_token=self._bot_token, chat_id=self._chat_id, text=text,
-                timeout_seconds=self._timeout_seconds,
-            )
+            self._transport.send_message(text=text)
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
             return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
