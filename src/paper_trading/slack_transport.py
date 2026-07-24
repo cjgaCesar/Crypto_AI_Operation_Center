@@ -51,6 +51,31 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 _ALLOWED_SLACK_HOSTS = frozenset({"hooks.slack.com", "hooks.slack-gov.com"})
+_INVALID_PATH_MESSAGE = "Slack webhook URL must use the expected Incoming Webhook path."
+
+
+def _validate_slack_webhook_path(path: str) -> None:
+    """Exige la estructura exacta `/services/<a>/<b>/<c>` (Etapa 6.13.1,
+    §28.x): ni más ni menos de 3 segmentos no vacíos después de
+    `services`, sin slash final, sin `.`/`..`. También rechaza
+    segmentos que, tras `urllib.parse.unquote`, resulten `.`/`..` o
+    contengan `/` -- una ruta codificada no se normaliza en silencio,
+    se rechaza directamente."""
+    segments = path.split("/")
+    if (
+        len(segments) != 5
+        or segments[0] != ""
+        or segments[1] != "services"
+        or any(not segment for segment in segments[2:])
+        or any(segment in {".", ".."} for segment in segments[2:])
+    ):
+        raise ValueError(_INVALID_PATH_MESSAGE)
+
+    decoded_segments = [urllib.parse.unquote(segment) for segment in segments[2:]]
+    if any(segment in {".", ".."} for segment in decoded_segments):
+        raise ValueError(_INVALID_PATH_MESSAGE)
+    if any("/" in segment for segment in decoded_segments):
+        raise ValueError(_INVALID_PATH_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -62,13 +87,20 @@ class SlackWebhookConfig:
     logs, tracebacks o depuración interactiva -- mismo criterio que
     `TelegramCredentials` (telegram_transport.py, §27.x).
 
-    Validación estructurada (nunca por red): usa `urllib.parse.urlparse`
-    para exigir esquema `https` y un host exactamente igual a uno de
-    `hooks.slack.com`/`hooks.slack-gov.com` -- nunca "contiene la
-    palabra slack". `urlparse().hostname` ya resuelve correctamente
-    intentos de suplantación vía userinfo (`https://hooks.slack.com@evil.com/...`
-    -> hostname real `evil.com`, rechazado) y normaliza mayúsculas/
-    minúsculas y el puerto.
+    Validación estructurada (nunca por red), endurecida en la Etapa
+    6.13.1 (§28.x) tras detectarse que la validación original no
+    rechazaba userinfo/query/fragment/puertos no permitidos/rutas
+    inválidas. Usa `urllib.parse.urlparse` con un orden determinista:
+    tipo/no vacío -> esquema -> host -> userinfo -> puerto -> query ->
+    fragment -> path. Exige esquema `https`, un host exactamente igual
+    a uno de `hooks.slack.com`/`hooks.slack-gov.com` (nunca "contiene la
+    palabra slack"), ausencia de userinfo, puerto `None`/`443`, sin
+    query string, sin fragment, y una ruta exactamente
+    `/services/<segmento>/<segmento>/<segmento>` (ver
+    `_validate_slack_webhook_path`). `urlparse().hostname` ya resuelve
+    correctamente intentos de suplantación vía userinfo
+    (`https://hooks.slack.com@evil.com/...` -> hostname real
+    `evil.com`, rechazado por host) y normaliza mayúsculas/minúsculas.
 
     Limitación real, no una promesa de seguridad: Python no garantiza
     el borrado seguro de un `str` de la memoria del proceso. Esta clase
@@ -82,10 +114,30 @@ class SlackWebhookConfig:
             raise ValueError("Slack webhook URL is required when Slack notifications are enabled.")
 
         parsed = urllib.parse.urlparse(self.webhook_url)
+
         if parsed.scheme != "https":
             raise ValueError("Slack webhook URL must use HTTPS.")
+
         if parsed.hostname not in _ALLOWED_SLACK_HOSTS:
             raise ValueError("Slack webhook URL must use an approved Slack host.")
+
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("Slack webhook URL must not include user information.")
+
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("Slack webhook URL contains an invalid port.") from None
+        if port not in (None, 443):
+            raise ValueError("Slack webhook URL must use the default HTTPS port.")
+
+        if parsed.query != "":
+            raise ValueError("Slack webhook URL must not include a query string.")
+
+        if parsed.fragment != "":
+            raise ValueError("Slack webhook URL must not include a fragment.")
+
+        _validate_slack_webhook_path(parsed.path)
 
 
 class SlackTransportError(Exception):

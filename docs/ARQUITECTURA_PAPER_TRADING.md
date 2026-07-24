@@ -3431,3 +3431,76 @@ transporte/canal; ninguna división de mensajes largos en múltiples
 envíos; Block Kit/`attachments`/`mrkdwn` personalizado/`username`/
 `icon_url`/channel override (solo texto plano); ningún envío real
 durante la implementación de esta etapa; no se modificó Telegram.
+
+### 28.x Endurecimiento de validación del webhook (Etapa 6.13.1)
+
+Corrección posterior a la auditoría de la Etapa 6.13. Resuelve 2
+hallazgos, sin cambiar `SlackNotificationChannel`/`SlackTransport`/
+`UrllibSlackTransport` (más allá de la validación de
+`SlackWebhookConfig`), el formatter, el truncamiento, la neutralización
+de menciones, el orden de canales, la idempotencia, los reintentos, la
+persistencia, la configuración (variables de entorno) ni Telegram.
+
+**H1 -- validación incompleta del webhook.** La validación original
+(Etapa 6.13) solo exigía esquema `https` y host aprobado
+(`hostname` vía `urlparse`) -- no rechazaba userinfo, query string,
+fragment, puertos distintos del HTTPS por defecto, ni validaba la
+estructura de la ruta. `SlackWebhookConfig.__post_init__` ahora aplica,
+en orden determinista, sobre el mismo `parsed = urllib.parse.urlparse(...)`
+ya existente:
+
+1. tipo/no vacío (sin cambios);
+2. esquema `https` (sin cambios);
+3. host (`parsed.hostname`) en `{hooks.slack.com, hooks.slack-gov.com}` (sin cambios);
+4. **nuevo**: `parsed.username is None and parsed.password is None` --
+   rechaza `"Slack webhook URL must not include user information."`;
+5. **nuevo**: `parsed.port` (con manejo de `ValueError` si el puerto no
+   es numérico -- `"Slack webhook URL contains an invalid port."`) en
+   `{None, 443}` -- rechaza `"Slack webhook URL must use the default HTTPS port."`;
+6. **nuevo**: `parsed.query == ""` -- rechaza
+   `"Slack webhook URL must not include a query string."`;
+7. **nuevo**: `parsed.fragment == ""` -- rechaza
+   `"Slack webhook URL must not include a fragment."`;
+8. **nuevo**: `_validate_slack_webhook_path(parsed.path)` -- exige
+   exactamente `/services/<segmento>/<segmento>/<segmento>`
+   (`path.split("/")` debe producir 5 elementos: `""`, `"services"` y 3
+   segmentos no vacíos, ninguno `.`/`..`; sin slash final, sin
+   segmentos de más). Además, cada segmento se decodifica con
+   `urllib.parse.unquote()` y se rechaza si el resultado es `.`/`..` o
+   contiene `/` -- una ruta codificada ambiguamente
+   (`/services/%2E/B/X`, `/services/T/B/X%2FY`) nunca se normaliza en
+   silencio, se rechaza directamente con el mismo mensaje de path
+   inválido.
+
+Todos los mensajes nuevos son estáticos (no interpolan ningún valor de
+la URL recibida): nunca incluyen el webhook completo, los segmentos del
+path, la query, el fragment, el username/password ni el puerto
+recibido. Toda la validación sigue siendo puramente estructural (sobre
+`urlparse`), sin ninguna conexión de red.
+
+Ejemplos aceptados: `https://hooks.slack.com/services/T000/B000/XXXX`,
+`https://hooks.slack.com:443/services/T000/B000/XXXX` (puerto por
+defecto explícito). Ejemplos rechazados (no exhaustivo):
+`https://user@hooks.slack.com/services/T/B/X`,
+`https://hooks.slack.com/services/T/B/X?token=...`,
+`https://hooks.slack.com/services/T/B/X#...`,
+`https://hooks.slack.com:8443/services/T/B/X`,
+`https://hooks.slack.com/services/T/B` (faltan segmentos),
+`https://hooks.slack.com/services/./B/X`.
+
+**H2 -- prueba UTF-8 con condición siempre verdadera.** Se auditó
+`test_payload_is_utf8_encoded`: el commit `4944e07` ya contenía la
+versión corregida (una única aserción directa,
+`json.loads(raw.decode("utf-8"))["text"] == "..."`), sin ningún `or True`
+-- la condición señalada por la auditoría no estaba presente en el
+código efectivamente confirmado. Aun así, en esta etapa se reescribió
+la prueba con nombres explícitos (`original_text`/`raw_payload`/
+`decoded_payload`) y una aserción adicional
+`isinstance(raw_payload, bytes)`, para dejar el caso cerrado de forma
+inequívoca y alineada con el formato exigido por la auditoría.
+
+**Compatibilidad**: `SlackNotificationChannel.deliver()`,
+`_format_slack_text()`, `SLACK_MAX_MESSAGE_LENGTH`, la neutralización
+de menciones, el orden `Logging -> Telegram -> Slack`, la identidad
+persistente (`"SlackNotificationChannel"`), la idempotencia por canal y
+`telegram_transport.py` no cambiaron en esta etapa.

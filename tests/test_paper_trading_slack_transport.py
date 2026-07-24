@@ -130,6 +130,132 @@ class TestSlackWebhookConfig:
         assert "evilslack.com" not in str(exc_info.value)
 
 
+class TestSlackWebhookConfigValidUrls:
+    """Etapa 6.13.1 (§28.x, punto 13): casos válidos, incluido el
+    puerto HTTPS por defecto explícito (:443)."""
+
+    @pytest.mark.parametrize("url", [
+        "https://hooks.slack.com/services/T000/B000/XXXX",
+        "https://hooks.slack-gov.com/services/T000/B000/XXXX",
+        "https://hooks.slack.com:443/services/T000/B000/XXXX",
+        "https://hooks.slack-gov.com:443/services/T000/B000/XXXX",
+    ])
+    def test_valid_url_is_accepted(self, url):
+        assert SlackWebhookConfig(webhook_url=url) is not None
+
+
+class TestSlackWebhookConfigUserinfoRejected:
+    """Etapa 6.13.1 (§28.x, punto 14): la URL nunca debe incluir
+    userinfo, aunque el host resuelva correctamente."""
+
+    @pytest.mark.parametrize("url", [
+        "https://secretuser123@hooks.slack.com/services/T/B/X",
+        "https://secretuser123:secretpass456@hooks.slack.com/services/T/B/X",
+    ])
+    def test_userinfo_rejected(self, url):
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=url)
+        message = str(exc_info.value)
+        assert "secretuser123" not in message
+        assert "secretpass456" not in message
+        assert url not in message
+
+    def test_userinfo_spoofing_with_different_host_rejected(self):
+        url = "https://hooks.slack.com@evil.com/services/T/B/X"
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=url)
+        message = str(exc_info.value)
+        assert "evil.com" not in message
+        assert url not in message
+
+
+class TestSlackWebhookConfigQueryAndFragmentRejected:
+    """Etapa 6.13.1 (§28.x, punto 15): sin query string ni fragment."""
+
+    @pytest.mark.parametrize("url", [
+        "https://hooks.slack.com/services/T/B/X?token=secret",
+        "https://hooks.slack.com/services/T/B/X?debug=true",
+    ])
+    def test_query_string_rejected(self, url):
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=url)
+        message = str(exc_info.value)
+        assert "token=secret" not in message
+        assert "debug=true" not in message
+        assert url not in message
+
+    def test_fragment_rejected(self):
+        url = "https://hooks.slack.com/services/T/B/X#secret"
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=url)
+        message = str(exc_info.value)
+        assert "secret" not in message
+        assert url not in message
+
+
+class TestSlackWebhookConfigPortRejected:
+    """Etapa 6.13.1 (§28.x, punto 16): solo se acepta el puerto HTTPS
+    por defecto (ausente o :443)."""
+
+    @pytest.mark.parametrize("url", [
+        "https://hooks.slack.com:80/services/T/B/X",
+        "https://hooks.slack.com:8443/services/T/B/X",
+    ])
+    def test_non_default_port_rejected(self, url):
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=url)
+        message = str(exc_info.value)
+        assert "80" not in message
+        assert "8443" not in message
+
+    def test_invalid_port_syntax_is_a_controlled_failure(self):
+        url = "https://hooks.slack.com:abc/services/T/B/X"
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=url)
+        assert "abc" not in str(exc_info.value)
+
+
+class TestSlackWebhookConfigPathRejected:
+    """Etapa 6.13.1 (§28.x, punto 17): la ruta debe ser exactamente
+    /services/<a>/<b>/<c> -- ni más ni menos segmentos, ninguno vacío,
+    ninguno '.'/'..' ."""
+
+    @pytest.mark.parametrize("path", [
+        "/",
+        "/services",
+        "/services/",
+        "/services/T",
+        "/services/T/B",
+        "/services/T/B/X/",
+        "/services/T/B/X/Y",
+        "/other/T/B/X",
+        "/services//B/X",
+        "/services/T//X",
+        "/services/T/B/",
+        "/services/./B/X",
+        "/services/../B/X",
+    ])
+    def test_invalid_path_rejected(self, path):
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=f"https://hooks.slack.com{path}")
+        assert "expected Incoming Webhook path" in str(exc_info.value)
+
+
+class TestSlackWebhookConfigEncodedPathRejected:
+    """Etapa 6.13.1 (§28.x, punto 18): rutas codificadas ambiguas se
+    rechazan, nunca se normalizan en silencio."""
+
+    @pytest.mark.parametrize("path", [
+        "/services/%2E/B/X",
+        "/services/%2E%2E/B/X",
+        "/services/T/B/X%2FY",
+    ])
+    def test_encoded_ambiguous_segment_rejected(self, path):
+        with pytest.raises(ValueError) as exc_info:
+            SlackWebhookConfig(webhook_url=f"https://hooks.slack.com{path}")
+        assert "expected Incoming Webhook path" in str(exc_info.value)
+
+
 class TestUrllibSlackTransportConstructor:
     def test_receives_config(self):
         transport = UrllibSlackTransport(config=_config(), timeout_seconds=5.0)
@@ -208,13 +334,21 @@ class TestRequestUsesEncapsulatedConfiguration:
         assert body == {"text": "mensaje de prueba"}
 
     def test_payload_is_utf8_encoded(self, monkeypatch):
+        """Etapa 6.13.1 (§28.x, H2): validación directa, sin ninguna
+        condición que no pueda fallar -- el payload decodificado debe
+        ser exactamente el texto original."""
         import json
 
         fake = _install_fake_urlopen(monkeypatch, body=b"ok")
         transport = UrllibSlackTransport(config=_config(), timeout_seconds=5.0)
-        transport.send_message(text="acentuación: áéíóú ñ")
-        raw = fake.calls[0]["request"].data
-        assert json.loads(raw.decode("utf-8"))["text"] == "acentuación: áéíóú ñ"
+
+        original_text = "acentuación: áéíóú ñ"
+        transport.send_message(text=original_text)
+
+        raw_payload = fake.calls[0]["request"].data
+        assert isinstance(raw_payload, bytes)
+        decoded_payload = json.loads(raw_payload.decode("utf-8"))
+        assert decoded_payload == {"text": original_text}
 
     def test_timeout_is_passed_to_urlopen(self, monkeypatch):
         fake = _install_fake_urlopen(monkeypatch, body=b"ok")

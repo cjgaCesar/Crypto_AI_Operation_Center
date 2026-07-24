@@ -1099,6 +1099,57 @@ class TestSlackChannelWiring:
         assert "evilslack.com" not in str(exc_info.value)
 
 
+class TestSlackChannelWiringHardenedValidation:
+    """Etapa 6.13.1 (§28.x, punto 21): una URL de webhook inválida
+    (userinfo/query/fragment/puerto no permitido/ruta inválida) debe
+    fallar de inmediato al construir el contexto, sin construir el
+    canal ni realizar ninguna conexión, y sin exponer el webhook."""
+
+    def _assert_fails_without_building_channel(self, tmp_path, webhook_url):
+        from src.paper_trading.notification_channels import SlackNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=webhook_url),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert webhook_url not in str(exc_info.value)
+        return exc_info
+
+    def test_userinfo_fails_to_build_context(self, tmp_path):
+        self._assert_fails_without_building_channel(
+            tmp_path, "https://secretuser@hooks.slack.com/services/T/B/X",
+        )
+
+    def test_query_string_fails_to_build_context(self, tmp_path):
+        exc_info = self._assert_fails_without_building_channel(
+            tmp_path, "https://hooks.slack.com/services/T/B/X?token=secret",
+        )
+        assert "token=secret" not in str(exc_info.value)
+
+    def test_fragment_fails_to_build_context(self, tmp_path):
+        exc_info = self._assert_fails_without_building_channel(
+            tmp_path, "https://hooks.slack.com/services/T/B/X#secret",
+        )
+        assert "secret" not in str(exc_info.value)
+
+    def test_port_8443_fails_to_build_context(self, tmp_path):
+        self._assert_fails_without_building_channel(
+            tmp_path, "https://hooks.slack.com:8443/services/T/B/X",
+        )
+
+    def test_invalid_path_fails_to_build_context(self, tmp_path):
+        self._assert_fails_without_building_channel(
+            tmp_path, "https://hooks.slack.com/services/T/B",
+        )
+
+
 class TestNotificationTemplateWiring:
     """Etapa 6.11 (§26): la Composition Root construye e inyecta el
     InspectionNotificationTemplate en AlertDeliveryService -- nunca lo
