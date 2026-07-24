@@ -160,6 +160,31 @@ def test_paper_trading_telegram_mirrors_top_level_telegram_settings(tmp_path, mo
     assert settings.paper_trading.telegram.chat_id == "chat_de_prueba"
 
 
+def test_slack_settings_default_timeout_when_env_unset(tmp_path, monkeypatch):
+    for var in ["SLACK_WEBHOOK_URL", "SLACK_TIMEOUT_SECONDS"]:
+        monkeypatch.delenv(var, raising=False)
+
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    assert settings.paper_trading.slack.webhook_url is None
+    assert settings.paper_trading.slack.timeout_seconds == 10.0
+
+
+def test_slack_settings_reads_all_fields_from_env(tmp_path, monkeypatch):
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/FAKE\nSLACK_TIMEOUT_SECONDS=12.5\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert settings.paper_trading.slack.webhook_url == "https://hooks.slack.com/services/T000/B000/FAKE"
+    assert settings.paper_trading.slack.timeout_seconds == 12.5
+
+
 def test_missing_config_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_settings(config_path=tmp_path / "no_existe.yaml", env_path=tmp_path / ".env")

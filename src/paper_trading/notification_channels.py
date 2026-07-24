@@ -41,6 +41,13 @@ credenciales quedan encapsuladas exclusivamente en el
 por la Composition Root. El canal solo conoce `transport`/`clock`, y
 `transport.send_message()` recibe únicamente el texto ya formateado.
 
+Etapa 6.13 (§28): `SlackNotificationChannel` deja de ser un placeholder,
+con el mismo patrón que Telegram: recibe un `SlackTransport` ya
+configurado (slack_transport.py, único módulo que conoce `urllib`/el
+Incoming Webhook), nunca el webhook. `_format_slack_text()` neutraliza
+menciones globales (`@channel`/`@here`/`@everyone`/`<!channel>`/
+`<!here>`/`<!everyone>`) antes de truncar a `SLACK_MAX_MESSAGE_LENGTH`.
+
 Etapa 6.10.1 (§25.2): `CompositeNotificationChannel` deja de llevar la
 lógica de reintentos únicamente en memoria. Ahora recibe `repository` y
 `max_attempts`, y consulta/persiste `InspectionAlertChannelDelivery`
@@ -73,12 +80,17 @@ from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, Ins
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.notification_templates import NotificationMessage
 from src.paper_trading.runtime import Clock, SystemClock
+from src.paper_trading.slack_transport import SlackTransport
 from src.paper_trading.telegram_transport import TelegramTransport
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 _TELEGRAM_TRUNCATION_MARK = "\n[Mensaje truncado]"
+
+SLACK_MAX_MESSAGE_LENGTH = 4000
+_SLACK_TRUNCATION_MARK = "\n[Mensaje truncado]"
+_SLACK_MENTION_PATTERNS = ("@channel", "@here", "@everyone", "<!channel>", "<!here>", "<!everyone>")
 
 
 class InspectionNotificationChannel(Protocol):
@@ -143,17 +155,83 @@ class EmailNotificationChannel:
         )
 
 
-class SlackNotificationChannel:
-    """Placeholder: la API real de Slack queda fuera de alcance de la Etapa 6.10.
+def _neutralize_slack_mentions(text: str) -> str:
+    """Inserta un carácter de ancho cero (U+200B) inmediatamente después
+    del signo de apertura de cada patrón de mención global de Slack
+    (`@channel`/`@here`/`@everyone`/`<!channel>`/`<!here>`/`<!everyone>`),
+    para que Slack nunca los reconozca como menciones reales -- el texto
+    sigue siendo legible para una persona (el carácter es invisible en
+    la práctica), pero deja de coincidir con el patrón exacto que Slack
+    interpreta como mención global."""
+    neutralized = text
+    for pattern in _SLACK_MENTION_PATTERNS:
+        if pattern.startswith("<!"):
+            replacement = "<!​" + pattern[2:]
+        else:
+            replacement = "@​" + pattern[1:]
+        neutralized = neutralized.replace(pattern, replacement)
+    return neutralized
 
-    No importa `slack_sdk` ni realiza ninguna llamada HTTP. `deliver()`
-    siempre lanza `NotImplementedError`."""
+
+def _format_slack_text(message: NotificationMessage) -> str:
+    """Adapta un NotificationMessage ya renderizado al texto plano que
+    Slack transporta (§28). Pura y determinista: nunca Block Kit, nunca
+    `mrkdwn` específico de Slack, nunca incluye metadata completa ni
+    `alert_id` (mismo criterio que Telegram, §27). Neutraliza menciones
+    globales (ver `_neutralize_slack_mentions`) antes de truncar de
+    forma controlada si el resultado supera `SLACK_MAX_MESSAGE_LENGTH`,
+    marcando el corte con `_SLACK_TRUNCATION_MARK`; nunca divide en
+    varios mensajes."""
+    lines = [message.title, "", message.body]
+    if message.severity is not None:
+        lines.append("")
+        lines.append(f"Severidad: {message.severity.value}")
+    text = _neutralize_slack_mentions("\n".join(lines))
+
+    if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
+        return text
+
+    truncated_length = SLACK_MAX_MESSAGE_LENGTH - len(_SLACK_TRUNCATION_MARK)
+    return text[:truncated_length] + _SLACK_TRUNCATION_MARK
+
+
+class SlackNotificationChannel:
+    """Canal real (Etapa 6.13, §28): entrega vía un Incoming Webhook de
+    Slack, a través de un `SlackTransport` inyectado y ya configurado
+    (slack_transport.py) -- mismo patrón que `TelegramNotificationChannel`
+    (§27/§27.x).
+
+    Nunca conoce `InspectionAlert` (solo `NotificationMessage`, igual
+    que el resto de los canales), nunca accede al repositorio, nunca
+    persiste estado directamente, y nunca decide reintentos globales ni
+    por canal -- eso es responsabilidad exclusiva de
+    `AlertDeliveryService`/`CompositeNotificationChannel` (§25.2).
+    `deliver()` realiza como máximo UNA solicitud HTTP por llamada: no
+    reintenta internamente.
+
+    No conoce ni almacena el webhook ni ningún timeout -- esa
+    configuración queda encapsulada exclusivamente en el `transport` ya
+    construido por la Composition Root (ver `SlackWebhookConfig`/
+    `UrllibSlackTransport`). Los únicos atributos propios de este canal
+    son `transport`/`clock`.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: SlackTransport,
+        clock: Clock = SystemClock(),
+    ):
+        self._transport = transport
+        self._clock = clock
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        raise NotImplementedError(
-            "SlackNotificationChannel todavía no está implementado (la integración con Slack "
-            "queda para una etapa posterior)."
-        )
+        text = _format_slack_text(message)
+        try:
+            self._transport.send_message(text=text)
+            return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
+        except Exception as exc:
+            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
 
 
 def _format_telegram_text(message: NotificationMessage) -> str:

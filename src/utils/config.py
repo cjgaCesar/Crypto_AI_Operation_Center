@@ -83,6 +83,22 @@ class TelegramSettings:
 
 
 @dataclass(frozen=True)
+class SlackSettings:
+    """Configuración del Incoming Webhook de Slack, leída desde `.env`.
+
+    `webhook_url` queda reservado en `None` a menos que se defina
+    `SLACK_WEBHOOK_URL` en `.env` -- `paper_trading.inspection_notifications.slack`
+    (config.yaml) es lo que decide si el canal real de Paper Trading se
+    activa; el webhook es obligatorio solo cuando ese flag es `true`
+    (validado por `SlackWebhookConfig`, ver
+    src/paper_trading/slack_transport.py y
+    docs/ARQUITECTURA_PAPER_TRADING.md §28), nunca por esta clase."""
+
+    webhook_url: Optional[str] = None
+    timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class AISettings:
     """SOLO credenciales (secretos) para proveedores de IA reales, leídas
     desde variables de entorno (.env), nunca desde config.yaml.
@@ -364,6 +380,10 @@ class PaperTradingConfig:
     # `inspection_notifications.telegram` (config.yaml), no una
     # variable de entorno nueva.
     telegram: TelegramSettings = field(default_factory=TelegramSettings)
+    # Etapa 6.13: mismo criterio que `telegram` -- el flag que decide si
+    # el canal se activa sigue siendo `inspection_notifications.slack`
+    # (config.yaml), no una variable de entorno nueva.
+    slack: SlackSettings = field(default_factory=SlackSettings)
 
 
 @dataclass(frozen=True)
@@ -704,6 +724,10 @@ def load_settings(
         chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
         timeout_seconds=float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10")),
     )
+    slack_settings = SlackSettings(
+        webhook_url=os.getenv("SLACK_WEBHOOK_URL") or None,
+        timeout_seconds=float(os.getenv("SLACK_TIMEOUT_SECONDS", "10")),
+    )
 
     return Settings(
         symbols=config["symbols"],
@@ -809,5 +833,6 @@ def load_settings(
             reconciliation_inspection=_parse_reconciliation_inspection_config(config["paper_trading"]),
             inspection_notifications=_parse_inspection_notifications_config(config["paper_trading"]),
             telegram=telegram_settings,
+            slack=slack_settings,
         ),
     )

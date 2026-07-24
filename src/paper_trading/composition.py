@@ -66,6 +66,14 @@ ser `TelegramSettings -> TelegramCredentials -> UrllibTelegramTransport
 (configurado con credenciales+timeout) -> TelegramNotificationChannel
 (solo transport+clock)` -- el canal ya no recibe ni conserva ninguna
 credencial.
+
+Etapa 6.13 (§28): mismo patrón para Slack. Cuando
+`inspection_notifications.slack` es `true`, esta función construye
+`SlackWebhookConfig` a partir de `config.slack` (valida esquema HTTPS y
+host aprobado), `UrllibSlackTransport` ya configurado, y
+`SlackNotificationChannel` recibiendo únicamente ese transporte. Se
+agrega a la lista después de Telegram (orden determinista: Logging ->
+Telegram -> Slack).
 """
 
 import logging
@@ -95,9 +103,10 @@ from src.paper_trading.reservation_engine import ReservationEngine
 from src.paper_trading.risk_engine import RiskEngine
 from src.paper_trading.runtime import Clock, IdGenerator
 from src.paper_trading.service import PaperTradingService
+from src.paper_trading.slack_transport import SlackWebhookConfig, UrllibSlackTransport
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 from src.paper_trading.telegram_transport import TelegramCredentials, UrllibTelegramTransport
-from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig, TelegramSettings
+from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig, SlackSettings, TelegramSettings
 
 logger = logging.getLogger(__name__)
 
@@ -148,12 +157,12 @@ def seed_initial_cash_balance(
 
 
 # Nombre de config -> nombre de clase placeholder, para el mensaje de
-# error de _build_notification_channel() (§25.3). Ninguno de estos 3
-# canales tiene una conexión real todavía. `telegram` sale de esta
-# lista en la Etapa 6.12 (§27): ya es un canal real, no un placeholder.
+# error de _build_notification_channel() (§25.3). Ninguno de estos 2
+# canales tiene una conexión real todavía. `telegram` salió de esta
+# lista en la Etapa 6.12 (§27); `slack` sale en la Etapa 6.13 (§28) --
+# ambos ya son canales reales, no placeholders.
 _PLACEHOLDER_CHANNEL_NAMES = {
     "email": "EmailNotificationChannel",
-    "slack": "SlackNotificationChannel",
     "webhook": "WebhookNotificationChannel",
 }
 
@@ -161,6 +170,7 @@ _PLACEHOLDER_CHANNEL_NAMES = {
 def _build_notification_channel(
     config: InspectionNotificationsConfig,
     telegram_settings: TelegramSettings,
+    slack_settings: SlackSettings,
     repository: PaperTradingRepository,
     max_attempts: int,
     clock: Clock,
@@ -181,7 +191,14 @@ def _build_notification_channel(
     timeout, y finalmente `TelegramNotificationChannel` recibiendo
     únicamente ese transporte (nunca ninguna credencial). Si falta
     algo, esta función falla de inmediato, antes de construir el resto
-    del contexto, con el mismo criterio que los placeholders."""
+    del contexto, con el mismo criterio que los placeholders.
+
+    Etapa 6.13 (§28): mismo patrón para Slack -- si `config.slack` es
+    `true`, construye `SlackWebhookConfig` a partir de `slack_settings`
+    (valida HTTPS y host aprobado), `UrllibSlackTransport` ya
+    configurado, y `SlackNotificationChannel` recibiendo únicamente ese
+    transporte. Orden determinista de la lista: Logging -> Telegram ->
+    Slack."""
     enabled_placeholders = [
         class_name for flag, class_name in _PLACEHOLDER_CHANNEL_NAMES.items() if getattr(config, flag)
     ]
@@ -204,6 +221,12 @@ def _build_notification_channel(
             credentials=credentials, timeout_seconds=telegram_settings.timeout_seconds,
         )
         channels.append(TelegramNotificationChannel(transport=transport, clock=clock))
+    if config.slack:
+        slack_config = SlackWebhookConfig(webhook_url=slack_settings.webhook_url)
+        slack_transport = UrllibSlackTransport(
+            config=slack_config, timeout_seconds=slack_settings.timeout_seconds,
+        )
+        channels.append(SlackNotificationChannel(transport=slack_transport, clock=clock))
     return CompositeNotificationChannel(channels, repository=repository, max_attempts=max_attempts, clock=clock)
 
 
@@ -250,7 +273,7 @@ def build_paper_trading_context(
     alert_delivery_service = AlertDeliveryService(
         repository=repository,
         channel=_build_notification_channel(
-            config.inspection_notifications, config.telegram, repository,
+            config.inspection_notifications, config.telegram, config.slack, repository,
             config.reconciliation_inspection.max_alert_delivery_attempts, clock,
         ),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,

@@ -613,17 +613,6 @@ class TestPlaceholderChannelsBlockedAtStartup:
             )
         assert "EmailNotificationChannel" in str(exc_info.value)
 
-    def test_slack_true_fails_to_build_context(self, tmp_path):
-        from src.utils.config import InspectionNotificationsConfig
-
-        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(slack=True))
-        with pytest.raises(ValueError) as exc_info:
-            build_paper_trading_context(
-                config=config, clock=FixedClock(_now()),
-                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-            )
-        assert "SlackNotificationChannel" in str(exc_info.value)
-
     def test_webhook_true_fails_to_build_context(self, tmp_path):
         from src.utils.config import InspectionNotificationsConfig
 
@@ -639,7 +628,7 @@ class TestPlaceholderChannelsBlockedAtStartup:
         from src.utils.config import InspectionNotificationsConfig
 
         config = _config(
-            tmp_path, inspection_notifications=InspectionNotificationsConfig(webhook=True, slack=True),
+            tmp_path, inspection_notifications=InspectionNotificationsConfig(webhook=True, email=True),
         )
         with pytest.raises(ValueError) as exc_info:
             build_paper_trading_context(
@@ -647,7 +636,7 @@ class TestPlaceholderChannelsBlockedAtStartup:
                 id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
             )
         assert "WebhookNotificationChannel" in str(exc_info.value)
-        assert "SlackNotificationChannel" in str(exc_info.value)
+        assert "EmailNotificationChannel" in str(exc_info.value)
 
     def test_logging_true_works(self, tmp_path):
         config = _config(tmp_path)  # default: logging=True, resto False
@@ -857,13 +846,13 @@ class TestTelegramChannelWiring:
         assert "chat" not in str(exc_info.value)  # el chat_id real tampoco se filtra por accidente
 
     def test_other_placeholders_remain_blocked_at_startup(self, tmp_path):
-        """Etapa 6.12 (§27, punto 20): Email/Slack/Webhook deben seguir
-        bloqueados como placeholders -- solo Telegram deja de estarlo."""
+        """Etapa 6.12 (§27, punto 20), actualizada en 6.13 (§28, punto 22):
+        Email/Webhook deben seguir bloqueados como placeholders --
+        Telegram y Slack ya son canales reales."""
         from src.utils.config import InspectionNotificationsConfig
 
         for flag, class_name in (
             ("email", "EmailNotificationChannel"),
-            ("slack", "SlackNotificationChannel"),
             ("webhook", "WebhookNotificationChannel"),
         ):
             config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(**{flag: True}))
@@ -873,6 +862,241 @@ class TestTelegramChannelWiring:
                     id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
                 )
             assert class_name in str(exc_info.value)
+
+
+class TestSlackChannelWiring:
+    """Etapa 6.13 (§28): SlackNotificationChannel deja de ser
+    placeholder -- se construye e inyecta como canal real cuando
+    inspection_notifications.slack=True y el webhook es válido."""
+
+    _VALID_WEBHOOK = "https://hooks.slack.com/services/T000/B000/XXXX"
+
+    def test_disabled_by_default_slack_not_constructed(self, tmp_path):
+        from src.paper_trading.notification_channels import SlackNotificationChannel
+
+        config = _config(tmp_path)  # default: slack=False
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert not any(isinstance(c, SlackNotificationChannel) for c in channels)
+
+    def test_disabled_by_default_does_not_require_webhook(self, tmp_path):
+        from src.utils.config import SlackSettings
+
+        config = _config(tmp_path, slack=SlackSettings(webhook_url=None))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_disabled_preserves_previous_behavior(self, tmp_path):
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        from src.paper_trading.notification_channels import LoggingNotificationChannel
+
+        channels = context.alert_delivery_service._channel._channels
+        assert len(channels) == 1
+        assert isinstance(channels[0], LoggingNotificationChannel)
+
+    def test_enabled_and_configured_builds_slack_channel(self, tmp_path):
+        from src.paper_trading.notification_channels import SlackNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=self._VALID_WEBHOOK, timeout_seconds=7.5),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        slack_channels = [c for c in channels if isinstance(c, SlackNotificationChannel)]
+        assert len(slack_channels) == 1
+
+    def test_channel_does_not_retain_the_webhook(self, tmp_path):
+        from src.paper_trading.notification_channels import SlackNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=self._VALID_WEBHOOK),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        slack_channel = next(c for c in channels if isinstance(c, SlackNotificationChannel))
+        assert set(vars(slack_channel).keys()) == {"_transport", "_clock"}
+        assert "XXXX" not in repr(slack_channel)
+        assert "XXXX" not in repr(slack_channel._transport)
+
+    def test_transport_receives_the_correct_configuration(self, tmp_path, monkeypatch):
+        """Confirma la configuración correcta sin inspeccionar
+        directamente el atributo sensible en el objeto ya construido:
+        se intercepta la llamada al constructor del transporte (spy)."""
+        import src.paper_trading.composition as composition_module
+        from src.paper_trading.slack_transport import UrllibSlackTransport
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        captured = {}
+        real_transport_cls = UrllibSlackTransport
+
+        def _spy_transport(*, config, timeout_seconds=10.0):
+            captured["webhook_matches_expected"] = (config.webhook_url == self._VALID_WEBHOOK)
+            captured["timeout_seconds"] = timeout_seconds
+            return real_transport_cls(config=config, timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(composition_module, "UrllibSlackTransport", _spy_transport)
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=self._VALID_WEBHOOK, timeout_seconds=6.5),
+        )
+        build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert captured["webhook_matches_expected"] is True
+        assert captured["timeout_seconds"] == 6.5
+
+    def test_channel_order_is_logging_telegram_slack(self, tmp_path):
+        from src.paper_trading.notification_channels import (
+            LoggingNotificationChannel, SlackNotificationChannel, TelegramNotificationChannel,
+        )
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(logging=True, telegram=True, slack=True),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat"),
+            slack=SlackSettings(webhook_url=self._VALID_WEBHOOK),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert [type(c) for c in channels] == [
+            LoggingNotificationChannel, TelegramNotificationChannel, SlackNotificationChannel,
+        ]
+
+    def test_slack_is_no_longer_a_placeholder(self, tmp_path):
+        """Confirma que habilitar Slack ya no dispara el ValueError de
+        placeholder bloqueado (§25.3) -- construye el contexto con éxito."""
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=self._VALID_WEBHOOK),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_enabled_without_webhook_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=None),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "webhook" in str(exc_info.value).lower()
+
+    def test_enabled_with_empty_webhook_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=""),
+        )
+        with pytest.raises(ValueError):
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+
+    def test_enabled_with_http_scheme_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url="http://hooks.slack.com/services/T000/B000/XXXX"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "https" in str(exc_info.value).lower()
+
+    def test_enabled_with_wrong_host_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url="https://evilslack.com/services/T000/B000/XXXX"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "host" in str(exc_info.value).lower()
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5, math.nan, math.inf, -math.inf])
+    def test_enabled_with_invalid_timeout_fails_to_build_context(self, tmp_path, bad_timeout):
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url=self._VALID_WEBHOOK, timeout_seconds=bad_timeout),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_slack_error_never_includes_the_webhook(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, SlackSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(slack=True),
+            slack=SlackSettings(webhook_url="https://evilslack.com/services/T000/B000/SECRETPATH"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "SECRETPATH" not in str(exc_info.value)
+        assert "evilslack.com" not in str(exc_info.value)
 
 
 class TestNotificationTemplateWiring:

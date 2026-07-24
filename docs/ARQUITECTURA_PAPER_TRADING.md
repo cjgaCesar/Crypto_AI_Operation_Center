@@ -3239,3 +3239,195 @@ como clave compuesta; `channel_name` sigue siendo
 intentos, y la persistencia tras reinicio se comportan exactamente
 igual que en la Etapa 6.12 (verificado reejecutando los mismos
 escenarios de entrega/reintento/reinicio contra el nuevo contrato).
+
+## 28. Canal de notificaciones Slack (Etapa 6.13)
+
+Segundo canal externo real de `inspection_notifications`, construido
+con exactamente el mismo patrón ya aprobado para Telegram (§27/§27.x):
+`AlertDeliveryService` sigue sin conocer canales concretos,
+`SlackNotificationChannel` sigue sin conocer `InspectionAlert` ni
+ninguna credencial, y la idempotencia por canal (§25.2) opera igual.
+Deshabilitado por defecto; no requiere ningún webhook mientras esté
+deshabilitado. No se modificó Telegram en esta etapa.
+
+### 28.1 Flujo completo
+
+```
+InspectionAlert
+  ↓
+DefaultInspectionNotificationTemplate   (§26 -- sin cambios en 6.13)
+  ↓
+NotificationMessage                     (§26.x -- sin cambios en 6.13)
+  ↓
+SlackNotificationChannel                (nuevo en 6.13: adapta el mensaje a texto plano)
+  ↓
+SlackTransport (Protocol)                (nuevo en 6.13: abstracción de transporte)
+  ↓
+UrllibSlackTransport                     (nuevo en 6.13: única implementación real)
+  ↓
+Slack Incoming Webhook (POST JSON)
+```
+
+Configuración:
+
+```
+Settings
+   ↓
+Composition Root
+   ↓
+SlackWebhookConfig ──→ UrllibSlackTransport
+                              ↓
+NotificationMessage ──→ SlackNotificationChannel
+                              ↓
+                    transport.send_message(text)
+```
+
+### 28.2 Responsabilidades por capa
+
+- **Template**: sin cambios (§26). Sigue siendo el único responsable de
+  `title`/`body`/`severity`.
+- **`SlackNotificationChannel`** (`notification_channels.py`): recibe
+  únicamente `NotificationMessage`. Su única responsabilidad de formato
+  es `_format_slack_text()` (función privada y pura). No accede al
+  repositorio, no persiste estado, no decide reintentos, y realiza como
+  máximo una solicitud HTTP por llamada a `deliver()`. No conoce ni
+  almacena `webhook_url`/`timeout_seconds` -- solo `transport`/`clock`
+  (mismo criterio que `TelegramNotificationChannel`, §27.x).
+- **`SlackTransport`/`UrllibSlackTransport`** (`slack_transport.py`,
+  único módulo que conoce `urllib`/el endpoint del Incoming Webhook):
+  construye el POST JSON, aplica el timeout, interpreta la respuesta de
+  texto plano y convierte cualquier fallo en `SlackTransportError` con
+  mensaje sanitizado. No conoce el formato del mensaje, no reintenta,
+  no persiste, no lee variables de entorno.
+- **Slack Incoming Webhook**: el servicio externo real -- fuera del
+  alcance del proyecto.
+
+### 28.3 `SlackWebhookConfig`
+
+Value object inmutable (`webhook_url: str = field(repr=False)`).
+Validación estructurada con `urllib.parse.urlparse` (nunca por red):
+
+- no vacío, no compuesto solo de espacios, debe ser `str`;
+- esquema exactamente `https` (`"Slack webhook URL must use HTTPS."`);
+- `parsed.hostname` debe ser exactamente `hooks.slack.com` o
+  `hooks.slack-gov.com` (`"Slack webhook URL must use an approved
+  Slack host."`) -- nunca "contiene la palabra slack". `urlparse().hostname`
+  resuelve correctamente intentos de suplantación vía userinfo
+  (`https://hooks.slack.com@evil.com/...` -> hostname real `evil.com`,
+  rechazado) y subdominios maliciosos (`hooks.slack.com.example.com` ->
+  hostname distinto, rechazado).
+
+Ningún mensaje de validación incluye el valor rechazado.
+
+### 28.4 `UrllibSlackTransport`
+
+`__init__(*, config: SlackWebhookConfig, timeout_seconds: float = 10.0)`
+recibe la configuración una sola vez; conserva `self._config` (un único
+objeto), nunca una copia como `self._webhook_url`. Valida el timeout
+con `math.isfinite(timeout_seconds) and timeout_seconds > 0` (rechaza
+`0`, negativos, `NaN`, ambos infinitos, y explícitamente `bool` aunque
+sea subtipo de `int`) con
+`"Slack timeout must be a finite number greater than zero."`.
+
+`send_message(*, text: str) -> None` construye un POST con cuerpo JSON
+`{"text": text}` y encabezado `Content-Type: application/json;
+charset=utf-8` -- sin bloques, `attachments`, `mrkdwn` personalizado,
+`username`, `icon_url`, ni channel override (solo texto plano en esta
+etapa). Considera éxito únicamente cuando el HTTP es exitoso y el
+cuerpo decodificado, tras `strip()`, es exactamente `"ok"`. Sin
+reintentos internos: como máximo una solicitud por llamada.
+
+### 28.5 Manejo y sanitización de errores
+
+Distingue: HTTP no exitoso, timeout, error de red/DNS, respuesta vacía,
+respuesta distinta de `"ok"`, texto no decodificable, y cualquier
+excepción inesperada de una capa inferior (catch-all defensivo, mismo
+criterio que Telegram, §27.x). Todos se convierten en
+`SlackTransportError` con mensaje sanitizado (ej. `"Slack webhook
+request failed (HTTP 400)."`, `"Slack webhook returned an invalid
+response."`) -- nunca incluye el webhook, la URL completa, encabezados,
+el payload completo ni el cuerpo completo de la respuesta.
+
+### 28.6 Formatter y neutralización de menciones
+
+`_format_slack_text()` (función privada y pura, sin `Clock`/entorno/
+configuración): mismo formato que Telegram (`{title}\n\n{body}\n\nSeveridad:
+{severity}`, severidad solo si no es `None`, sin metadata ni
+`alert_id`, sin Block Kit ni formato específico de Slack).
+
+Antes de truncar, `_neutralize_slack_mentions()` inserta un carácter de
+ancho cero (U+200B) inmediatamente después del signo de apertura de
+cada patrón de mención global (`@channel`/`@here`/`@everyone`/
+`<!channel>`/`<!here>`/`<!everyone>`) -- el texto sigue siendo legible
+(el carácter es invisible en la práctica) pero deja de coincidir con el
+patrón exacto que Slack interpreta como mención masiva real. No afecta
+direcciones de correo ni ningún otro texto.
+
+### 28.7 Límite de longitud
+
+`SLACK_MAX_MESSAGE_LENGTH = 4000` (límite conservador y predecible,
+menor al que Slack admite en algunos contextos). Si el texto ya
+neutralizado supera el límite, se trunca una sola vez y se agrega
+`"\n[Mensaje truncado]"`, garantizando que el resultado nunca exceda el
+máximo. Esta etapa no divide un mensaje largo en varios envíos.
+
+### 28.8 Configuración
+
+Reutiliza el sistema existente, sin crear uno nuevo:
+
+- **Activación**: `paper_trading.inspection_notifications.slack`
+  (config.yaml, ya existía desde la Etapa 6.10) -- `false` por
+  defecto. Ningún flag de entorno redundante.
+- **Webhook**: `SlackSettings.webhook_url`, nueva clase análoga a
+  `TelegramSettings` (§27.9), leída de `SLACK_WEBHOOK_URL` en `.env`
+  (nunca desde config.yaml). Solo obligatorio cuando
+  `inspection_notifications.slack=true`.
+- **Timeout**: `SlackSettings.timeout_seconds` (default `10.0`), leído
+  de `SLACK_TIMEOUT_SECONDS` (opcional).
+- A diferencia de Telegram, no existe un `Settings.slack` de nivel
+  superior (no había ninguna integración previa reservada para Slack en
+  el proyecto): `SlackSettings` vive únicamente dentro de
+  `PaperTradingConfig.slack`, sin duplicar ningún sistema existente.
+
+### 28.9 Orden determinista de canales
+
+`_build_notification_channel()` agrega los canales en este orden fijo:
+`LoggingNotificationChannel` (si `logging=true`) ->
+`TelegramNotificationChannel` (si `telegram=true`) ->
+`SlackNotificationChannel` (si `slack=true`). Cambiar este orden en el
+futuro debe documentarse aquí explícitamente.
+
+### 28.10 Identidad persistente e idempotencia
+
+Sin cambios respecto al mecanismo general (§25.2): la identidad del
+canal es `type(channel).__name__ == "SlackNotificationChannel"`. Un
+envío ya `DELIVERED` nunca se reintenta, sobrevive reinicios y
+reconstrucciones de la Composition Root. Verificado también en
+combinación con Logging/Telegram en el mismo Composite: si Slack falla
+mientras los demás tienen éxito, estos últimos no se repiten en el
+siguiente intento; si Slack luego tiene éxito, solo Slack se reintenta.
+
+### 28.11 Seguridad
+
+El webhook nunca aparece en: `repr`/`str` (config, transport, channel
+-- `SlackWebhookConfig.webhook_url` usa `field(repr=False)`; el canal
+no define `__repr__` propio, así que la representación por defecto de
+Python ya es segura), logs, mensajes de excepción, documentación (esta
+sección no incluye ningún webhook con formato real), pruebas (usan
+valores claramente ficticios) ni commits. `.env` está ignorado por git;
+`.env.example` solo contiene el placeholder vacío
+`SLACK_WEBHOOK_URL=`. Ninguna prueba automatizada realiza una conexión
+real (`urllib.request.urlopen` siempre se reemplaza por un doble en las
+pruebas del transporte; el canal siempre recibe un `FakeSlackTransport`
+en sus propias pruebas).
+
+### 28.12 Explícitamente fuera de alcance
+
+Email/Webhook genérico siguen bloqueados como placeholders (§25.3, sin
+cambios); ninguna dependencia nueva (`requests`/`httpx`/`aiohttp`/
+`slack_sdk`/`slack-bolt` -- solo `urllib`/`json`/`math`/`dataclasses`/
+`typing` de la biblioteca estándar); ningún reintento interno en
+transporte/canal; ninguna división de mensajes largos en múltiples
+envíos; Block Kit/`attachments`/`mrkdwn` personalizado/`username`/
+`icon_url`/channel override (solo texto plano); ningún envío real
+durante la implementación de esta etapa; no se modificó Telegram.

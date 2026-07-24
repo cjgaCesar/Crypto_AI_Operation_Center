@@ -1,9 +1,10 @@
 """
 Pruebas para src/paper_trading/notification_channels.py (Etapa 6.10,
 ampliado en 6.10.1 con idempotencia de entrega por canal, en 6.11 para
-transportar NotificationMessage en vez de InspectionAlert, y en 6.12
-con el canal real de Telegram): patrón Strategy para la entrega de
-alertas de inspección. Ver docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27.
+transportar NotificationMessage en vez de InspectionAlert, en 6.12 con
+el canal real de Telegram, y en 6.13 con el canal real de Slack):
+patrón Strategy para la entrega de alertas de inspección. Ver
+docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27/§28.
 """
 
 from datetime import datetime, timezone
@@ -14,12 +15,14 @@ from src.paper_trading.alert_delivery_service import AlertDeliveryService
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertType, AlertStatus, InspectionAlert
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.notification_channels import (
-    TELEGRAM_MAX_MESSAGE_LENGTH, CompositeNotificationChannel, EmailNotificationChannel,
-    LoggingNotificationChannel, NullNotificationChannel, SlackNotificationChannel,
-    TelegramNotificationChannel, WebhookNotificationChannel, _format_telegram_text,
+    SLACK_MAX_MESSAGE_LENGTH, TELEGRAM_MAX_MESSAGE_LENGTH, CompositeNotificationChannel,
+    EmailNotificationChannel, LoggingNotificationChannel, NullNotificationChannel,
+    SlackNotificationChannel, TelegramNotificationChannel, WebhookNotificationChannel,
+    _format_slack_text, _format_telegram_text,
 )
 from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, NotificationMessage
 from src.paper_trading.reconciliation_models import IssueSeverity
+from src.paper_trading.slack_transport import SlackTransportError
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 from src.paper_trading.telegram_transport import TelegramTransportError
 
@@ -162,12 +165,13 @@ class TestNullChannel:
 
 
 class TestPlaceholderChannelsRaiseNotImplemented:
-    """Etapa 6.12 (§27): TelegramNotificationChannel deja de ser
-    placeholder -- ya no aparece en esta lista, tiene sus propias
-    pruebas en TestTelegramNotificationChannel."""
+    """Etapa 6.12 (§27)/6.13 (§28): Telegram/SlackNotificationChannel
+    dejan de ser placeholders -- ya no aparecen en esta lista, tienen
+    sus propias pruebas en TestTelegramNotificationChannel/
+    TestSlackNotificationChannel."""
 
     @pytest.mark.parametrize("channel_class", [
-        EmailNotificationChannel, SlackNotificationChannel, WebhookNotificationChannel,
+        EmailNotificationChannel, WebhookNotificationChannel,
     ])
     def test_deliver_raises_not_implemented(self, channel_class):
         channel = channel_class()
@@ -175,7 +179,7 @@ class TestPlaceholderChannelsRaiseNotImplemented:
             channel.deliver(_message())
 
     @pytest.mark.parametrize("channel_class", [
-        EmailNotificationChannel, SlackNotificationChannel, WebhookNotificationChannel,
+        EmailNotificationChannel, WebhookNotificationChannel,
     ])
     def test_error_message_is_clear(self, channel_class):
         channel = channel_class()
@@ -819,3 +823,397 @@ class TestTelegramFailThenSucceed:
         assert repo.get_inspection_alert_by_deduplication_key("dedup-retry").status == AlertStatus.DELIVERED
         assert good_channel.delivered == ["alert-retry"]  # el canal exitoso nunca se repite
         assert len(transport.calls) == 2
+
+
+class FakeSlackTransport:
+    """Doble de SlackTransport (Etapa 6.13): nunca realiza ninguna
+    conexión real. Solo recibe `text`, igual que el contrato real de
+    `send_message()`."""
+
+    def __init__(self, fail_times: int = 0, error_message: str = "Slack webhook returned an unsuccessful response."):
+        self.calls: list = []
+        self._fail_times = fail_times
+        self._error_message = error_message
+
+    def send_message(self, *, text):
+        self.calls.append(dict(text=text))
+        if len(self.calls) <= self._fail_times:
+            raise SlackTransportError(self._error_message)
+
+
+class TestSlackTextFormat:
+    """Etapa 6.13 (§28): _format_slack_text() es pura, determinista,
+    nunca Block Kit, nunca incluye metadata/alert_id."""
+
+    def test_includes_title_and_body(self):
+        message = NotificationMessage(alert_id="a1", title="Titulo", body="Cuerpo", severity=None)
+        text = _format_slack_text(message)
+        assert "Titulo" in text
+        assert "Cuerpo" in text
+
+    def test_includes_severity_when_present(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        text = _format_slack_text(message)
+        assert "Severidad: CRITICAL" in text
+
+    def test_omits_severity_line_when_none(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        text = _format_slack_text(message)
+        assert "Severidad" not in text
+
+    def test_does_not_include_metadata_or_alert_id(self):
+        message = NotificationMessage(
+            alert_id="alert-secreto", title="T", body="B", severity=None,
+            metadata={"run_id": "run-1", "alert_type": "NEW_ISSUE"},
+        )
+        text = _format_slack_text(message)
+        assert "alert-secreto" not in text
+        assert "run-1" not in text
+        assert "alert_type" not in text
+
+    def test_never_contains_block_kit_or_slack_specific_markup(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        text = _format_slack_text(message)
+        for forbidden in ('"blocks":', '"attachments":', "*bold*", "_italic_", "```", "<http"):
+            assert forbidden not in text
+
+    def test_is_deterministic(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        assert _format_slack_text(message) == _format_slack_text(message)
+
+
+class TestSlackMentionNeutralization:
+    """Etapa 6.13 (§28, punto 15): las menciones globales de Slack se
+    neutralizan con un carácter de ancho cero, para que nunca activen
+    una notificación masiva real."""
+
+    @pytest.mark.parametrize("mention", ["@channel", "@here", "@everyone"])
+    def test_at_mentions_are_neutralized(self, mention):
+        message = NotificationMessage(alert_id="a1", title="T", body=f"Aviso {mention} urgente", severity=None)
+        text = _format_slack_text(message)
+        assert mention not in text
+
+    @pytest.mark.parametrize("mention", ["<!channel>", "<!here>", "<!everyone>"])
+    def test_bang_mentions_are_neutralized(self, mention):
+        message = NotificationMessage(alert_id="a1", title="T", body=f"Aviso {mention} urgente", severity=None)
+        text = _format_slack_text(message)
+        assert mention not in text
+
+    def test_neutralized_text_remains_readable(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="Aviso @channel urgente", severity=None)
+        text = _format_slack_text(message)
+        assert "channel" in text
+        assert "Aviso" in text
+        assert "urgente" in text
+
+    def test_normal_text_without_mentions_is_unmodified(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="Texto normal sin menciones.", severity=None)
+        text = _format_slack_text(message)
+        assert text == "T\n\nTexto normal sin menciones."
+
+
+class TestSlackFormatterPurity:
+    """Etapa 6.13 (§28): _format_slack_text() depende exclusivamente de
+    `message` y de constantes inmutables del módulo -- nunca de clock,
+    entorno, locale, red ni estado global (mismo criterio que Telegram,
+    §27.x)."""
+
+    def test_determinism_across_repeated_calls(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        assert _format_slack_text(message) == _format_slack_text(message)
+
+    def test_signature_does_not_admit_a_clock(self):
+        import inspect
+
+        params = list(inspect.signature(_format_slack_text).parameters)
+        assert params == ["message"]
+
+    def test_independent_of_environment_variables(self, monkeypatch):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        before = _format_slack_text(message)
+
+        for var, value in (
+            ("TZ", "America/Argentina/Buenos_Aires"), ("LANG", "es_AR.UTF-8"), ("LC_ALL", "es_AR.UTF-8"),
+            ("SLACK_WEBHOOK_URL", "https://hooks.slack.com/deberia-ser-ignorado"),
+        ):
+            monkeypatch.setenv(var, value)
+
+        after = _format_slack_text(message)
+        assert before == after
+
+    def test_does_not_mutate_the_message(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        before = repr(message)
+        _format_slack_text(message)
+        after = repr(message)
+        assert before == after
+
+    def test_has_no_side_effects_source_inspection(self):
+        import inspect
+
+        source = inspect.getsource(_format_slack_text)
+        forbidden_identifiers = (
+            "logger.", "logging.", "print(", "open(", "socket.", "urllib.", "requests.",
+            "self._repository", "repository.", "os.environ", "os.getenv",
+        )
+        for forbidden in forbidden_identifiers:
+            assert forbidden not in source
+
+
+class TestSlackTextLength:
+    def test_short_text_is_not_altered(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="cuerpo corto", severity=None)
+        text = _format_slack_text(message)
+        assert text == "T\n\ncuerpo corto"
+
+    def test_text_at_exact_limit_is_not_truncated(self):
+        body = "x" * (SLACK_MAX_MESSAGE_LENGTH - len("T\n\n"))
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_slack_text(message)
+        assert len(text) == SLACK_MAX_MESSAGE_LENGTH
+        assert "truncado" not in text
+
+    def test_text_over_limit_is_truncated_with_mark(self):
+        body = "x" * (SLACK_MAX_MESSAGE_LENGTH * 2)
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_slack_text(message)
+        assert len(text) <= SLACK_MAX_MESSAGE_LENGTH
+        assert text.endswith("[Mensaje truncado]")
+
+    def test_truncated_text_never_exceeds_max_length(self):
+        body = "y" * (SLACK_MAX_MESSAGE_LENGTH + 1)
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_slack_text(message)
+        assert len(text) == SLACK_MAX_MESSAGE_LENGTH
+
+
+class TestSlackNotificationChannelConstructor:
+    """Etapa 6.13 (§28): el constructor solo acepta transport/clock."""
+
+    def test_only_accepts_transport_and_clock(self):
+        import inspect
+
+        params = list(inspect.signature(SlackNotificationChannel.__init__).parameters)
+        assert params == ["self", "transport", "clock"]
+
+    def test_webhook_url_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            SlackNotificationChannel(webhook_url="https://hooks.slack.com/x", transport=FakeSlackTransport())
+
+    def test_timeout_seconds_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            SlackNotificationChannel(timeout_seconds=5.0, transport=FakeSlackTransport())
+
+    def test_valid_configuration_constructs_successfully(self):
+        channel = SlackNotificationChannel(transport=FakeSlackTransport())
+        assert channel is not None
+
+
+class TestSlackChannelHasNoCredentials:
+    def test_channel_has_no_credential_attributes(self):
+        channel = SlackNotificationChannel(transport=FakeSlackTransport())
+        for attr in ("_webhook_url", "webhook_url", "_timeout_seconds", "timeout_seconds", "_config", "config"):
+            assert not hasattr(channel, attr), f"el canal no debería tener el atributo {attr!r}"
+
+    def test_channel_only_has_transport_and_clock(self):
+        channel = SlackNotificationChannel(transport=FakeSlackTransport())
+        assert set(vars(channel).keys()) == {"_transport", "_clock"}
+
+    def test_repr_does_not_contain_webhook(self):
+        channel = SlackNotificationChannel(transport=FakeSlackTransport())
+        assert "FAKE-WEBHOOK-VALUE" not in repr(channel)
+
+    def test_str_does_not_contain_webhook(self):
+        channel = SlackNotificationChannel(transport=FakeSlackTransport())
+        assert "FAKE-WEBHOOK-VALUE" not in str(channel)
+
+
+class TestSlackNotificationChannelDelivery:
+    def test_successful_delivery_invokes_transport_once(self):
+        transport = FakeSlackTransport()
+        channel = SlackNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        result = channel.deliver(message)
+        assert result.success is True
+        assert len(transport.calls) == 1
+
+    def test_uses_injected_clock_for_delivered_at(self):
+        fixed = datetime(2030, 7, 7, tzinfo=timezone.utc)
+        channel = SlackNotificationChannel(transport=FakeSlackTransport(), clock=FixedClock(fixed))
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.delivered_at == fixed
+
+    def test_does_not_modify_the_message(self):
+        transport = FakeSlackTransport()
+        channel = SlackNotificationChannel(transport=transport)
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        channel.deliver(message)
+        assert message == NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+
+    def test_transport_receives_only_text(self):
+        transport = FakeSlackTransport()
+        channel = SlackNotificationChannel(transport=transport)
+        channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert list(transport.calls[0].keys()) == ["text"]
+        assert transport.calls[0]["text"] == "T\n\nB"
+
+    def test_transport_failure_returns_failed_result_without_raising(self):
+        transport = FakeSlackTransport(fail_times=99)
+        channel = SlackNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+
+    def test_transport_failure_message_passes_through_unmodified(self):
+        transport = FakeSlackTransport(fail_times=99, error_message="Slack webhook request failed (HTTP 400).")
+        channel = SlackNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.error_message == "Slack webhook request failed (HTTP 400)."
+
+    def test_deliver_never_retries_internally(self):
+        transport = FakeSlackTransport(fail_times=1)
+        channel = SlackNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+        assert len(transport.calls) == 1
+
+
+class TestSlackChannelIdentity:
+    """Etapa 6.13 (§28, punto 21): la identidad persistente del canal es
+    exactamente type(channel).__name__ == 'SlackNotificationChannel'."""
+
+    def test_persisted_identity_is_the_class_name(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-sl", deduplication_key="k-sl")
+        _seed_alert(repo, alert)
+        transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        composite = CompositeNotificationChannel([slack_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()))
+        composite.deliver(_message(alert_id="alert-sl"))
+        state = repo.get_alert_channel_delivery("alert-sl", "SlackNotificationChannel")
+        assert state is not None
+        assert state.status == AlertStatus.DELIVERED
+
+
+class TestSlackEndToEndWithoutInternet:
+    """Punto 28: integración interna completa (repositorio real,
+    DefaultInspectionNotificationTemplate real, SlackNotificationChannel
+    con FakeSlackTransport -- nunca UrllibSlackTransport --,
+    CompositeNotificationChannel, AlertDeliveryService)."""
+
+    def test_full_pipeline_delivers_and_never_resends(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+
+        alert = InspectionAlert(
+            id="alert-slack-e2e", run_id="run-slack-e2e", alert_type=AlertType.NEW_ISSUE, issue_identity=None,
+            issue_code=None, severity=None, title="t", message="Inconsistencia detectada.",
+            deduplication_key="dedup-slack-e2e", status=AlertStatus.PENDING, delivery_attempts=0,
+            last_error=None, created_at=_now(),
+        )
+        _seed_alert(repo1, alert)
+
+        transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        composite1 = CompositeNotificationChannel([slack_channel], repository=repo1, max_attempts=3, clock=FixedClock(_now()))
+        service1 = AlertDeliveryService(
+            repo1, composite1, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+
+        result = service1.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(transport.calls) == 1
+        assert "Inconsistencia detectada." in transport.calls[0]["text"]
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-slack-e2e").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-slack-e2e", "SlackNotificationChannel").status == AlertStatus.DELIVERED
+
+        # Segundo procesamiento: no reenvía.
+        service1.deliver_pending_alerts()
+        assert len(transport.calls) == 1
+
+        # "Reinicio": nueva instancia de repositorio + servicios sobre el mismo archivo.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel([slack_channel], repository=repo2, max_attempts=3, clock=FixedClock(_now()))
+        service2 = AlertDeliveryService(
+            repo2, composite2, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+        service2.deliver_pending_alerts()
+        assert len(transport.calls) == 1  # Slack no se vuelve a invocar tras el reinicio.
+
+
+class TestMultiChannelIntegration:
+    """Punto 29: Logging + Telegram (fake) + Slack (fake) juntos en el
+    mismo CompositeNotificationChannel."""
+
+    def test_all_three_channels_succeed(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-multi", deduplication_key="dedup-multi")
+        _seed_alert(repo, alert)
+
+        logging_channel = LoggingNotificationChannel(clock=FixedClock(_now()))
+        telegram_transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(transport=telegram_transport, clock=FixedClock(_now()))
+        slack_transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=slack_transport, clock=FixedClock(_now()))
+
+        composite = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service = AlertDeliveryService(repo, composite, max_attempts=3, clock=FixedClock(_now()))
+        result = service.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-multi").status == AlertStatus.DELIVERED
+        for channel_name in ("LoggingNotificationChannel", "TelegramNotificationChannel", "SlackNotificationChannel"):
+            state = repo.get_alert_channel_delivery("alert-multi", channel_name)
+            assert state is not None
+            assert state.status == AlertStatus.DELIVERED
+
+    def test_slack_fails_others_do_not_repeat_then_slack_succeeds(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+        alert = _alert(id="alert-multi2", deduplication_key="dedup-multi2")
+        _seed_alert(repo1, alert)
+
+        telegram_transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(transport=telegram_transport, clock=FixedClock(_now()))
+        slack_transport = FakeSlackTransport(fail_times=1)
+        slack_channel = SlackNotificationChannel(transport=slack_transport, clock=FixedClock(_now()))
+
+        composite1 = CompositeNotificationChannel(
+            [telegram_channel, slack_channel], repository=repo1, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service1 = AlertDeliveryService(repo1, composite1, max_attempts=3, clock=FixedClock(_now()))
+
+        service1.deliver_pending_alerts()
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert repo1.get_alert_channel_delivery("alert-multi2", "TelegramNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi2", "SlackNotificationChannel").status == AlertStatus.PENDING
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-multi2").status == AlertStatus.PENDING
+
+        service1.deliver_pending_alerts()
+        assert len(telegram_transport.calls) == 1  # Telegram no se repite
+        assert len(slack_transport.calls) == 2  # solo Slack se reintenta
+        assert repo1.get_alert_channel_delivery("alert-multi2", "SlackNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-multi2").status == AlertStatus.DELIVERED
+
+        # "Reinicio": ningún canal ya DELIVERED se vuelve a invocar.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel(
+            [telegram_channel, slack_channel], repository=repo2, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service2 = AlertDeliveryService(repo2, composite2, max_attempts=3, clock=FixedClock(_now()))
+        result2 = service2.deliver_pending_alerts()
+        assert result2.delivered_count == 0
+        assert result2.failed_count == 0
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 2
