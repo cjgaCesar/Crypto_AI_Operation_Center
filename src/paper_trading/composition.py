@@ -74,6 +74,14 @@ host aprobado), `UrllibSlackTransport` ya configurado, y
 `SlackNotificationChannel` recibiendo únicamente ese transporte. Se
 agrega a la lista después de Telegram (orden determinista: Logging ->
 Telegram -> Slack).
+
+Etapa 6.14 (§29): mismo patrón para Email. Cuando
+`inspection_notifications.email` es `true`, esta función construye
+`SmtpEmailConfig` a partir de `config.email` (valida host/puerto/
+seguridad/credenciales consistentes/direcciones), `SmtpEmailTransport`
+ya configurado, y `EmailNotificationChannel` recibiendo únicamente ese
+transporte. Se agrega al final de la lista (orden determinista:
+Logging -> Telegram -> Slack -> Email).
 """
 
 import logging
@@ -88,6 +96,7 @@ from src.paper_trading.fill_engine import FillEngine
 from src.paper_trading.inspection_job import InspectionJob
 from src.paper_trading.inspection_service import InspectionService
 from src.paper_trading.models import CashBalance
+from src.paper_trading.email_transport import SmtpEmailConfig, SmtpEmailTransport
 from src.paper_trading.notification_channels import (
     CompositeNotificationChannel, EmailNotificationChannel, InspectionNotificationChannel,
     LoggingNotificationChannel, SlackNotificationChannel, TelegramNotificationChannel,
@@ -106,7 +115,9 @@ from src.paper_trading.service import PaperTradingService
 from src.paper_trading.slack_transport import SlackWebhookConfig, UrllibSlackTransport
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 from src.paper_trading.telegram_transport import TelegramCredentials, UrllibTelegramTransport
-from src.utils.config import InspectionNotificationsConfig, PaperTradingConfig, SlackSettings, TelegramSettings
+from src.utils.config import (
+    EmailSettings, InspectionNotificationsConfig, PaperTradingConfig, SlackSettings, TelegramSettings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,12 +168,11 @@ def seed_initial_cash_balance(
 
 
 # Nombre de config -> nombre de clase placeholder, para el mensaje de
-# error de _build_notification_channel() (§25.3). Ninguno de estos 2
-# canales tiene una conexión real todavía. `telegram` salió de esta
-# lista en la Etapa 6.12 (§27); `slack` sale en la Etapa 6.13 (§28) --
-# ambos ya son canales reales, no placeholders.
+# error de _build_notification_channel() (§25.3). Solo queda este canal
+# sin conexión real. `telegram`/`slack` salieron de esta lista en las
+# Etapas 6.12/6.13; `email` sale en la Etapa 6.14 (§29) -- los tres ya
+# son canales reales, no placeholders.
 _PLACEHOLDER_CHANNEL_NAMES = {
-    "email": "EmailNotificationChannel",
     "webhook": "WebhookNotificationChannel",
 }
 
@@ -171,6 +181,7 @@ def _build_notification_channel(
     config: InspectionNotificationsConfig,
     telegram_settings: TelegramSettings,
     slack_settings: SlackSettings,
+    email_settings: EmailSettings,
     repository: PaperTradingRepository,
     max_attempts: int,
     clock: Clock,
@@ -197,8 +208,15 @@ def _build_notification_channel(
     `true`, construye `SlackWebhookConfig` a partir de `slack_settings`
     (valida HTTPS y host aprobado), `UrllibSlackTransport` ya
     configurado, y `SlackNotificationChannel` recibiendo únicamente ese
-    transporte. Orden determinista de la lista: Logging -> Telegram ->
-    Slack."""
+    transporte.
+
+    Etapa 6.14 (§29): mismo patrón para Email -- si `config.email` es
+    `true`, construye `SmtpEmailConfig` a partir de `email_settings`
+    (valida host/puerto/seguridad/credenciales consistentes/
+    direcciones), `SmtpEmailTransport` ya configurado, y
+    `EmailNotificationChannel` recibiendo únicamente ese transporte.
+    Orden determinista de la lista: Logging -> Telegram -> Slack ->
+    Email."""
     enabled_placeholders = [
         class_name for flag, class_name in _PLACEHOLDER_CHANNEL_NAMES.items() if getattr(config, flag)
     ]
@@ -227,6 +245,17 @@ def _build_notification_channel(
             config=slack_config, timeout_seconds=slack_settings.timeout_seconds,
         )
         channels.append(SlackNotificationChannel(transport=slack_transport, clock=clock))
+    if config.email:
+        smtp_config = SmtpEmailConfig(
+            host=email_settings.host, port=email_settings.port,
+            sender=email_settings.sender, recipient=email_settings.recipient,
+            security=email_settings.security,
+            username=email_settings.username, password=email_settings.password,
+        )
+        email_transport = SmtpEmailTransport(
+            config=smtp_config, timeout_seconds=email_settings.timeout_seconds,
+        )
+        channels.append(EmailNotificationChannel(transport=email_transport, clock=clock))
     return CompositeNotificationChannel(channels, repository=repository, max_attempts=max_attempts, clock=clock)
 
 
@@ -273,7 +302,7 @@ def build_paper_trading_context(
     alert_delivery_service = AlertDeliveryService(
         repository=repository,
         channel=_build_notification_channel(
-            config.inspection_notifications, config.telegram, config.slack, repository,
+            config.inspection_notifications, config.telegram, config.slack, config.email, repository,
             config.reconciliation_inspection.max_alert_delivery_attempts, clock,
         ),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,

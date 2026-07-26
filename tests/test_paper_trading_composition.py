@@ -602,17 +602,6 @@ class TestPlaceholderChannelsBlockedAtStartup:
     debe fallar de inmediato al construir la Composition Root, con un
     mensaje que identifica el canal -- nunca esperar a la primera alerta."""
 
-    def test_email_true_fails_to_build_context(self, tmp_path):
-        from src.utils.config import InspectionNotificationsConfig
-
-        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(email=True))
-        with pytest.raises(ValueError) as exc_info:
-            build_paper_trading_context(
-                config=config, clock=FixedClock(_now()),
-                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-            )
-        assert "EmailNotificationChannel" in str(exc_info.value)
-
     def test_webhook_true_fails_to_build_context(self, tmp_path):
         from src.utils.config import InspectionNotificationsConfig
 
@@ -623,20 +612,6 @@ class TestPlaceholderChannelsBlockedAtStartup:
                 id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
             )
         assert "WebhookNotificationChannel" in str(exc_info.value)
-
-    def test_message_identifies_multiple_enabled_placeholders(self, tmp_path):
-        from src.utils.config import InspectionNotificationsConfig
-
-        config = _config(
-            tmp_path, inspection_notifications=InspectionNotificationsConfig(webhook=True, email=True),
-        )
-        with pytest.raises(ValueError) as exc_info:
-            build_paper_trading_context(
-                config=config, clock=FixedClock(_now()),
-                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-            )
-        assert "WebhookNotificationChannel" in str(exc_info.value)
-        assert "EmailNotificationChannel" in str(exc_info.value)
 
     def test_logging_true_works(self, tmp_path):
         config = _config(tmp_path)  # default: logging=True, resto False
@@ -846,13 +821,12 @@ class TestTelegramChannelWiring:
         assert "chat" not in str(exc_info.value)  # el chat_id real tampoco se filtra por accidente
 
     def test_other_placeholders_remain_blocked_at_startup(self, tmp_path):
-        """Etapa 6.12 (§27, punto 20), actualizada en 6.13 (§28, punto 22):
-        Email/Webhook deben seguir bloqueados como placeholders --
-        Telegram y Slack ya son canales reales."""
+        """Etapa 6.12 (§27, punto 20), actualizada en 6.13 (§28, punto 22)
+        y en 6.14 (§29, punto 28): solo Webhook sigue bloqueado como
+        placeholder -- Telegram, Slack y Email ya son canales reales."""
         from src.utils.config import InspectionNotificationsConfig
 
         for flag, class_name in (
-            ("email", "EmailNotificationChannel"),
             ("webhook", "WebhookNotificationChannel"),
         ):
             config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(**{flag: True}))
@@ -1148,6 +1122,316 @@ class TestSlackChannelWiringHardenedValidation:
         self._assert_fails_without_building_channel(
             tmp_path, "https://hooks.slack.com/services/T/B",
         )
+
+
+class TestEmailChannelWiring:
+    """Etapa 6.14 (§29): EmailNotificationChannel deja de ser
+    placeholder -- se construye e inyecta como canal real cuando
+    inspection_notifications.email=True y la configuración SMTP es
+    válida."""
+
+    _VALID_HOST = "smtp.example.com"
+    _VALID_SENDER = "alerts@example.com"
+    _VALID_RECIPIENT = "ops@example.com"
+
+    def test_disabled_by_default_email_not_constructed(self, tmp_path):
+        from src.paper_trading.notification_channels import EmailNotificationChannel
+
+        config = _config(tmp_path)  # default: email=False
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert not any(isinstance(c, EmailNotificationChannel) for c in channels)
+
+    def test_disabled_by_default_does_not_require_smtp_settings(self, tmp_path):
+        from src.utils.config import EmailSettings
+
+        config = _config(tmp_path, email=EmailSettings(host=None, sender=None, recipient=None))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_disabled_preserves_previous_behavior(self, tmp_path):
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        from src.paper_trading.notification_channels import LoggingNotificationChannel
+
+        channels = context.alert_delivery_service._channel._channels
+        assert len(channels) == 1
+        assert isinstance(channels[0], LoggingNotificationChannel)
+
+    def test_enabled_and_configured_builds_email_channel(self, tmp_path):
+        from src.paper_trading.notification_channels import EmailNotificationChannel
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, port=587, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                security="starttls", timeout_seconds=7.5,
+            ),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        email_channels = [c for c in channels if isinstance(c, EmailNotificationChannel)]
+        assert len(email_channels) == 1
+
+    def test_channel_does_not_retain_credentials(self, tmp_path):
+        from src.paper_trading.notification_channels import EmailNotificationChannel
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                username="secretuser", password="SECRETPW123",
+            ),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        email_channel = next(c for c in channels if isinstance(c, EmailNotificationChannel))
+        assert set(vars(email_channel).keys()) == {"_transport", "_clock"}
+        assert "SECRETPW123" not in repr(email_channel)
+        assert "SECRETPW123" not in repr(email_channel._transport)
+
+    def test_transport_receives_the_correct_configuration(self, tmp_path, monkeypatch):
+        """Confirma la configuración correcta sin inspeccionar
+        directamente el atributo sensible en el objeto ya construido:
+        se intercepta la llamada al constructor del transporte (spy)."""
+        import src.paper_trading.composition as composition_module
+        from src.paper_trading.email_transport import SmtpEmailTransport
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        captured = {}
+        real_transport_cls = SmtpEmailTransport
+
+        def _spy_transport(*, config, timeout_seconds=10.0):
+            captured["host_matches_expected"] = (config.host == self._VALID_HOST)
+            captured["sender_matches_expected"] = (config.sender == self._VALID_SENDER)
+            captured["timeout_seconds"] = timeout_seconds
+            return real_transport_cls(config=config, timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(composition_module, "SmtpEmailTransport", _spy_transport)
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                timeout_seconds=6.5,
+            ),
+        )
+        build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert captured["host_matches_expected"] is True
+        assert captured["sender_matches_expected"] is True
+        assert captured["timeout_seconds"] == 6.5
+
+    def test_channel_order_is_logging_telegram_slack_email(self, tmp_path):
+        from src.paper_trading.notification_channels import (
+            EmailNotificationChannel, LoggingNotificationChannel, SlackNotificationChannel,
+            TelegramNotificationChannel,
+        )
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig, SlackSettings, TelegramSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(
+                logging=True, telegram=True, slack=True, email=True,
+            ),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat"),
+            slack=SlackSettings(webhook_url="https://hooks.slack.com/services/T000/B000/XXXX"),
+            email=EmailSettings(host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert [type(c) for c in channels] == [
+            LoggingNotificationChannel, TelegramNotificationChannel, SlackNotificationChannel, EmailNotificationChannel,
+        ]
+
+    def test_email_is_no_longer_a_placeholder(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_enabled_without_host_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(host=None, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "host" in str(exc_info.value).lower()
+
+    def test_enabled_with_invalid_port_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, port=0, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "port" in str(exc_info.value).lower()
+
+    def test_enabled_without_sender_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(host=self._VALID_HOST, sender=None, recipient=self._VALID_RECIPIENT),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "sender" in str(exc_info.value).lower()
+
+    def test_enabled_without_recipient_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=None),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "recipient" in str(exc_info.value).lower()
+
+    def test_enabled_with_invalid_security_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                security="none",
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "security" in str(exc_info.value).lower()
+
+    def test_enabled_with_username_without_password_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                username="user", password=None,
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "password" in str(exc_info.value).lower()
+
+    def test_enabled_with_password_without_username_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                username=None, password="pw",
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "password" in str(exc_info.value).lower()
+
+    def test_enabled_with_header_injection_in_address_fails_to_build_context(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        malicious = "a@example.com\nBcc: victim@evil.com"
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(host=self._VALID_HOST, sender=malicious, recipient=self._VALID_RECIPIENT),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "victim@evil.com" not in str(exc_info.value)
+
+    def test_email_error_never_includes_the_username(self, tmp_path):
+        from src.utils.config import EmailSettings, InspectionNotificationsConfig
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(email=True),
+            email=EmailSettings(
+                host=self._VALID_HOST, sender=self._VALID_SENDER, recipient=self._VALID_RECIPIENT,
+                username="MY-SECRET-USER", password=None,
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "MY-SECRET-USER" not in str(exc_info.value)
 
 
 class TestNotificationTemplateWiring:

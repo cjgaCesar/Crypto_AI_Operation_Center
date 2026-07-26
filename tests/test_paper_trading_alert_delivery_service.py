@@ -263,13 +263,13 @@ class TestWorksWithCompositeNotificationChannel:
 
     def test_composite_with_a_failing_placeholder_channel_keeps_alert_pending(self, tmp_path):
         from src.paper_trading.notification_channels import (
-            CompositeNotificationChannel, EmailNotificationChannel, NullNotificationChannel,
+            CompositeNotificationChannel, NullNotificationChannel, WebhookNotificationChannel,
         )
 
         repo = _repo(tmp_path)
         _seed_alert(repo)
         composite = CompositeNotificationChannel(
-            [NullNotificationChannel(), EmailNotificationChannel()], repository=repo, max_attempts=3,
+            [NullNotificationChannel(), WebhookNotificationChannel()], repository=repo, max_attempts=3,
         )
         service = AlertDeliveryService(repo, composite, max_attempts=3)
         result = service.deliver_pending_alerts()

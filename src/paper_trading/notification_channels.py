@@ -48,6 +48,14 @@ Incoming Webhook), nunca el webhook. `_format_slack_text()` neutraliza
 menciones globales (`@channel`/`@here`/`@everyone`/`<!channel>`/
 `<!here>`/`<!everyone>`) antes de truncar a `SLACK_MAX_MESSAGE_LENGTH`.
 
+Etapa 6.14 (§29): `EmailNotificationChannel` deja de ser un placeholder,
+mismo patrón: recibe un `EmailTransport` ya configurado
+(email_transport.py, único módulo que conoce `smtplib`/`ssl`), nunca
+host/puerto/credenciales/remitente/destinatario. `_format_email_subject()`/
+`_format_email_body()` neutralizan CR/LF/tabs (defensa en profundidad
+contra header injection) antes de truncar a
+`EMAIL_MAX_SUBJECT_LENGTH`/`EMAIL_MAX_BODY_LENGTH`.
+
 Etapa 6.10.1 (§25.2): `CompositeNotificationChannel` deja de llevar la
 lógica de reintentos únicamente en memoria. Ahora recibe `repository` y
 `max_attempts`, y consulta/persiste `InspectionAlertChannelDelivery`
@@ -79,6 +87,7 @@ from typing import Protocol
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, InspectionAlertChannelDelivery
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.notification_templates import NotificationMessage
+from src.paper_trading.email_transport import EmailTransport
 from src.paper_trading.runtime import Clock, SystemClock
 from src.paper_trading.slack_transport import SlackTransport
 from src.paper_trading.telegram_transport import TelegramTransport
@@ -91,6 +100,11 @@ _TELEGRAM_TRUNCATION_MARK = "\n[Mensaje truncado]"
 SLACK_MAX_MESSAGE_LENGTH = 4000
 _SLACK_TRUNCATION_MARK = "\n[Mensaje truncado]"
 _SLACK_MENTION_PATTERNS = ("@channel", "@here", "@everyone", "<!channel>", "<!here>", "<!everyone>")
+
+EMAIL_MAX_SUBJECT_LENGTH = 180
+_EMAIL_SUBJECT_TRUNCATION_MARK = "…"
+EMAIL_MAX_BODY_LENGTH = 10000
+_EMAIL_BODY_TRUNCATION_MARK = "\n[Mensaje truncado]"
 
 
 class InspectionNotificationChannel(Protocol):
@@ -143,16 +157,89 @@ class NullNotificationChannel:
         return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
 
 
-class EmailNotificationChannel:
-    """Placeholder: SMTP real queda fuera de alcance de la Etapa 6.10.
+def _sanitize_email_header_value(value: str) -> str:
+    """Defensa en profundidad contra header injection (§29.x): aunque
+    `NotificationMessage` ya pasó por el Template (nunca debería traer
+    CR/LF), esta función igual reemplaza CR/LF/tabs por espacios y
+    colapsa espacios repetidos antes de usar el valor como cabecera
+    SMTP -- nunca permite que un salto de línea cree una cabecera
+    nueva (ej. `"Bcc: ..."`)."""
+    sanitized = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return " ".join(sanitized.split())
 
-    No importa `smtplib` ni ninguna librería de correo. `deliver()`
-    siempre lanza `NotImplementedError`."""
+
+def _format_email_subject(message: NotificationMessage) -> str:
+    """Adapta un NotificationMessage ya renderizado al asunto de un
+    email (§29). Pura y determinista: nunca incluye `alert_id` ni
+    metadata completa. Trunca de forma controlada si el resultado
+    supera `EMAIL_MAX_SUBJECT_LENGTH`, marcando el corte con
+    `_EMAIL_SUBJECT_TRUNCATION_MARK`."""
+    subject = _sanitize_email_header_value(f"[Crypto AI] {message.title}")
+    if len(subject) <= EMAIL_MAX_SUBJECT_LENGTH:
+        return subject
+
+    truncated_length = EMAIL_MAX_SUBJECT_LENGTH - len(_EMAIL_SUBJECT_TRUNCATION_MARK)
+    return subject[:truncated_length] + _EMAIL_SUBJECT_TRUNCATION_MARK
+
+
+def _format_email_body(message: NotificationMessage) -> str:
+    """Adapta un NotificationMessage ya renderizado al cuerpo de texto
+    plano de un email (§29). Pura y determinista: nunca HTML, nunca
+    incluye metadata completa ni `alert_id` (mismo criterio que
+    Telegram/Slack, §27/§28). Trunca de forma controlada si el
+    resultado supera `EMAIL_MAX_BODY_LENGTH`, marcando el corte con
+    `_EMAIL_BODY_TRUNCATION_MARK`; nunca divide en varios emails."""
+    lines = [message.title, "", message.body]
+    if message.severity is not None:
+        lines.append("")
+        lines.append(f"Severidad: {message.severity.value}")
+    text = "\n".join(lines)
+
+    if len(text) <= EMAIL_MAX_BODY_LENGTH:
+        return text
+
+    truncated_length = EMAIL_MAX_BODY_LENGTH - len(_EMAIL_BODY_TRUNCATION_MARK)
+    return text[:truncated_length] + _EMAIL_BODY_TRUNCATION_MARK
+
+
+class EmailNotificationChannel:
+    """Canal real (Etapa 6.14, §29): entrega vía SMTP, a través de un
+    `EmailTransport` inyectado y ya configurado (email_transport.py) --
+    mismo patrón que `TelegramNotificationChannel`/`SlackNotificationChannel`
+    (§27/§27.x/§28).
+
+    Nunca conoce `InspectionAlert` (solo `NotificationMessage`, igual
+    que el resto de los canales), nunca accede al repositorio, nunca
+    persiste estado directamente, y nunca decide reintentos globales ni
+    por canal -- eso es responsabilidad exclusiva de
+    `AlertDeliveryService`/`CompositeNotificationChannel` (§25.2).
+    `deliver()` realiza como máximo UNA sesión SMTP por llamada: no
+    reintenta internamente.
+
+    No conoce ni almacena host/puerto/username/password/sender/
+    recipient/security/timeout -- esa configuración queda encapsulada
+    exclusivamente en el `transport` ya construido por la Composition
+    Root (ver `SmtpEmailConfig`/`SmtpEmailTransport`). Los únicos
+    atributos propios de este canal son `transport`/`clock`.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: EmailTransport,
+        clock: Clock = SystemClock(),
+    ):
+        self._transport = transport
+        self._clock = clock
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        raise NotImplementedError(
-            "EmailNotificationChannel todavía no está implementado (SMTP real queda para una etapa posterior)."
-        )
+        subject = _format_email_subject(message)
+        body = _format_email_body(message)
+        try:
+            self._transport.send_message(subject=subject, body=body)
+            return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
+        except Exception as exc:
+            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
 
 
 def _neutralize_slack_mentions(text: str) -> str:

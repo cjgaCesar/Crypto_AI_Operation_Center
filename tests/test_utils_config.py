@@ -185,6 +185,59 @@ def test_slack_settings_reads_all_fields_from_env(tmp_path, monkeypatch):
     assert settings.paper_trading.slack.timeout_seconds == 12.5
 
 
+def test_email_settings_defaults_when_env_unset(tmp_path, monkeypatch):
+    for var in (
+        "EMAIL_SMTP_HOST", "EMAIL_SMTP_PORT", "EMAIL_SMTP_USERNAME", "EMAIL_SMTP_PASSWORD",
+        "EMAIL_FROM", "EMAIL_TO", "EMAIL_SECURITY", "EMAIL_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    assert settings.paper_trading.email.host is None
+    assert settings.paper_trading.email.port == 587
+    assert settings.paper_trading.email.username is None
+    assert settings.paper_trading.email.password is None
+    assert settings.paper_trading.email.sender is None
+    assert settings.paper_trading.email.recipient is None
+    assert settings.paper_trading.email.security == "starttls"
+    assert settings.paper_trading.email.timeout_seconds == 10.0
+
+
+def test_email_settings_reads_all_fields_from_env(tmp_path, monkeypatch):
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "EMAIL_SMTP_HOST=smtp.example.com\nEMAIL_SMTP_PORT=465\n"
+        "EMAIL_SMTP_USERNAME=usuario_de_prueba\nEMAIL_SMTP_PASSWORD=clave_de_prueba\n"
+        "EMAIL_FROM=alerts@example.com\nEMAIL_TO=ops@example.com\n"
+        "EMAIL_SECURITY=ssl\nEMAIL_TIMEOUT_SECONDS=8.5\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert settings.paper_trading.email.host == "smtp.example.com"
+    assert settings.paper_trading.email.port == 465
+    assert settings.paper_trading.email.username == "usuario_de_prueba"
+    assert settings.paper_trading.email.password == "clave_de_prueba"
+    assert settings.paper_trading.email.sender == "alerts@example.com"
+    assert settings.paper_trading.email.recipient == "ops@example.com"
+    assert settings.paper_trading.email.security == "ssl"
+    assert settings.paper_trading.email.timeout_seconds == 8.5
+
+
+def test_email_settings_password_absent_from_repr(tmp_path):
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text("EMAIL_SMTP_PASSWORD=super_secreto_de_prueba\n", encoding="utf-8")
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert "super_secreto_de_prueba" not in repr(settings.paper_trading.email)
+
+
 def test_missing_config_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_settings(config_path=tmp_path / "no_existe.yaml", env_path=tmp_path / ".env")

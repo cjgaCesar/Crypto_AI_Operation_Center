@@ -2,9 +2,10 @@
 Pruebas para src/paper_trading/notification_channels.py (Etapa 6.10,
 ampliado en 6.10.1 con idempotencia de entrega por canal, en 6.11 para
 transportar NotificationMessage en vez de InspectionAlert, en 6.12 con
-el canal real de Telegram, y en 6.13 con el canal real de Slack):
-patrón Strategy para la entrega de alertas de inspección. Ver
-docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27/§28.
+el canal real de Telegram, en 6.13 con el canal real de Slack, y en
+6.14 con el canal real de Email SMTP): patrón Strategy para la entrega
+de alertas de inspección. Ver
+docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27/§28/§29.
 """
 
 from datetime import datetime, timezone
@@ -13,12 +14,13 @@ import pytest
 
 from src.paper_trading.alert_delivery_service import AlertDeliveryService
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertType, AlertStatus, InspectionAlert
+from src.paper_trading.email_transport import EmailTransportError
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.notification_channels import (
-    SLACK_MAX_MESSAGE_LENGTH, TELEGRAM_MAX_MESSAGE_LENGTH, CompositeNotificationChannel,
-    EmailNotificationChannel, LoggingNotificationChannel, NullNotificationChannel,
+    EMAIL_MAX_BODY_LENGTH, EMAIL_MAX_SUBJECT_LENGTH, SLACK_MAX_MESSAGE_LENGTH, TELEGRAM_MAX_MESSAGE_LENGTH,
+    CompositeNotificationChannel, EmailNotificationChannel, LoggingNotificationChannel, NullNotificationChannel,
     SlackNotificationChannel, TelegramNotificationChannel, WebhookNotificationChannel,
-    _format_slack_text, _format_telegram_text,
+    _format_email_body, _format_email_subject, _format_slack_text, _format_telegram_text,
 )
 from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, NotificationMessage
 from src.paper_trading.reconciliation_models import IssueSeverity
@@ -165,13 +167,14 @@ class TestNullChannel:
 
 
 class TestPlaceholderChannelsRaiseNotImplemented:
-    """Etapa 6.12 (§27)/6.13 (§28): Telegram/SlackNotificationChannel
-    dejan de ser placeholders -- ya no aparecen en esta lista, tienen
-    sus propias pruebas en TestTelegramNotificationChannel/
-    TestSlackNotificationChannel."""
+    """Etapa 6.12 (§27)/6.13 (§28)/6.14 (§29): Telegram/Slack/
+    EmailNotificationChannel dejan de ser placeholders -- ya no
+    aparecen en esta lista, tienen sus propias pruebas en
+    TestTelegramNotificationChannel/TestSlackNotificationChannel/
+    TestEmailNotificationChannel."""
 
     @pytest.mark.parametrize("channel_class", [
-        EmailNotificationChannel, WebhookNotificationChannel,
+        WebhookNotificationChannel,
     ])
     def test_deliver_raises_not_implemented(self, channel_class):
         channel = channel_class()
@@ -179,7 +182,7 @@ class TestPlaceholderChannelsRaiseNotImplemented:
             channel.deliver(_message())
 
     @pytest.mark.parametrize("channel_class", [
-        EmailNotificationChannel, WebhookNotificationChannel,
+        WebhookNotificationChannel,
     ])
     def test_error_message_is_clear(self, channel_class):
         channel = channel_class()
@@ -271,12 +274,12 @@ class TestCompositeChannelNeverRaises:
         repo = _repo(tmp_path)
         _seed_alert(repo, _alert())
         composite = CompositeNotificationChannel(
-            [EmailNotificationChannel(), NullNotificationChannel(clock=FixedClock(_now()))],
+            [WebhookNotificationChannel(), NullNotificationChannel(clock=FixedClock(_now()))],
             repository=repo, max_attempts=3, clock=FixedClock(_now()),
         )
         result = composite.deliver(_message())  # no debe lanzar NotImplementedError
         assert result.success is False
-        assert "EmailNotificationChannel" in result.error_message
+        assert "WebhookNotificationChannel" in result.error_message
 
 
 class TestPerChannelIdempotency:
@@ -1145,9 +1148,400 @@ class TestSlackEndToEndWithoutInternet:
         assert len(transport.calls) == 1  # Slack no se vuelve a invocar tras el reinicio.
 
 
+class FakeEmailTransport:
+    """Doble de EmailTransport (Etapa 6.14): nunca realiza ninguna
+    conexión SMTP real. Solo recibe `subject`/`body`, igual que el
+    contrato real de `send_message()`."""
+
+    def __init__(self, fail_times: int = 0, error_message: str = "SMTP message delivery failed."):
+        self.calls: list = []
+        self._fail_times = fail_times
+        self._error_message = error_message
+
+    def send_message(self, *, subject, body):
+        self.calls.append(dict(subject=subject, body=body))
+        if len(self.calls) <= self._fail_times:
+            raise EmailTransportError(self._error_message)
+
+
+class TestEmailSubjectFormat:
+    """Etapa 6.14 (§29): _format_email_subject() es pura, determinista,
+    nunca incluye alert_id/metadata, y neutraliza CR/LF/tabs."""
+
+    def test_includes_prefix_and_title(self):
+        message = NotificationMessage(alert_id="a1", title="Titulo", body="Cuerpo", severity=None)
+        subject = _format_email_subject(message)
+        assert subject == "[Crypto AI] Titulo"
+
+    def test_does_not_include_alert_id_or_metadata(self):
+        message = NotificationMessage(
+            alert_id="alert-secreto", title="T", body="B", severity=None,
+            metadata={"run_id": "run-1", "alert_type": "NEW_ISSUE"},
+        )
+        subject = _format_email_subject(message)
+        assert "alert-secreto" not in subject
+        assert "run-1" not in subject
+        assert "alert_type" not in subject
+
+    def test_is_deterministic(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        assert _format_email_subject(message) == _format_email_subject(message)
+
+
+class TestEmailHeaderInjection:
+    """Etapa 6.14 (§29, punto 20): defensa en profundidad contra header
+    injection en el asunto -- CR/LF/tabs se neutralizan aunque el
+    NotificationMessage ya haya pasado por el Template."""
+
+    def test_newline_in_title_neutralized(self):
+        message = NotificationMessage(alert_id="a1", title="Hola\nMundo", body="B", severity=None)
+        subject = _format_email_subject(message)
+        assert "\n" not in subject
+        assert "Hola" in subject and "Mundo" in subject
+
+    def test_carriage_return_in_title_neutralized(self):
+        message = NotificationMessage(alert_id="a1", title="Hola\r\nMundo", body="B", severity=None)
+        subject = _format_email_subject(message)
+        assert "\r" not in subject
+        assert "\n" not in subject
+
+    def test_bcc_header_injection_neutralized(self):
+        message = NotificationMessage(
+            alert_id="a1", title="Alerta\nBcc: victim@evil.com", body="B", severity=None,
+        )
+        subject = _format_email_subject(message)
+        assert "\n" not in subject
+        assert "Bcc:" in subject  # texto literal inofensivo, nunca una cabecera nueva
+
+    def test_cc_header_injection_neutralized(self):
+        message = NotificationMessage(
+            alert_id="a1", title="Alerta\nCc: victim@evil.com", body="B", severity=None,
+        )
+        subject = _format_email_subject(message)
+        assert "\n" not in subject
+
+    def test_tabs_in_title_neutralized(self):
+        message = NotificationMessage(alert_id="a1", title="Hola\tMundo", body="B", severity=None)
+        subject = _format_email_subject(message)
+        assert "\t" not in subject
+
+
+class TestEmailSubjectLength:
+    def test_short_subject_is_not_altered(self):
+        message = NotificationMessage(alert_id="a1", title="Titulo corto", body="B", severity=None)
+        assert _format_email_subject(message) == "[Crypto AI] Titulo corto"
+
+    def test_subject_over_limit_is_truncated(self):
+        message = NotificationMessage(alert_id="a1", title="x" * 300, body="B", severity=None)
+        subject = _format_email_subject(message)
+        assert len(subject) <= EMAIL_MAX_SUBJECT_LENGTH
+        assert subject.endswith("…")
+
+    def test_truncated_subject_never_exceeds_max_length(self):
+        message = NotificationMessage(alert_id="a1", title="y" * 1000, body="B", severity=None)
+        subject = _format_email_subject(message)
+        assert len(subject) == EMAIL_MAX_SUBJECT_LENGTH
+
+
+class TestEmailBodyFormat:
+    def test_includes_title_and_body(self):
+        message = NotificationMessage(alert_id="a1", title="Titulo", body="Cuerpo", severity=None)
+        text = _format_email_body(message)
+        assert "Titulo" in text
+        assert "Cuerpo" in text
+
+    def test_includes_severity_when_present(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        text = _format_email_body(message)
+        assert "Severidad: CRITICAL" in text
+
+    def test_omits_severity_line_when_none(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        text = _format_email_body(message)
+        assert "Severidad" not in text
+
+    def test_does_not_include_metadata_or_alert_id(self):
+        message = NotificationMessage(
+            alert_id="alert-secreto", title="T", body="B", severity=None,
+            metadata={"run_id": "run-1", "alert_type": "NEW_ISSUE"},
+        )
+        text = _format_email_body(message)
+        assert "alert-secreto" not in text
+        assert "run-1" not in text
+
+    def test_is_deterministic(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        assert _format_email_body(message) == _format_email_body(message)
+
+
+class TestEmailFormatterPurity:
+    """Etapa 6.14 (§29): _format_email_subject()/_format_email_body()
+    dependen exclusivamente de `message` y constantes inmutables del
+    módulo -- nunca de clock, entorno, locale, red ni estado global
+    (mismo criterio que Telegram/Slack, §27.x/§28)."""
+
+    def test_subject_signature_does_not_admit_a_clock(self):
+        import inspect
+
+        assert list(inspect.signature(_format_email_subject).parameters) == ["message"]
+
+    def test_body_signature_does_not_admit_a_clock(self):
+        import inspect
+
+        assert list(inspect.signature(_format_email_body).parameters) == ["message"]
+
+    def test_independent_of_environment_variables(self, monkeypatch):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        before_subject = _format_email_subject(message)
+        before_body = _format_email_body(message)
+
+        for var, value in (
+            ("TZ", "America/Argentina/Buenos_Aires"), ("LANG", "es_AR.UTF-8"), ("LC_ALL", "es_AR.UTF-8"),
+            ("EMAIL_SMTP_PASSWORD", "deberia-ser-ignorado"),
+        ):
+            monkeypatch.setenv(var, value)
+
+        assert _format_email_subject(message) == before_subject
+        assert _format_email_body(message) == before_body
+
+    def test_does_not_mutate_the_message(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        before = repr(message)
+        _format_email_subject(message)
+        _format_email_body(message)
+        after = repr(message)
+        assert before == after
+
+    def test_has_no_side_effects_source_inspection(self):
+        import inspect
+
+        source = inspect.getsource(_format_email_subject) + inspect.getsource(_format_email_body)
+        forbidden_identifiers = (
+            "logger.", "logging.", "print(", "open(", "socket.", "smtplib.", "ssl.",
+            "self._repository", "repository.", "os.environ", "os.getenv",
+        )
+        for forbidden in forbidden_identifiers:
+            assert forbidden not in source
+
+
+class TestEmailBodyLength:
+    def test_short_body_is_not_altered(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="cuerpo corto", severity=None)
+        text = _format_email_body(message)
+        assert text == "T\n\ncuerpo corto"
+
+    def test_text_at_exact_limit_is_not_truncated(self):
+        body = "x" * (EMAIL_MAX_BODY_LENGTH - len("T\n\n"))
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_email_body(message)
+        assert len(text) == EMAIL_MAX_BODY_LENGTH
+        assert "truncado" not in text
+
+    def test_text_over_limit_is_truncated_with_mark(self):
+        body = "x" * (EMAIL_MAX_BODY_LENGTH * 2)
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_email_body(message)
+        assert len(text) <= EMAIL_MAX_BODY_LENGTH
+        assert text.endswith("[Mensaje truncado]")
+
+    def test_truncated_text_never_exceeds_max_length(self):
+        body = "y" * (EMAIL_MAX_BODY_LENGTH + 1)
+        message = NotificationMessage(alert_id="a1", title="T", body=body, severity=None)
+        text = _format_email_body(message)
+        assert len(text) == EMAIL_MAX_BODY_LENGTH
+
+
+class TestEmailNotificationChannelConstructor:
+    """Etapa 6.14 (§29): el constructor solo acepta transport/clock."""
+
+    def test_only_accepts_transport_and_clock(self):
+        import inspect
+
+        params = list(inspect.signature(EmailNotificationChannel.__init__).parameters)
+        assert params == ["self", "transport", "clock"]
+
+    def test_host_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(host="smtp.example.com", transport=FakeEmailTransport())
+
+    def test_port_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(port=587, transport=FakeEmailTransport())
+
+    def test_username_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(username="u", transport=FakeEmailTransport())
+
+    def test_password_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(password="p", transport=FakeEmailTransport())
+
+    def test_sender_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(sender="a@example.com", transport=FakeEmailTransport())
+
+    def test_recipient_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(recipient="b@example.com", transport=FakeEmailTransport())
+
+    def test_timeout_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            EmailNotificationChannel(timeout_seconds=5.0, transport=FakeEmailTransport())
+
+    def test_valid_configuration_constructs_successfully(self):
+        assert EmailNotificationChannel(transport=FakeEmailTransport()) is not None
+
+
+class TestEmailChannelHasNoCredentials:
+    def test_channel_has_no_smtp_attributes(self):
+        channel = EmailNotificationChannel(transport=FakeEmailTransport())
+        forbidden_attrs = (
+            "_host", "host", "_port", "port", "_username", "username", "_password", "password",
+            "_sender", "sender", "_recipient", "recipient", "_timeout_seconds", "timeout_seconds", "_config", "config",
+        )
+        for attr in forbidden_attrs:
+            assert not hasattr(channel, attr), f"el canal no debería tener el atributo {attr!r}"
+
+    def test_channel_only_has_transport_and_clock(self):
+        channel = EmailNotificationChannel(transport=FakeEmailTransport())
+        assert set(vars(channel).keys()) == {"_transport", "_clock"}
+
+    def test_repr_does_not_contain_password(self):
+        channel = EmailNotificationChannel(transport=FakeEmailTransport())
+        assert "MY-SUPER-SECRET" not in repr(channel)
+
+    def test_str_does_not_contain_password(self):
+        channel = EmailNotificationChannel(transport=FakeEmailTransport())
+        assert "MY-SUPER-SECRET" not in str(channel)
+
+
+class TestEmailNotificationChannelDelivery:
+    def test_successful_delivery_invokes_transport_once(self):
+        transport = FakeEmailTransport()
+        channel = EmailNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        result = channel.deliver(message)
+        assert result.success is True
+        assert len(transport.calls) == 1
+
+    def test_uses_injected_clock_for_delivered_at(self):
+        fixed = datetime(2030, 8, 8, tzinfo=timezone.utc)
+        channel = EmailNotificationChannel(transport=FakeEmailTransport(), clock=FixedClock(fixed))
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.delivered_at == fixed
+
+    def test_does_not_modify_the_message(self):
+        transport = FakeEmailTransport()
+        channel = EmailNotificationChannel(transport=transport)
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        channel.deliver(message)
+        assert message == NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+
+    def test_transport_receives_subject_and_body(self):
+        transport = FakeEmailTransport()
+        channel = EmailNotificationChannel(transport=transport)
+        channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert set(transport.calls[0].keys()) == {"subject", "body"}
+        assert transport.calls[0]["subject"] == "[Crypto AI] T"
+        assert transport.calls[0]["body"] == "T\n\nB"
+
+    def test_transport_failure_returns_failed_result_without_raising(self):
+        transport = FakeEmailTransport(fail_times=99)
+        channel = EmailNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+
+    def test_result_is_never_terminal(self):
+        transport = FakeEmailTransport(fail_times=99)
+        channel = EmailNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.terminal is False
+
+    def test_transport_failure_message_passes_through_unmodified(self):
+        transport = FakeEmailTransport(fail_times=99, error_message="SMTP authentication failed.")
+        channel = EmailNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.error_message == "SMTP authentication failed."
+
+    def test_deliver_never_retries_internally(self):
+        transport = FakeEmailTransport(fail_times=1)
+        channel = EmailNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+        assert len(transport.calls) == 1
+
+
+class TestEmailChannelIdentity:
+    """Etapa 6.14 (§29, punto 22): la identidad persistente del canal es
+    exactamente type(channel).__name__ == 'EmailNotificationChannel'."""
+
+    def test_persisted_identity_is_the_class_name(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-em", deduplication_key="k-em")
+        _seed_alert(repo, alert)
+        transport = FakeEmailTransport()
+        email_channel = EmailNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        composite = CompositeNotificationChannel([email_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()))
+        composite.deliver(_message(alert_id="alert-em"))
+        state = repo.get_alert_channel_delivery("alert-em", "EmailNotificationChannel")
+        assert state is not None
+        assert state.status == AlertStatus.DELIVERED
+
+
+class TestEmailEndToEndWithoutInternet:
+    """Punto 34: integración interna completa (repositorio real,
+    DefaultInspectionNotificationTemplate real, EmailNotificationChannel
+    con FakeEmailTransport -- nunca SmtpEmailTransport --,
+    CompositeNotificationChannel, AlertDeliveryService)."""
+
+    def test_full_pipeline_delivers_and_never_resends(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+
+        alert = InspectionAlert(
+            id="alert-email-e2e", run_id="run-email-e2e", alert_type=AlertType.NEW_ISSUE, issue_identity=None,
+            issue_code=None, severity=None, title="t", message="Inconsistencia detectada.",
+            deduplication_key="dedup-email-e2e", status=AlertStatus.PENDING, delivery_attempts=0,
+            last_error=None, created_at=_now(),
+        )
+        _seed_alert(repo1, alert)
+
+        transport = FakeEmailTransport()
+        email_channel = EmailNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        composite1 = CompositeNotificationChannel([email_channel], repository=repo1, max_attempts=3, clock=FixedClock(_now()))
+        service1 = AlertDeliveryService(
+            repo1, composite1, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+
+        result = service1.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(transport.calls) == 1
+        assert "Inconsistencia detectada." in transport.calls[0]["body"]
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-email-e2e").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-email-e2e", "EmailNotificationChannel").status == AlertStatus.DELIVERED
+
+        # Segundo procesamiento: no reenvía.
+        service1.deliver_pending_alerts()
+        assert len(transport.calls) == 1
+
+        # "Reinicio": nueva instancia de repositorio + servicios sobre el mismo archivo.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel([email_channel], repository=repo2, max_attempts=3, clock=FixedClock(_now()))
+        service2 = AlertDeliveryService(
+            repo2, composite2, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+        service2.deliver_pending_alerts()
+        assert len(transport.calls) == 1  # Email no se vuelve a invocar tras el reinicio.
+
+
 class TestMultiChannelIntegration:
-    """Punto 29: Logging + Telegram (fake) + Slack (fake) juntos en el
-    mismo CompositeNotificationChannel."""
+    """Punto 29 (6.13)/35 (6.14): Logging + Telegram (fake) + Slack
+    (fake) + Email (fake) juntos en el mismo CompositeNotificationChannel."""
 
     def test_all_three_channels_succeed(self, tmp_path):
         repo = _repo(tmp_path)
@@ -1174,6 +1568,92 @@ class TestMultiChannelIntegration:
             state = repo.get_alert_channel_delivery("alert-multi", channel_name)
             assert state is not None
             assert state.status == AlertStatus.DELIVERED
+
+    def test_all_four_channels_succeed(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-multi4", deduplication_key="dedup-multi4")
+        _seed_alert(repo, alert)
+
+        logging_channel = LoggingNotificationChannel(clock=FixedClock(_now()))
+        telegram_transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(transport=telegram_transport, clock=FixedClock(_now()))
+        slack_transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=slack_transport, clock=FixedClock(_now()))
+        email_transport = FakeEmailTransport()
+        email_channel = EmailNotificationChannel(transport=email_transport, clock=FixedClock(_now()))
+
+        composite = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel, email_channel],
+            repository=repo, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service = AlertDeliveryService(repo, composite, max_attempts=3, clock=FixedClock(_now()))
+        result = service.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 1
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-multi4").status == AlertStatus.DELIVERED
+        for channel_name in (
+            "LoggingNotificationChannel", "TelegramNotificationChannel",
+            "SlackNotificationChannel", "EmailNotificationChannel",
+        ):
+            state = repo.get_alert_channel_delivery("alert-multi4", channel_name)
+            assert state is not None
+            assert state.status == AlertStatus.DELIVERED
+
+    def test_email_fails_others_do_not_repeat_then_email_succeeds(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+        alert = _alert(id="alert-multi-email", deduplication_key="dedup-multi-email")
+        _seed_alert(repo1, alert)
+
+        logging_channel = LoggingNotificationChannel(clock=FixedClock(_now()))
+        telegram_transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(transport=telegram_transport, clock=FixedClock(_now()))
+        slack_transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=slack_transport, clock=FixedClock(_now()))
+        email_transport = FakeEmailTransport(fail_times=1)
+        email_channel = EmailNotificationChannel(transport=email_transport, clock=FixedClock(_now()))
+
+        composite1 = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel, email_channel],
+            repository=repo1, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service1 = AlertDeliveryService(repo1, composite1, max_attempts=3, clock=FixedClock(_now()))
+
+        service1.deliver_pending_alerts()
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 1
+        assert repo1.get_alert_channel_delivery("alert-multi-email", "LoggingNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-email", "TelegramNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-email", "SlackNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-email", "EmailNotificationChannel").status == AlertStatus.PENDING
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-multi-email").status == AlertStatus.PENDING
+
+        service1.deliver_pending_alerts()
+        assert len(telegram_transport.calls) == 1  # no se repiten
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 2  # solo Email se reintenta
+        assert repo1.get_alert_channel_delivery("alert-multi-email", "EmailNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-multi-email").status == AlertStatus.DELIVERED
+
+        # "Reinicio": ningún canal ya DELIVERED se vuelve a invocar; solo pendientes se procesan.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel, email_channel],
+            repository=repo2, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service2 = AlertDeliveryService(repo2, composite2, max_attempts=3, clock=FixedClock(_now()))
+        result2 = service2.deliver_pending_alerts()
+        assert result2.delivered_count == 0
+        assert result2.failed_count == 0
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 2
 
     def test_slack_fails_others_do_not_repeat_then_slack_succeeds(self, tmp_path):
         db_path = str(tmp_path / "test.db")

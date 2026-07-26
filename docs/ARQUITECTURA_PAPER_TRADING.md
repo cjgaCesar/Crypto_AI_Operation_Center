@@ -3504,3 +3504,225 @@ inequívoca y alineada con el formato exigido por la auditoría.
 de menciones, el orden `Logging -> Telegram -> Slack`, la identidad
 persistente (`"SlackNotificationChannel"`), la idempotencia por canal y
 `telegram_transport.py` no cambiaron en esta etapa.
+
+## 29. Canal de notificaciones Email SMTP (Etapa 6.14)
+
+Tercer canal externo real de `inspection_notifications`, construido con
+el mismo patrón ya aprobado para Telegram/Slack (§27/§27.x/§28/§28.x):
+`AlertDeliveryService` sigue sin conocer canales concretos,
+`EmailNotificationChannel` sigue sin conocer `InspectionAlert` ni
+ninguna credencial SMTP, y la idempotencia por canal (§25.2) opera
+igual. Deshabilitado por defecto; no requiere ninguna configuración
+SMTP mientras esté deshabilitado. No se modificó Telegram ni Slack en
+esta etapa.
+
+### 29.1 Flujo completo
+
+```
+InspectionAlert
+  ↓
+DefaultInspectionNotificationTemplate   (§26 -- sin cambios en 6.14)
+  ↓
+NotificationMessage                     (§26.x -- sin cambios en 6.14)
+  ↓
+EmailNotificationChannel                (nuevo en 6.14: adapta el mensaje a subject/body de texto plano)
+  ↓
+EmailTransport (Protocol)                (nuevo en 6.14: abstracción de transporte)
+  ↓
+SmtpEmailTransport                       (nuevo en 6.14: única implementación real)
+  ↓
+Servidor SMTP (STARTTLS o SSL)
+```
+
+Configuración:
+
+```
+Settings
+   ↓
+Composition Root
+   ↓
+SmtpEmailConfig ──→ SmtpEmailTransport
+                          ↓
+NotificationMessage ──→ EmailNotificationChannel
+                          ↓
+              transport.send_message(subject, body)
+```
+
+### 29.2 Responsabilidades por capa
+
+- **Template**: sin cambios (§26).
+- **`EmailNotificationChannel`** (`notification_channels.py`): recibe
+  únicamente `NotificationMessage`. Su única responsabilidad de formato
+  es `_format_email_subject()`/`_format_email_body()` (funciones
+  privadas y puras). No accede al repositorio, no persiste estado, no
+  decide reintentos, y realiza como máximo una sesión SMTP por llamada
+  a `deliver()`. No conoce ni almacena host/puerto/username/password/
+  sender/recipient/security/timeout -- solo `transport`/`clock` (mismo
+  criterio que Telegram/Slack).
+- **`EmailTransport`/`SmtpEmailTransport`** (`email_transport.py`,
+  único módulo que conoce `smtplib`/`ssl`): abre la sesión SMTP
+  (STARTTLS o SSL según configuración), autentica opcionalmente, envía
+  el mensaje y cierra la sesión. Convierte cualquier fallo en
+  `EmailTransportError` con mensaje sanitizado. No conoce el formato
+  del mensaje, no reintenta, no persiste, no lee variables de entorno.
+- **Servidor SMTP**: el servicio externo real -- fuera del alcance del
+  proyecto.
+
+### 29.3 `SmtpEmailConfig`
+
+Value object inmutable con `host`/`port`/`sender`/`recipient`/
+`security`/`username`/`password` (los dos últimos con `field(repr=False)`).
+Validación estructural (nunca por red ni DNS), en orden determinista:
+
+1. **host**: `str` no vacío, sin espacios/esquema/puerto/path/query/
+   fragment/userinfo (rechaza cualquier carácter de
+   `" \t\r\n/?#:@"` -- `"SMTP host must be a bare hostname without
+   scheme, port, path, or credentials."`);
+2. **puerto**: entero (nunca `bool`) entre 1 y 65535 (`"SMTP port must
+   be an integer between 1 and 65535."`);
+3. **security**: exactamente `"starttls"` o `"ssl"` (`"SMTP security
+   must be 'starttls' or 'ssl'."`) -- nunca SMTP sin cifrar, sin
+   fallback silencioso;
+4. **credenciales**: `username`/`password` ambos presentes o ambos
+   ausentes (`"SMTP username and password must both be provided or
+   both be omitted."`); si están presentes, ninguno puede ser vacío o
+   solo espacios;
+5. **sender**/**recipient**: validados con `email.utils.parseaddr` --
+   exactamente una dirección (rechaza listas separadas por comas),
+   nunca `\r`/`\n` (defensa contra header injection), debe tener parte
+   local y dominio no vacíos. Acepta forma simple
+   (`alerts@example.com`) y con nombre de despliegue
+   (`Crypto Alerts <alerts@example.com>`).
+
+Ningún mensaje de validación incluye el host/dirección/credencial
+rechazada.
+
+### 29.4 `SmtpEmailTransport`
+
+`__init__(*, config: SmtpEmailConfig, timeout_seconds: float = 10.0)`
+recibe la configuración una sola vez; conserva `self._config` (un único
+objeto), nunca copias sueltas (`self._host`/`self._password`, etc.).
+Valida el timeout igual que Telegram/Slack
+(`math.isfinite(timeout_seconds) and timeout_seconds > 0`, rechaza
+`bool` explícitamente).
+
+`send_message(*, subject: str, body: str) -> None` construye un
+`email.message.EmailMessage` de texto plano (`set_content(body,
+subtype="plain", charset="utf-8")`, sin HTML/adjuntos/CC/BCC/múltiples
+destinatarios/Reply-To) y ejecuta:
+
+- **STARTTLS** (`smtplib.SMTP`): `ehlo()` -> `starttls(context=ssl.create_default_context())`
+  -> `ehlo()` -> login opcional -> `send_message()`.
+- **SSL** (`smtplib.SMTP_SSL`, con `context=ssl.create_default_context()`):
+  login opcional -> `send_message()` (sin `starttls()`, la conexión ya
+  está cifrada desde el inicio).
+
+Sin reintentos internos: como máximo una sesión SMTP por llamada.
+
+### 29.5 Política de cierre de sesión
+
+Si `send_message()` (la entrega real al servidor) ya tuvo éxito, un
+fallo posterior al cerrar la sesión (`client.quit()`) se descarta en
+silencio, deliberadamente (`_close_quietly()`) -- nunca se reporta como
+fallo ni provoca un segundo envío/duplicación. Esta decisión está
+documentada explícitamente en el código (`email_transport.py`), no es
+un accidente: la conexión se abre manualmente (sin `with`) precisamente
+para poder separar "¿tuvo éxito el envío?" de "¿tuvo éxito el cierre?".
+
+### 29.6 Manejo y sanitización de errores
+
+Distingue: error de conexión/DNS, timeout, fallo de negociación TLS/
+STARTTLS, fallo de autenticación, respuesta SMTP no exitosa, fallo de
+envío, y cualquier excepción inesperada de una capa inferior (catch-all
+defensivo, mismo criterio que Telegram/Slack). Todos se convierten en
+`EmailTransportError` con mensaje sanitizado (ej. `"SMTP connection
+failed."`, `"SMTP authentication failed."`) -- nunca incluye host,
+username, password, sender, recipient, la respuesta SMTP completa ni el
+payload completo.
+
+### 29.7 Formato del asunto y del cuerpo
+
+`_format_email_subject()`: `"[Crypto AI] {message.title}"`, sin
+`alert_id` ni metadata, truncado a `EMAIL_MAX_SUBJECT_LENGTH = 180`
+caracteres (marca `"…"`). `_format_email_body()`: mismo formato que
+Telegram/Slack (`{title}\n\n{body}\n\nSeveridad: {severity}`, severidad
+solo si no es `None`), truncado a `EMAIL_MAX_BODY_LENGTH = 10000`
+caracteres (marca `"\n[Mensaje truncado]"`). Ambas funciones son puras
+y deterministas: no dependen de `Clock`, entorno, locale ni
+configuración.
+
+**Header injection (defensa en profundidad, punto 20)**: aunque
+`NotificationMessage` ya pasó por el Template (no debería traer CR/LF),
+`_format_email_subject()` igual reemplaza `\r`/`\n`/`\t` por espacios y
+colapsa espacios repetidos antes de usar el valor como cabecera SMTP --
+un intento de inyectar `"...\nBcc: victim@..."` en el título nunca crea
+una cabecera `Bcc:` nueva: el salto de línea se neutraliza y el texto
+`"Bcc: victim@..."` queda como contenido literal e inofensivo dentro de
+la misma línea de asunto.
+
+### 29.8 Configuración
+
+Reutiliza el sistema existente, sin crear uno nuevo:
+
+- **Activación**: `paper_trading.inspection_notifications.email`
+  (config.yaml, ya existía desde la Etapa 6.10) -- `false` por
+  defecto. Ningún flag de entorno redundante.
+- **Configuración SMTP**: `EmailSettings`, nueva clase análoga a
+  `TelegramSettings`/`SlackSettings`, leída de `EMAIL_SMTP_HOST`/
+  `EMAIL_SMTP_PORT`/`EMAIL_SMTP_USERNAME`/`EMAIL_SMTP_PASSWORD`/
+  `EMAIL_FROM`/`EMAIL_TO`/`EMAIL_SECURITY`/`EMAIL_TIMEOUT_SECONDS` en
+  `.env` (nunca desde config.yaml). Solo obligatorio (host/sender/
+  recipient/security válidos) cuando
+  `inspection_notifications.email=true`. Igual que `SlackSettings`, no
+  existe un `Settings.email` de nivel superior -- `EmailSettings` vive
+  únicamente dentro de `PaperTradingConfig.email`.
+
+### 29.9 Orden determinista de canales
+
+`_build_notification_channel()` agrega los canales en este orden fijo:
+`LoggingNotificationChannel` -> `TelegramNotificationChannel` ->
+`SlackNotificationChannel` -> `EmailNotificationChannel`. Cambiar este
+orden en el futuro debe documentarse aquí explícitamente.
+
+### 29.10 Identidad persistente e idempotencia
+
+Sin cambios respecto al mecanismo general (§25.2): la identidad del
+canal es `type(channel).__name__ == "EmailNotificationChannel"`. Un
+envío ya `DELIVERED` nunca se reintenta, sobrevive reinicios y
+reconstrucciones de la Composition Root. Verificado también en
+combinación con Logging/Telegram/Slack en el mismo Composite: si Email
+falla mientras los demás tienen éxito, estos últimos no se repiten en
+el siguiente intento; si Email luego tiene éxito, solo Email se
+reintenta.
+
+### 29.11 Seguridad
+
+`username`/`password` nunca aparecen en `repr`/`str` (config, transport,
+channel -- `SmtpEmailConfig` usa `field(repr=False)` en ambos; el canal
+no define `__repr__` propio, así que la representación por defecto de
+Python ya es segura), logs, mensajes de excepción, documentación (esta
+sección no incluye ninguna credencial con formato real), pruebas (usan
+valores claramente ficticios) ni commits. `.env` está ignorado por git;
+`.env.example` solo contiene placeholders vacíos. Ninguna prueba
+automatizada realiza una conexión SMTP real (`smtplib.SMTP`/
+`smtplib.SMTP_SSL` siempre se reemplazan por un doble en las pruebas
+del transporte; el canal siempre recibe un `FakeEmailTransport` en sus
+propias pruebas).
+
+**Limitación real (no una promesa de seguridad)**: igual que Telegram/
+Slack (§27.x), Python no garantiza el borrado físico de un `str` de la
+memoria del proceso -- esta capa reduce la exposición accidental de
+`username`/`password`, no elimina el secreto de memoria.
+
+### 29.12 Explícitamente fuera de alcance
+
+Webhook genérico sigue bloqueado como placeholder (§25.3, sin cambios,
+único placeholder restante); ninguna dependencia nueva
+(`sendgrid`/`mailgun`/`boto3`/`requests`/`httpx`/`aiosmtplib`/`yagmail`
+-- solo `smtplib`/`ssl`/`math`/`dataclasses`/`email.message`/
+`email.utils`/`typing` de la biblioteca estándar); ningún reintento
+interno en transporte/canal; HTML/adjuntos/CC/BCC/múltiples
+destinatarios/Reply-To/prioridad/tracking/imágenes/plantillas externas
+(solo texto plano); división de un email largo en varios envíos; ningún
+envío SMTP real durante la implementación de esta etapa; no se
+modificó Telegram ni Slack.

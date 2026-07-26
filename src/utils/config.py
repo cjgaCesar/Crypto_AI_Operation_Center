@@ -99,6 +99,34 @@ class SlackSettings:
 
 
 @dataclass(frozen=True)
+class EmailSettings:
+    """Configuración SMTP para el canal de Email, leída desde `.env`.
+
+    Todos los campos quedan reservados en `None` (o su default seguro)
+    a menos que se definan las variables `EMAIL_SMTP_*`/`EMAIL_FROM`/
+    `EMAIL_TO`/`EMAIL_SECURITY`/`EMAIL_TIMEOUT_SECONDS` en `.env` --
+    `paper_trading.inspection_notifications.email` (config.yaml) es lo
+    que decide si el canal real de Paper Trading se activa; host/
+    sender/recipient son obligatorios solo cuando ese flag es `true`
+    (validado por `SmtpEmailConfig`, ver
+    src/paper_trading/email_transport.py y
+    docs/ARQUITECTURA_PAPER_TRADING.md §29), nunca por esta clase.
+
+    `username`/`password` usan `field(repr=False)` para reducir su
+    exposición accidental en `repr()`/`str()`, mismo criterio que
+    `TelegramSettings`."""
+
+    host: Optional[str] = None
+    port: int = 587
+    username: Optional[str] = field(default=None, repr=False)
+    password: Optional[str] = field(default=None, repr=False)
+    sender: Optional[str] = None
+    recipient: Optional[str] = None
+    security: str = "starttls"
+    timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class AISettings:
     """SOLO credenciales (secretos) para proveedores de IA reales, leídas
     desde variables de entorno (.env), nunca desde config.yaml.
@@ -384,6 +412,10 @@ class PaperTradingConfig:
     # el canal se activa sigue siendo `inspection_notifications.slack`
     # (config.yaml), no una variable de entorno nueva.
     slack: SlackSettings = field(default_factory=SlackSettings)
+    # Etapa 6.14: mismo criterio -- el flag que decide si el canal se
+    # activa sigue siendo `inspection_notifications.email`
+    # (config.yaml), no una variable de entorno nueva.
+    email: EmailSettings = field(default_factory=EmailSettings)
 
 
 @dataclass(frozen=True)
@@ -728,6 +760,16 @@ def load_settings(
         webhook_url=os.getenv("SLACK_WEBHOOK_URL") or None,
         timeout_seconds=float(os.getenv("SLACK_TIMEOUT_SECONDS", "10")),
     )
+    email_settings = EmailSettings(
+        host=os.getenv("EMAIL_SMTP_HOST") or None,
+        port=int(os.getenv("EMAIL_SMTP_PORT", "587")),
+        username=os.getenv("EMAIL_SMTP_USERNAME") or None,
+        password=os.getenv("EMAIL_SMTP_PASSWORD") or None,
+        sender=os.getenv("EMAIL_FROM") or None,
+        recipient=os.getenv("EMAIL_TO") or None,
+        security=os.getenv("EMAIL_SECURITY", "starttls"),
+        timeout_seconds=float(os.getenv("EMAIL_TIMEOUT_SECONDS", "10")),
+    )
 
     return Settings(
         symbols=config["symbols"],
@@ -834,5 +876,6 @@ def load_settings(
             inspection_notifications=_parse_inspection_notifications_config(config["paper_trading"]),
             telegram=telegram_settings,
             slack=slack_settings,
+            email=email_settings,
         ),
     )
