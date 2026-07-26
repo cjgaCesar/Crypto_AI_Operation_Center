@@ -16,13 +16,11 @@ la misma implementación que `LoggingInspectionAlertSink`/
 `NullInspectionAlertSink` (Etapa 6.9, ver alert_sink.py, que ahora las
 reexporta como alias por compatibilidad hacia atrás).
 
-Los placeholders restantes (`EmailNotificationChannel`,
-`SlackNotificationChannel`, `WebhookNotificationChannel`) NO realizan
-ninguna conexión real: no importan `smtplib`, `requests`, `slack_sdk`
-ni `aiohttp`. Simplemente lanzan `NotImplementedError` con un mensaje
-explícito -- quedan preparados para una etapa posterior (fuera de
-alcance de la 6.10/6.10.1/6.11: SMTP, Slack API, webhooks HTTP reales,
-secretos/tokens/OAuth).
+Desde la Etapa 6.15 (§30) ya no queda ningún placeholder en esta lista:
+`EmailNotificationChannel`/`SlackNotificationChannel`/
+`TelegramNotificationChannel`/`WebhookNotificationChannel` son los
+cuatro canales externos reales (Etapas 6.12-6.15), además de
+`LoggingNotificationChannel`/`NullNotificationChannel`.
 
 Etapa 6.12 (§27): `TelegramNotificationChannel` deja de ser un
 placeholder. Es un canal real que transporta un `NotificationMessage`
@@ -79,10 +77,24 @@ plantilla (tipo correcto y `alert_id` coincidente con la alerta real)
 antes de invocar cualquier canal -- ningún canal de esta lista se
 invoca jamás con un `NotificationMessage` inválido o con un `alert_id`
 que no corresponda a la alerta que se está entregando.
+
+Etapa 6.15 (§30): `WebhookNotificationChannel` deja de ser un
+placeholder -- era el último. Mismo patrón que Telegram/Slack/Email:
+recibe un `WebhookTransport` ya configurado (webhook_transport.py,
+único módulo que conoce `urllib`/`ssl`/el endpoint HTTPS), nunca el
+endpoint ni el secreto de autorización. A diferencia de los otros tres
+canales (que envían texto), Webhook envía un payload JSON estructurado
+-- `_build_webhook_payload()` es la función pura que lo construye a
+partir de un `NotificationMessage`, incluyendo su propia lógica de
+truncado UTF-8-seguro del cuerpo para respetar
+`WEBHOOK_MAX_PAYLOAD_BYTES` (definida en webhook_transport.py, única
+fuente de verdad, importada aquí). Con este canal ya real, no queda
+ningún placeholder dentro de `inspection_notifications`.
 """
 
+import json
 import logging
-from typing import Protocol
+from typing import Optional, Protocol
 
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, InspectionAlertChannelDelivery
 from src.paper_trading.base import PaperTradingRepository
@@ -91,6 +103,7 @@ from src.paper_trading.email_transport import EmailTransport
 from src.paper_trading.runtime import Clock, SystemClock
 from src.paper_trading.slack_transport import SlackTransport
 from src.paper_trading.telegram_transport import TelegramTransport
+from src.paper_trading.webhook_transport import WEBHOOK_MAX_PAYLOAD_BYTES, WebhookTransport, WebhookTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +118,8 @@ EMAIL_MAX_SUBJECT_LENGTH = 180
 _EMAIL_SUBJECT_TRUNCATION_MARK = "…"
 EMAIL_MAX_BODY_LENGTH = 10000
 _EMAIL_BODY_TRUNCATION_MARK = "\n[Mensaje truncado]"
+
+_WEBHOOK_BODY_TRUNCATION_MARK = "\n[Mensaje truncado]"
 
 
 class InspectionNotificationChannel(Protocol):
@@ -380,17 +395,120 @@ class TelegramNotificationChannel:
             return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
 
 
-class WebhookNotificationChannel:
-    """Placeholder: los webhooks HTTP reales quedan fuera de alcance de la Etapa 6.10.
+def _serialize_webhook_payload(payload: dict) -> bytes:
+    """Misma serialización determinista que usa `UrllibWebhookTransport`
+    (webhook_transport.py) para su propio chequeo defensivo de tamaño --
+    única forma de que ambos midan el mismo payload de la misma manera."""
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return serialized.encode("utf-8")
 
-    No importa `requests`/`aiohttp` ni realiza ninguna conexión de red.
-    `deliver()` siempre lanza `NotImplementedError`."""
+
+def _webhook_payload_fits(*, alert_id: str, title: str, severity: Optional[str], body: str) -> bool:
+    candidate = {
+        "version": "1",
+        "event_type": "paper_trading.inspection_alert",
+        "alert": {"id": alert_id, "title": title, "body": body, "severity": severity},
+    }
+    return len(_serialize_webhook_payload(candidate)) <= WEBHOOK_MAX_PAYLOAD_BYTES
+
+
+def _truncate_webhook_body(*, alert_id: str, title: str, severity: Optional[str], body: str) -> str:
+    """Encuentra, por búsqueda binaria sobre la cantidad de caracteres de
+    `body`, el prefijo más largo que -- con `_WEBHOOK_BODY_TRUNCATION_MARK`
+    agregado -- deja el payload completo dentro de
+    `WEBHOOK_MAX_PAYLOAD_BYTES`. Trabaja siempre sobre `str` (nunca
+    bytes a medio carácter): cada candidato se vuelve a serializar por
+    completo, así que el resultado final siempre es JSON UTF-8 válido.
+    Si ni siquiera un cuerpo vacío entra en el límite, devuelve ''
+    (el llamador decide si eso sigue sin entrar y falla de forma
+    controlada)."""
+    low, high = 0, len(body)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = body[:mid]
+        if mid < len(body):
+            candidate = candidate + _WEBHOOK_BODY_TRUNCATION_MARK
+        if _webhook_payload_fits(alert_id=alert_id, title=title, severity=severity, body=candidate):
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _build_webhook_payload(message: NotificationMessage) -> dict:
+    """Adapta un NotificationMessage ya renderizado al payload JSON que el
+    Webhook transporta (§30). Pura y determinista: nunca muta `message`,
+    nunca incluye metadata arbitraria, credenciales, marcas de tiempo
+    nuevas ni datos del repositorio -- solo `alert_id`/`title`/`body`/
+    `severity` (como texto o `None`), bajo las claves fijas `version`
+    (`"1"`) y `event_type` (`"paper_trading.inspection_alert"`).
+
+    Si el payload con el cuerpo completo no entra en
+    `WEBHOOK_MAX_PAYLOAD_BYTES`, trunca únicamente `alert.body` (nunca
+    título/severidad/id) de forma determinista y seguro para UTF-8 (ver
+    `_truncate_webhook_body`), marcando el corte con
+    `_WEBHOOK_BODY_TRUNCATION_MARK`. Si incluso con el cuerpo vacío el
+    payload seguiría sin entrar, lanza `WebhookTransportError` antes de
+    que `UrllibWebhookTransport` intente ninguna conexión real."""
+    severity = message.severity.value if message.severity is not None else None
+    payload = {
+        "version": "1",
+        "event_type": "paper_trading.inspection_alert",
+        "alert": {"id": message.alert_id, "title": message.title, "body": message.body, "severity": severity},
+    }
+    if len(_serialize_webhook_payload(payload)) <= WEBHOOK_MAX_PAYLOAD_BYTES:
+        return payload
+
+    truncated_body = _truncate_webhook_body(
+        alert_id=message.alert_id, title=message.title, severity=severity, body=message.body,
+    )
+    payload["alert"]["body"] = truncated_body
+    if len(_serialize_webhook_payload(payload)) > WEBHOOK_MAX_PAYLOAD_BYTES:
+        raise WebhookTransportError("Webhook payload exceeds the maximum allowed size.")
+    return payload
+
+
+class WebhookNotificationChannel:
+    """Canal real (Etapa 6.15, §30): entrega vía un webhook HTTP genérico,
+    a través de un `WebhookTransport` inyectado y ya configurado
+    (webhook_transport.py) -- mismo patrón que
+    `TelegramNotificationChannel`/`SlackNotificationChannel`/
+    `EmailNotificationChannel` (§27/§28/§29).
+
+    A diferencia de esos tres canales (texto plano), Webhook envía un
+    payload JSON estructurado -- ver `_build_webhook_payload()`. Nunca
+    conoce `InspectionAlert` (solo `NotificationMessage`), nunca accede
+    al repositorio, nunca persiste estado directamente, y nunca decide
+    reintentos globales ni por canal -- eso es responsabilidad
+    exclusiva de `AlertDeliveryService`/`CompositeNotificationChannel`
+    (§25.2). `deliver()` realiza como máximo UNA solicitud HTTP por
+    llamada: no reintenta internamente.
+
+    No conoce ni almacena el endpoint ni el secreto de autorización ni
+    ningún timeout -- esa configuración queda encapsulada
+    exclusivamente en el `transport` ya construido por la Composition
+    Root (ver `WebhookEndpointConfig`/`UrllibWebhookTransport`). Los
+    únicos atributos propios de este canal son `transport`/`clock`.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: WebhookTransport,
+        clock: Clock = SystemClock(),
+    ):
+        self._transport = transport
+        self._clock = clock
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        raise NotImplementedError(
-            "WebhookNotificationChannel todavía no está implementado (los webhooks HTTP reales "
-            "quedan para una etapa posterior)."
-        )
+        try:
+            payload = _build_webhook_payload(message)
+            self._transport.send_payload(payload=payload)
+            return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
+        except Exception as exc:
+            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
 
 
 class CompositeNotificationChannel:

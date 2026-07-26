@@ -184,11 +184,10 @@ paper_trading:
   # qué canales usa AlertDeliveryService para entregar alertas de
   # inspección. logging=true preserva exactamente el comportamiento ya
   # aprobado en la Etapa 6.9. telegram (Etapa 6.12)/slack (Etapa 6.13)/
-  # email (Etapa 6.14) ya son canales reales -- deshabilitados por
-  # defecto, requieren credenciales en .env cuando se habilitan (ver
-  # .env.example). webhook sigue siendo un placeholder (lanza
-  # NotImplementedError si se habilita) -- sin conexión real hasta una
-  # etapa posterior.
+  # email (Etapa 6.14)/webhook (Etapa 6.15) ya son los 4 canales
+  # externos reales -- deshabilitados por defecto, requieren
+  # credenciales/endpoint en .env cuando se habilitan (ver
+  # .env.example). Ya no queda ningún canal placeholder.
   inspection_notifications:
     logging: true
     email: false

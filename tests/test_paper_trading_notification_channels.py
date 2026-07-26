@@ -2,12 +2,14 @@
 Pruebas para src/paper_trading/notification_channels.py (Etapa 6.10,
 ampliado en 6.10.1 con idempotencia de entrega por canal, en 6.11 para
 transportar NotificationMessage en vez de InspectionAlert, en 6.12 con
-el canal real de Telegram, en 6.13 con el canal real de Slack, y en
-6.14 con el canal real de Email SMTP): patrón Strategy para la entrega
-de alertas de inspección. Ver
-docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27/§28/§29.
+el canal real de Telegram, en 6.13 con el canal real de Slack, en 6.14
+con el canal real de Email SMTP, y en 6.15 con el canal real de Webhook
+HTTP genérico): patrón Strategy para la entrega de alertas de
+inspección. Ver
+docs/ARQUITECTURA_PAPER_TRADING.md §24/§25/§26/§27/§28/§29/§30.
 """
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -18,15 +20,17 @@ from src.paper_trading.email_transport import EmailTransportError
 from src.paper_trading.inspection_models import ScheduledInspectionRun
 from src.paper_trading.notification_channels import (
     EMAIL_MAX_BODY_LENGTH, EMAIL_MAX_SUBJECT_LENGTH, SLACK_MAX_MESSAGE_LENGTH, TELEGRAM_MAX_MESSAGE_LENGTH,
+    WEBHOOK_MAX_PAYLOAD_BYTES,
     CompositeNotificationChannel, EmailNotificationChannel, LoggingNotificationChannel, NullNotificationChannel,
     SlackNotificationChannel, TelegramNotificationChannel, WebhookNotificationChannel,
-    _format_email_body, _format_email_subject, _format_slack_text, _format_telegram_text,
+    _build_webhook_payload, _format_email_body, _format_email_subject, _format_slack_text, _format_telegram_text,
 )
 from src.paper_trading.notification_templates import DefaultInspectionNotificationTemplate, NotificationMessage
 from src.paper_trading.reconciliation_models import IssueSeverity
 from src.paper_trading.slack_transport import SlackTransportError
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 from src.paper_trading.telegram_transport import TelegramTransportError
+from src.paper_trading.webhook_transport import WebhookTransportError
 
 
 class FixedClock:
@@ -166,31 +170,6 @@ class TestNullChannel:
         assert result.error_message is None
 
 
-class TestPlaceholderChannelsRaiseNotImplemented:
-    """Etapa 6.12 (§27)/6.13 (§28)/6.14 (§29): Telegram/Slack/
-    EmailNotificationChannel dejan de ser placeholders -- ya no
-    aparecen en esta lista, tienen sus propias pruebas en
-    TestTelegramNotificationChannel/TestSlackNotificationChannel/
-    TestEmailNotificationChannel."""
-
-    @pytest.mark.parametrize("channel_class", [
-        WebhookNotificationChannel,
-    ])
-    def test_deliver_raises_not_implemented(self, channel_class):
-        channel = channel_class()
-        with pytest.raises(NotImplementedError):
-            channel.deliver(_message())
-
-    @pytest.mark.parametrize("channel_class", [
-        WebhookNotificationChannel,
-    ])
-    def test_error_message_is_clear(self, channel_class):
-        channel = channel_class()
-        with pytest.raises(NotImplementedError) as exc_info:
-            channel.deliver(_message())
-        assert "etapa posterior" in str(exc_info.value)
-
-
 class TestCompositeConstructorValidation:
     def test_max_attempts_must_be_positive(self, tmp_path):
         repo = _repo(tmp_path)
@@ -270,16 +249,22 @@ class TestCompositeChannelEmpty:
 
 
 class TestCompositeChannelNeverRaises:
-    def test_placeholder_channel_inside_composite_never_propagates(self, tmp_path):
+    def test_raising_channel_inside_composite_never_propagates(self, tmp_path):
+        """Etapa 6.15 (§30): antes usaba `WebhookNotificationChannel()`
+        sin argumentos como doble de "canal que siempre lanza" (era el
+        último placeholder); ahora que Webhook es un canal real que
+        exige un `transport`, se reemplaza por `RaisingChannel` (ya
+        definida en este archivo), que preserva exactamente el mismo
+        comportamiento que esta prueba necesita."""
         repo = _repo(tmp_path)
         _seed_alert(repo, _alert())
         composite = CompositeNotificationChannel(
-            [WebhookNotificationChannel(), NullNotificationChannel(clock=FixedClock(_now()))],
+            [RaisingChannel("r"), NullNotificationChannel(clock=FixedClock(_now()))],
             repository=repo, max_attempts=3, clock=FixedClock(_now()),
         )
-        result = composite.deliver(_message())  # no debe lanzar NotImplementedError
+        result = composite.deliver(_message())  # no debe lanzar RuntimeError
         assert result.success is False
-        assert "WebhookNotificationChannel" in result.error_message
+        assert "RaisingChannel" in result.error_message
 
 
 class TestPerChannelIdempotency:
@@ -1539,6 +1524,296 @@ class TestEmailEndToEndWithoutInternet:
         assert len(transport.calls) == 1  # Email no se vuelve a invocar tras el reinicio.
 
 
+class FakeWebhookTransport:
+    """Doble de WebhookTransport (Etapa 6.15): nunca realiza ninguna
+    conexión real. Solo recibe `payload`, igual que el contrato real de
+    `send_payload()`."""
+
+    def __init__(self, fail_times: int = 0, error_message: str = "Webhook request failed (HTTP 500)."):
+        self.calls: list = []
+        self._fail_times = fail_times
+        self._error_message = error_message
+
+    def send_payload(self, *, payload):
+        self.calls.append(dict(payload=payload))
+        if len(self.calls) <= self._fail_times:
+            raise WebhookTransportError(self._error_message)
+
+
+class TestWebhookPayload:
+    """Etapa 6.15 (§30): _build_webhook_payload() es puro, determinista,
+    con estructura fija (version/event_type/alert.id/title/body/severity),
+    sin metadata arbitraria ni credenciales."""
+
+    def test_exact_structure(self):
+        message = NotificationMessage(alert_id="a1", title="Titulo", body="Cuerpo", severity=IssueSeverity.CRITICAL)
+        payload = _build_webhook_payload(message)
+        assert payload == {
+            "version": "1",
+            "event_type": "paper_trading.inspection_alert",
+            "alert": {"id": "a1", "title": "Titulo", "body": "Cuerpo", "severity": "CRITICAL"},
+        }
+
+    def test_severity_absent_is_null(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        payload = _build_webhook_payload(message)
+        assert payload["alert"]["severity"] is None
+
+    def test_alert_id_matches_message(self):
+        message = NotificationMessage(alert_id="alert-xyz", title="T", body="B", severity=None)
+        payload = _build_webhook_payload(message)
+        assert payload["alert"]["id"] == "alert-xyz"
+
+    def test_no_arbitrary_metadata(self):
+        message = NotificationMessage(
+            alert_id="a1", title="T", body="B", severity=None,
+            metadata={"run_id": "run-1", "alert_type": "NEW_ISSUE"},
+        )
+        payload = _build_webhook_payload(message)
+        assert "metadata" not in payload
+        assert "run_id" not in json.dumps(payload)
+        assert "alert_type" not in json.dumps(payload)
+
+    def test_no_credentials(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        payload = _build_webhook_payload(message)
+        serialized = json.dumps(payload)
+        for forbidden in ("authorization", "secret", "token", "password"):
+            assert forbidden not in serialized.lower()
+
+    def test_is_deterministic(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        assert _build_webhook_payload(message) == _build_webhook_payload(message)
+
+    def test_does_not_mutate_the_message(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.INFO)
+        before = repr(message)
+        _build_webhook_payload(message)
+        assert repr(message) == before
+
+    def test_independent_of_environment_variables(self, monkeypatch):
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL)
+        before = _build_webhook_payload(message)
+        for var, value in (
+            ("TZ", "America/Argentina/Buenos_Aires"),
+            ("WEBHOOK_ENDPOINT_URL", "https://deberia-ser-ignorado.example.com/x"),
+            ("WEBHOOK_AUTHORIZATION_SECRET", "deberia-ser-ignorado"),
+        ):
+            monkeypatch.setenv(var, value)
+        after = _build_webhook_payload(message)
+        assert before == after
+
+    def test_unicode_body_roundtrips(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="acentuación: áéíóú ñ", severity=None)
+        payload = _build_webhook_payload(message)
+        assert payload["alert"]["body"] == "acentuación: áéíóú ñ"
+
+    def test_empty_body_is_allowed(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="", severity=None)
+        payload = _build_webhook_payload(message)
+        assert payload["alert"]["body"] == ""
+
+    def test_huge_body_is_truncated_within_size_limit(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="x" * 500000, severity=None)
+        payload = _build_webhook_payload(message)
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        assert len(encoded) <= WEBHOOK_MAX_PAYLOAD_BYTES
+        assert payload["alert"]["body"].endswith("[Mensaje truncado]")
+
+    def test_only_body_is_truncated_never_title_or_id(self):
+        message = NotificationMessage(alert_id="alert-preserved", title="Titulo preservado", body="x" * 500000, severity=None)
+        payload = _build_webhook_payload(message)
+        assert payload["alert"]["id"] == "alert-preserved"
+        assert payload["alert"]["title"] == "Titulo preservado"
+
+    def test_short_body_is_never_truncated(self):
+        message = NotificationMessage(alert_id="a1", title="T", body="cuerpo corto", severity=None)
+        payload = _build_webhook_payload(message)
+        assert payload["alert"]["body"] == "cuerpo corto"
+
+    def test_oversized_id_and_title_raise_controlled_error(self):
+        """Si incluso con el cuerpo vacío el payload seguiría sin entrar
+        en el límite (por ejemplo, un alert_id/title desmedido), se
+        lanza WebhookTransportError antes de intentar ninguna conexión."""
+        message = NotificationMessage(alert_id="i" * 100000, title="t" * 100000, body="x", severity=None)
+        with pytest.raises(WebhookTransportError):
+            _build_webhook_payload(message)
+
+
+class TestWebhookNotificationChannelConstructor:
+    """Etapa 6.15 (§30): el constructor solo acepta transport/clock."""
+
+    def test_only_accepts_transport_and_clock(self):
+        import inspect
+
+        params = list(inspect.signature(WebhookNotificationChannel.__init__).parameters)
+        assert params == ["self", "transport", "clock"]
+
+    def test_endpoint_url_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            WebhookNotificationChannel(endpoint_url="https://example.com/hook", transport=FakeWebhookTransport())
+
+    def test_authorization_secret_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            WebhookNotificationChannel(authorization_secret="s", transport=FakeWebhookTransport())
+
+    def test_timeout_keyword_does_not_exist(self):
+        with pytest.raises(TypeError):
+            WebhookNotificationChannel(timeout_seconds=5.0, transport=FakeWebhookTransport())
+
+    def test_valid_configuration_constructs_successfully(self):
+        assert WebhookNotificationChannel(transport=FakeWebhookTransport()) is not None
+
+
+class TestWebhookChannelHasNoCredentials:
+    def test_channel_has_no_endpoint_or_secret_attributes(self):
+        channel = WebhookNotificationChannel(transport=FakeWebhookTransport())
+        forbidden_attrs = (
+            "_endpoint_url", "endpoint_url", "_authorization_secret", "authorization_secret",
+            "_timeout_seconds", "timeout_seconds", "_config", "config",
+        )
+        for attr in forbidden_attrs:
+            assert not hasattr(channel, attr), f"el canal no debería tener el atributo {attr!r}"
+
+    def test_channel_only_has_transport_and_clock(self):
+        channel = WebhookNotificationChannel(transport=FakeWebhookTransport())
+        assert set(vars(channel).keys()) == {"_transport", "_clock"}
+
+    def test_repr_does_not_contain_secret(self):
+        channel = WebhookNotificationChannel(transport=FakeWebhookTransport())
+        assert "MY-SUPER-SECRET" not in repr(channel)
+
+    def test_str_does_not_contain_secret(self):
+        channel = WebhookNotificationChannel(transport=FakeWebhookTransport())
+        assert "MY-SUPER-SECRET" not in str(channel)
+
+
+class TestWebhookNotificationChannelDelivery:
+    def test_successful_delivery_invokes_transport_once(self):
+        transport = FakeWebhookTransport()
+        channel = WebhookNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=None)
+        result = channel.deliver(message)
+        assert result.success is True
+        assert len(transport.calls) == 1
+
+    def test_uses_injected_clock_for_delivered_at(self):
+        fixed = datetime(2030, 9, 9, tzinfo=timezone.utc)
+        channel = WebhookNotificationChannel(transport=FakeWebhookTransport(), clock=FixedClock(fixed))
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.delivered_at == fixed
+
+    def test_does_not_modify_the_message(self):
+        transport = FakeWebhookTransport()
+        channel = WebhookNotificationChannel(transport=transport)
+        message = NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+        channel.deliver(message)
+        assert message == NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.WARNING)
+
+    def test_transport_receives_the_built_payload(self):
+        transport = FakeWebhookTransport()
+        channel = WebhookNotificationChannel(transport=transport)
+        channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=IssueSeverity.CRITICAL))
+        assert list(transport.calls[0].keys()) == ["payload"]
+        assert transport.calls[0]["payload"] == {
+            "version": "1", "event_type": "paper_trading.inspection_alert",
+            "alert": {"id": "a1", "title": "T", "body": "B", "severity": "CRITICAL"},
+        }
+
+    def test_transport_failure_returns_failed_result_without_raising(self):
+        transport = FakeWebhookTransport(fail_times=99)
+        channel = WebhookNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+
+    def test_result_is_never_terminal(self):
+        transport = FakeWebhookTransport(fail_times=99)
+        channel = WebhookNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.terminal is False
+
+    def test_transport_failure_message_passes_through_unmodified(self):
+        transport = FakeWebhookTransport(fail_times=99, error_message="Webhook request failed (HTTP 400).")
+        channel = WebhookNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.error_message == "Webhook request failed (HTTP 400)."
+
+    def test_deliver_never_retries_internally(self):
+        transport = FakeWebhookTransport(fail_times=1)
+        channel = WebhookNotificationChannel(transport=transport)
+        result = channel.deliver(NotificationMessage(alert_id="a1", title="T", body="B", severity=None))
+        assert result.success is False
+        assert len(transport.calls) == 1
+
+
+class TestWebhookChannelIdentity:
+    """Etapa 6.15 (§30, punto 26): la identidad persistente del canal es
+    exactamente type(channel).__name__ == 'WebhookNotificationChannel'."""
+
+    def test_persisted_identity_is_the_class_name(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-wh", deduplication_key="k-wh")
+        _seed_alert(repo, alert)
+        transport = FakeWebhookTransport()
+        webhook_channel = WebhookNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        composite = CompositeNotificationChannel([webhook_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()))
+        composite.deliver(_message(alert_id="alert-wh"))
+        state = repo.get_alert_channel_delivery("alert-wh", "WebhookNotificationChannel")
+        assert state is not None
+        assert state.status == AlertStatus.DELIVERED
+
+
+class TestWebhookEndToEndWithoutInternet:
+    """Etapa 6.15 (§30): integración interna completa (repositorio real,
+    DefaultInspectionNotificationTemplate real, WebhookNotificationChannel
+    con FakeWebhookTransport -- nunca UrllibWebhookTransport --,
+    CompositeNotificationChannel, AlertDeliveryService)."""
+
+    def test_full_pipeline_delivers_and_never_resends(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+
+        alert = InspectionAlert(
+            id="alert-webhook-e2e", run_id="run-webhook-e2e", alert_type=AlertType.NEW_ISSUE, issue_identity=None,
+            issue_code=None, severity=None, title="t", message="Inconsistencia detectada.",
+            deduplication_key="dedup-webhook-e2e", status=AlertStatus.PENDING, delivery_attempts=0,
+            last_error=None, created_at=_now(),
+        )
+        _seed_alert(repo1, alert)
+
+        transport = FakeWebhookTransport()
+        webhook_channel = WebhookNotificationChannel(transport=transport, clock=FixedClock(_now()))
+        composite1 = CompositeNotificationChannel([webhook_channel], repository=repo1, max_attempts=3, clock=FixedClock(_now()))
+        service1 = AlertDeliveryService(
+            repo1, composite1, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+
+        result = service1.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(transport.calls) == 1
+        assert "Inconsistencia detectada." in transport.calls[0]["payload"]["alert"]["body"]
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-webhook-e2e").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-webhook-e2e", "WebhookNotificationChannel").status == AlertStatus.DELIVERED
+
+        # Segundo procesamiento: no reenvía.
+        service1.deliver_pending_alerts()
+        assert len(transport.calls) == 1
+
+        # "Reinicio": nueva instancia de repositorio + servicios sobre el mismo archivo.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel([webhook_channel], repository=repo2, max_attempts=3, clock=FixedClock(_now()))
+        service2 = AlertDeliveryService(
+            repo2, composite2, max_attempts=3, clock=FixedClock(_now()),
+            template=DefaultInspectionNotificationTemplate(),
+        )
+        service2.deliver_pending_alerts()
+        assert len(transport.calls) == 1  # Webhook no se vuelve a invocar tras el reinicio.
+
+
 class TestMultiChannelIntegration:
     """Punto 29 (6.13)/35 (6.14): Logging + Telegram (fake) + Slack
     (fake) + Email (fake) juntos en el mismo CompositeNotificationChannel."""
@@ -1601,6 +1876,101 @@ class TestMultiChannelIntegration:
             state = repo.get_alert_channel_delivery("alert-multi4", channel_name)
             assert state is not None
             assert state.status == AlertStatus.DELIVERED
+
+    def test_all_five_channels_succeed(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-multi5", deduplication_key="dedup-multi5")
+        _seed_alert(repo, alert)
+
+        logging_channel = LoggingNotificationChannel(clock=FixedClock(_now()))
+        telegram_transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(transport=telegram_transport, clock=FixedClock(_now()))
+        slack_transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=slack_transport, clock=FixedClock(_now()))
+        email_transport = FakeEmailTransport()
+        email_channel = EmailNotificationChannel(transport=email_transport, clock=FixedClock(_now()))
+        webhook_transport = FakeWebhookTransport()
+        webhook_channel = WebhookNotificationChannel(transport=webhook_transport, clock=FixedClock(_now()))
+
+        composite = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel, email_channel, webhook_channel],
+            repository=repo, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service = AlertDeliveryService(repo, composite, max_attempts=3, clock=FixedClock(_now()))
+        result = service.deliver_pending_alerts()
+
+        assert result.delivered_count == 1
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 1
+        assert len(webhook_transport.calls) == 1
+        assert repo.get_inspection_alert_by_deduplication_key("dedup-multi5").status == AlertStatus.DELIVERED
+        for channel_name in (
+            "LoggingNotificationChannel", "TelegramNotificationChannel",
+            "SlackNotificationChannel", "EmailNotificationChannel", "WebhookNotificationChannel",
+        ):
+            state = repo.get_alert_channel_delivery("alert-multi5", channel_name)
+            assert state is not None
+            assert state.status == AlertStatus.DELIVERED
+
+    def test_webhook_fails_others_do_not_repeat_then_webhook_succeeds(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        repo1 = SQLitePaperTradingRepository(db_path)
+        repo1.init()
+        alert = _alert(id="alert-multi-webhook", deduplication_key="dedup-multi-webhook")
+        _seed_alert(repo1, alert)
+
+        logging_channel = LoggingNotificationChannel(clock=FixedClock(_now()))
+        telegram_transport = FakeTelegramTransport()
+        telegram_channel = TelegramNotificationChannel(transport=telegram_transport, clock=FixedClock(_now()))
+        slack_transport = FakeSlackTransport()
+        slack_channel = SlackNotificationChannel(transport=slack_transport, clock=FixedClock(_now()))
+        email_transport = FakeEmailTransport()
+        email_channel = EmailNotificationChannel(transport=email_transport, clock=FixedClock(_now()))
+        webhook_transport = FakeWebhookTransport(fail_times=1)
+        webhook_channel = WebhookNotificationChannel(transport=webhook_transport, clock=FixedClock(_now()))
+
+        composite1 = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel, email_channel, webhook_channel],
+            repository=repo1, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service1 = AlertDeliveryService(repo1, composite1, max_attempts=3, clock=FixedClock(_now()))
+
+        service1.deliver_pending_alerts()
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 1
+        assert len(webhook_transport.calls) == 1
+        assert repo1.get_alert_channel_delivery("alert-multi-webhook", "LoggingNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-webhook", "TelegramNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-webhook", "SlackNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-webhook", "EmailNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_alert_channel_delivery("alert-multi-webhook", "WebhookNotificationChannel").status == AlertStatus.PENDING
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-multi-webhook").status == AlertStatus.PENDING
+
+        service1.deliver_pending_alerts()
+        assert len(telegram_transport.calls) == 1  # no se repiten
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 1
+        assert len(webhook_transport.calls) == 2  # solo Webhook se reintenta
+        assert repo1.get_alert_channel_delivery("alert-multi-webhook", "WebhookNotificationChannel").status == AlertStatus.DELIVERED
+        assert repo1.get_inspection_alert_by_deduplication_key("dedup-multi-webhook").status == AlertStatus.DELIVERED
+
+        # "Reinicio": ningún canal ya DELIVERED se vuelve a invocar; solo pendientes se procesan.
+        repo2 = SQLitePaperTradingRepository(db_path)
+        repo2.init()
+        composite2 = CompositeNotificationChannel(
+            [logging_channel, telegram_channel, slack_channel, email_channel, webhook_channel],
+            repository=repo2, max_attempts=3, clock=FixedClock(_now()),
+        )
+        service2 = AlertDeliveryService(repo2, composite2, max_attempts=3, clock=FixedClock(_now()))
+        result2 = service2.deliver_pending_alerts()
+        assert result2.delivered_count == 0
+        assert result2.failed_count == 0
+        assert len(telegram_transport.calls) == 1
+        assert len(slack_transport.calls) == 1
+        assert len(email_transport.calls) == 1
+        assert len(webhook_transport.calls) == 2
 
     def test_email_fails_others_do_not_repeat_then_email_succeeds(self, tmp_path):
         db_path = str(tmp_path / "test.db")

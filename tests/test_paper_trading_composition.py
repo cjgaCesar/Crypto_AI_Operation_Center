@@ -600,18 +600,35 @@ class TestNotificationChannelWiring:
 class TestPlaceholderChannelsBlockedAtStartup:
     """Corrección 3 (Etapa 6.10.1, §25.3): habilitar un canal placeholder
     debe fallar de inmediato al construir la Composition Root, con un
-    mensaje que identifica el canal -- nunca esperar a la primera alerta."""
+    mensaje que identifica el canal -- nunca esperar a la primera alerta.
 
-    def test_webhook_true_fails_to_build_context(self, tmp_path):
-        from src.utils.config import InspectionNotificationsConfig
+    Etapa 6.15 (§30, punto 32): Webhook -- el último placeholder -- ya
+    es un canal real; `_PLACEHOLDER_CHANNEL_NAMES` queda vacío. Ya no
+    queda ningún canal bloqueado por esta validación dentro de
+    `inspection_notifications` (sus propias pruebas de validación de
+    endpoint/secreto/SSRF viven en `TestWebhookChannelWiring`)."""
 
-        config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(webhook=True))
-        with pytest.raises(ValueError) as exc_info:
-            build_paper_trading_context(
-                config=config, clock=FixedClock(_now()),
-                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-            )
-        assert "WebhookNotificationChannel" in str(exc_info.value)
+    def test_placeholder_set_is_now_empty(self):
+        from src.paper_trading.composition import _PLACEHOLDER_CHANNEL_NAMES
+
+        assert _PLACEHOLDER_CHANNEL_NAMES == {}
+
+    def test_webhook_true_no_longer_raises_the_placeholder_error(self, tmp_path):
+        """Habilitar Webhook con una configuración válida ya no dispara
+        NotImplementedError ni el ValueError de placeholder -- construye
+        el contexto con éxito (mismo criterio que Telegram/Slack/Email)."""
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://example.com/hook"),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
 
     def test_logging_true_works(self, tmp_path):
         config = _config(tmp_path)  # default: logging=True, resto False
@@ -820,22 +837,15 @@ class TestTelegramChannelWiring:
             )
         assert "chat" not in str(exc_info.value)  # el chat_id real tampoco se filtra por accidente
 
-    def test_other_placeholders_remain_blocked_at_startup(self, tmp_path):
-        """Etapa 6.12 (§27, punto 20), actualizada en 6.13 (§28, punto 22)
-        y en 6.14 (§29, punto 28): solo Webhook sigue bloqueado como
-        placeholder -- Telegram, Slack y Email ya son canales reales."""
-        from src.utils.config import InspectionNotificationsConfig
+    def test_no_placeholders_remain_at_startup(self, tmp_path):
+        """Etapa 6.12 (§27, punto 20), actualizada en 6.13 (§28, punto 22),
+        6.14 (§29, punto 28) y 6.15 (§30, punto 32): Webhook -- el
+        último placeholder -- ya es un canal real. Ya no queda ningún
+        canal bloqueado por esta validación dentro de
+        `inspection_notifications`."""
+        from src.paper_trading.composition import _PLACEHOLDER_CHANNEL_NAMES
 
-        for flag, class_name in (
-            ("webhook", "WebhookNotificationChannel"),
-        ):
-            config = _config(tmp_path, inspection_notifications=InspectionNotificationsConfig(**{flag: True}))
-            with pytest.raises(ValueError) as exc_info:
-                build_paper_trading_context(
-                    config=config, clock=FixedClock(_now()),
-                    id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
-                )
-            assert class_name in str(exc_info.value)
+        assert _PLACEHOLDER_CHANNEL_NAMES == {}
 
 
 class TestSlackChannelWiring:
@@ -1432,6 +1442,351 @@ class TestEmailChannelWiring:
                 id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
             )
         assert "MY-SECRET-USER" not in str(exc_info.value)
+
+
+class TestWebhookChannelWiring:
+    """Etapa 6.15 (§30): WebhookNotificationChannel deja de ser
+    placeholder -- se construye e inyecta como canal real cuando
+    inspection_notifications.webhook=True y el endpoint es válido."""
+
+    _VALID_ENDPOINT = "https://example.com/hook"
+
+    def test_disabled_by_default_webhook_not_constructed(self, tmp_path):
+        from src.paper_trading.notification_channels import WebhookNotificationChannel
+
+        config = _config(tmp_path)  # default: webhook=False
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert not any(isinstance(c, WebhookNotificationChannel) for c in channels)
+
+    def test_disabled_by_default_does_not_require_endpoint(self, tmp_path):
+        from src.utils.config import WebhookSettings
+
+        config = _config(tmp_path, webhook=WebhookSettings(endpoint_url=None))
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_disabled_preserves_previous_behavior(self, tmp_path):
+        config = _config(tmp_path)
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        from src.paper_trading.notification_channels import LoggingNotificationChannel
+
+        channels = context.alert_delivery_service._channel._channels
+        assert len(channels) == 1
+        assert isinstance(channels[0], LoggingNotificationChannel)
+
+    def test_enabled_and_configured_builds_webhook_channel(self, tmp_path):
+        from src.paper_trading.notification_channels import WebhookNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT, timeout_seconds=7.5),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        webhook_channels = [c for c in channels if isinstance(c, WebhookNotificationChannel)]
+        assert len(webhook_channels) == 1
+
+    def test_channel_does_not_retain_the_endpoint_or_secret(self, tmp_path):
+        from src.paper_trading.notification_channels import WebhookNotificationChannel
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT, authorization_secret="secretvalue789xyz"),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        webhook_channel = next(c for c in channels if isinstance(c, WebhookNotificationChannel))
+        assert set(vars(webhook_channel).keys()) == {"_transport", "_clock"}
+        assert "secretvalue789xyz" not in repr(webhook_channel)
+        assert "secretvalue789xyz" not in repr(webhook_channel._transport)
+        assert self._VALID_ENDPOINT not in repr(webhook_channel._transport)
+
+    def test_transport_receives_the_correct_configuration(self, tmp_path, monkeypatch):
+        """Confirma la configuración correcta sin inspeccionar
+        directamente el atributo sensible en el objeto ya construido:
+        se intercepta la llamada al constructor del transporte (spy)."""
+        import src.paper_trading.composition as composition_module
+        from src.paper_trading.webhook_transport import UrllibWebhookTransport
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        captured = {}
+        real_transport_cls = UrllibWebhookTransport
+
+        def _spy_transport(*, config, timeout_seconds=10.0):
+            captured["endpoint_matches_expected"] = (config.endpoint_url == self._VALID_ENDPOINT)
+            captured["timeout_seconds"] = timeout_seconds
+            return real_transport_cls(config=config, timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(composition_module, "UrllibWebhookTransport", _spy_transport)
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT, timeout_seconds=6.5),
+        )
+        build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert captured["endpoint_matches_expected"] is True
+        assert captured["timeout_seconds"] == 6.5
+
+    def test_channel_order_is_logging_telegram_slack_email_webhook(self, tmp_path):
+        from src.paper_trading.notification_channels import (
+            EmailNotificationChannel, LoggingNotificationChannel, SlackNotificationChannel,
+            TelegramNotificationChannel, WebhookNotificationChannel,
+        )
+        from src.utils.config import (
+            EmailSettings, InspectionNotificationsConfig, SlackSettings, TelegramSettings, WebhookSettings,
+        )
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(
+                logging=True, telegram=True, slack=True, email=True, webhook=True,
+            ),
+            telegram=TelegramSettings(bot_token="tok", chat_id="chat"),
+            slack=SlackSettings(webhook_url="https://hooks.slack.com/services/T000/B000/XXXX"),
+            email=EmailSettings(host="smtp.example.com", sender="a@example.com", recipient="b@example.com"),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        channels = context.alert_delivery_service._channel._channels
+        assert [type(c) for c in channels] == [
+            LoggingNotificationChannel, TelegramNotificationChannel, SlackNotificationChannel,
+            EmailNotificationChannel, WebhookNotificationChannel,
+        ]
+
+    def test_webhook_is_no_longer_a_placeholder(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT),
+        )
+        context = build_paper_trading_context(
+            config=config, clock=FixedClock(_now()),
+            id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+        )
+        assert context is not None
+
+    def test_enabled_without_endpoint_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=None),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "endpoint" in str(exc_info.value).lower()
+
+    def test_enabled_with_http_scheme_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="http://example.com/hook"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "https" in str(exc_info.value).lower()
+
+    def test_enabled_with_localhost_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://localhost/hook"),
+        )
+        with pytest.raises(ValueError):
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+
+    def test_enabled_with_private_ip_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://192.168.1.1/hook"),
+        )
+        with pytest.raises(ValueError):
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+
+    def test_enabled_with_userinfo_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://secretuser123@example.com/hook"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "secretuser123" not in str(exc_info.value)
+
+    def test_enabled_with_query_string_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://example.com/hook?token=leakedsecret"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "leakedsecret" not in str(exc_info.value)
+
+    def test_enabled_with_fragment_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://example.com/hook#secretfragment"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "secretfragment" not in str(exc_info.value)
+
+    def test_enabled_with_non_default_port_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://example.com:8443/hook"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "port" in str(exc_info.value).lower()
+
+    def test_enabled_with_root_path_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://example.com/"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "path" in str(exc_info.value).lower()
+
+    def test_enabled_with_empty_authorization_secret_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT, authorization_secret=""),
+        )
+        with pytest.raises(ValueError):
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+
+    def test_enabled_with_bearer_prefixed_secret_fails_to_build_context(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT, authorization_secret="Bearer abc"),
+        )
+        with pytest.raises(ValueError):
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5, math.nan, math.inf, -math.inf])
+    def test_enabled_with_invalid_timeout_fails_to_build_context(self, tmp_path, bad_timeout):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url=self._VALID_ENDPOINT, timeout_seconds=bad_timeout),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_webhook_error_never_includes_the_endpoint_or_secret(self, tmp_path):
+        from src.utils.config import InspectionNotificationsConfig, WebhookSettings
+
+        config = _config(
+            tmp_path,
+            inspection_notifications=InspectionNotificationsConfig(webhook=True),
+            webhook=WebhookSettings(endpoint_url="https://192.168.99.99/hook", authorization_secret="secretvalue789xyz"),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_paper_trading_context(
+                config=config, clock=FixedClock(_now()),
+                id_generator=DeterministicIdGenerator(), market_price_provider=FakePriceProvider(),
+            )
+        message = str(exc_info.value)
+        assert "192.168.99.99" not in message
+        assert "secretvalue789xyz" not in message
 
 
 class TestNotificationTemplateWiring:

@@ -80,8 +80,19 @@ Etapa 6.14 (§29): mismo patrón para Email. Cuando
 `SmtpEmailConfig` a partir de `config.email` (valida host/puerto/
 seguridad/credenciales consistentes/direcciones), `SmtpEmailTransport`
 ya configurado, y `EmailNotificationChannel` recibiendo únicamente ese
-transporte. Se agrega al final de la lista (orden determinista:
-Logging -> Telegram -> Slack -> Email).
+transporte. Se agrega después de Slack (orden determinista: Logging ->
+Telegram -> Slack -> Email).
+
+Etapa 6.15 (§30): mismo patrón para Webhook -- el último placeholder.
+Cuando `inspection_notifications.webhook` es `true`, esta función
+construye `WebhookEndpointConfig` a partir de `config.webhook` (valida
+HTTPS/host/SSRF/userinfo/query/fragment/puerto/path/secreto de
+autorización), `UrllibWebhookTransport` ya configurado, y
+`WebhookNotificationChannel` recibiendo únicamente ese transporte. Se
+agrega al final de la lista (orden determinista: Logging -> Telegram ->
+Slack -> Email -> Webhook). Con este canal ya real,
+`_PLACEHOLDER_CHANNEL_NAMES` queda vacío: no hay ningún placeholder
+restante dentro de `inspection_notifications`.
 """
 
 import logging
@@ -115,8 +126,10 @@ from src.paper_trading.service import PaperTradingService
 from src.paper_trading.slack_transport import SlackWebhookConfig, UrllibSlackTransport
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 from src.paper_trading.telegram_transport import TelegramCredentials, UrllibTelegramTransport
+from src.paper_trading.webhook_transport import WebhookEndpointConfig, UrllibWebhookTransport
 from src.utils.config import (
     EmailSettings, InspectionNotificationsConfig, PaperTradingConfig, SlackSettings, TelegramSettings,
+    WebhookSettings,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,13 +181,12 @@ def seed_initial_cash_balance(
 
 
 # Nombre de config -> nombre de clase placeholder, para el mensaje de
-# error de _build_notification_channel() (§25.3). Solo queda este canal
-# sin conexión real. `telegram`/`slack` salieron de esta lista en las
-# Etapas 6.12/6.13; `email` sale en la Etapa 6.14 (§29) -- los tres ya
-# son canales reales, no placeholders.
-_PLACEHOLDER_CHANNEL_NAMES = {
-    "webhook": "WebhookNotificationChannel",
-}
+# error de _build_notification_channel() (§25.3). Vacío desde la Etapa
+# 6.15 (§30): `telegram`/`slack`/`email`/`webhook` ya son canales reales,
+# no placeholders. Se conserva la validación (nunca falla si el
+# diccionario está vacío) por si una etapa futura agrega un canal nuevo
+# que empiece, otra vez, como placeholder.
+_PLACEHOLDER_CHANNEL_NAMES: dict[str, str] = {}
 
 
 def _build_notification_channel(
@@ -182,6 +194,7 @@ def _build_notification_channel(
     telegram_settings: TelegramSettings,
     slack_settings: SlackSettings,
     email_settings: EmailSettings,
+    webhook_settings: WebhookSettings,
     repository: PaperTradingRepository,
     max_attempts: int,
     clock: Clock,
@@ -215,8 +228,14 @@ def _build_notification_channel(
     (valida host/puerto/seguridad/credenciales consistentes/
     direcciones), `SmtpEmailTransport` ya configurado, y
     `EmailNotificationChannel` recibiendo únicamente ese transporte.
-    Orden determinista de la lista: Logging -> Telegram -> Slack ->
-    Email."""
+
+    Etapa 6.15 (§30): mismo patrón para Webhook -- si `config.webhook`
+    es `true`, construye `WebhookEndpointConfig` a partir de
+    `webhook_settings` (valida HTTPS/host/SSRF/userinfo/query/fragment/
+    puerto/path/secreto de autorización), `UrllibWebhookTransport` ya
+    configurado, y `WebhookNotificationChannel` recibiendo únicamente
+    ese transporte. Orden determinista de la lista: Logging -> Telegram
+    -> Slack -> Email -> Webhook."""
     enabled_placeholders = [
         class_name for flag, class_name in _PLACEHOLDER_CHANNEL_NAMES.items() if getattr(config, flag)
     ]
@@ -256,6 +275,15 @@ def _build_notification_channel(
             config=smtp_config, timeout_seconds=email_settings.timeout_seconds,
         )
         channels.append(EmailNotificationChannel(transport=email_transport, clock=clock))
+    if config.webhook:
+        webhook_config = WebhookEndpointConfig(
+            endpoint_url=webhook_settings.endpoint_url,
+            authorization_secret=webhook_settings.authorization_secret,
+        )
+        webhook_transport = UrllibWebhookTransport(
+            config=webhook_config, timeout_seconds=webhook_settings.timeout_seconds,
+        )
+        channels.append(WebhookNotificationChannel(transport=webhook_transport, clock=clock))
     return CompositeNotificationChannel(channels, repository=repository, max_attempts=max_attempts, clock=clock)
 
 
@@ -302,8 +330,8 @@ def build_paper_trading_context(
     alert_delivery_service = AlertDeliveryService(
         repository=repository,
         channel=_build_notification_channel(
-            config.inspection_notifications, config.telegram, config.slack, config.email, repository,
-            config.reconciliation_inspection.max_alert_delivery_attempts, clock,
+            config.inspection_notifications, config.telegram, config.slack, config.email, config.webhook,
+            repository, config.reconciliation_inspection.max_alert_delivery_attempts, clock,
         ),
         max_attempts=config.reconciliation_inspection.max_alert_delivery_attempts,
         clock=clock,

@@ -127,6 +127,27 @@ class EmailSettings:
 
 
 @dataclass(frozen=True)
+class WebhookSettings:
+    """Configuración del endpoint de Webhook HTTP genérico, leída desde `.env`.
+
+    `endpoint_url` queda reservado en `None` a menos que se defina
+    `WEBHOOK_ENDPOINT_URL` en `.env` -- `paper_trading.inspection_notifications.webhook`
+    (config.yaml) es lo que decide si el canal real de Paper Trading se
+    activa; el endpoint es obligatorio solo cuando ese flag es `true`
+    (validado por `WebhookEndpointConfig`, ver
+    src/paper_trading/webhook_transport.py y
+    docs/ARQUITECTURA_PAPER_TRADING.md §30), nunca por esta clase.
+
+    `authorization_secret` usa `field(repr=False)` para reducir su
+    exposición accidental en `repr()`/`str()`, mismo criterio que
+    `TelegramSettings`/`EmailSettings`."""
+
+    endpoint_url: Optional[str] = None
+    authorization_secret: Optional[str] = field(default=None, repr=False)
+    timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class AISettings:
     """SOLO credenciales (secretos) para proveedores de IA reales, leídas
     desde variables de entorno (.env), nunca desde config.yaml.
@@ -416,6 +437,10 @@ class PaperTradingConfig:
     # activa sigue siendo `inspection_notifications.email`
     # (config.yaml), no una variable de entorno nueva.
     email: EmailSettings = field(default_factory=EmailSettings)
+    # Etapa 6.15: mismo criterio -- el flag que decide si el canal se
+    # activa sigue siendo `inspection_notifications.webhook`
+    # (config.yaml), no una variable de entorno nueva.
+    webhook: WebhookSettings = field(default_factory=WebhookSettings)
 
 
 @dataclass(frozen=True)
@@ -770,6 +795,11 @@ def load_settings(
         security=os.getenv("EMAIL_SECURITY", "starttls"),
         timeout_seconds=float(os.getenv("EMAIL_TIMEOUT_SECONDS", "10")),
     )
+    webhook_settings = WebhookSettings(
+        endpoint_url=os.getenv("WEBHOOK_ENDPOINT_URL") or None,
+        authorization_secret=os.getenv("WEBHOOK_AUTHORIZATION_SECRET") or None,
+        timeout_seconds=float(os.getenv("WEBHOOK_TIMEOUT_SECONDS", "10")),
+    )
 
     return Settings(
         symbols=config["symbols"],
@@ -877,5 +907,6 @@ def load_settings(
             telegram=telegram_settings,
             slack=slack_settings,
             email=email_settings,
+            webhook=webhook_settings,
         ),
     )

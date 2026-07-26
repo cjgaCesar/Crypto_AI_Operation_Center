@@ -261,15 +261,20 @@ class TestWorksWithCompositeNotificationChannel:
         assert result.delivered_count == 1
         assert repo.fetch_alert_channel_deliveries("alert-1")[0].status == AlertStatus.DELIVERED
 
-    def test_composite_with_a_failing_placeholder_channel_keeps_alert_pending(self, tmp_path):
-        from src.paper_trading.notification_channels import (
-            CompositeNotificationChannel, NullNotificationChannel, WebhookNotificationChannel,
-        )
+    def test_composite_with_a_failing_channel_keeps_alert_pending(self, tmp_path):
+        """Etapa 6.15 (§30): antes usaba `WebhookNotificationChannel()`
+        sin argumentos como doble de "canal que siempre falla" (era el
+        último placeholder); ahora que Webhook es un canal real que
+        exige un `transport`, se reemplaza por `FailingSink` (ya
+        definido en este archivo), que preserva exactamente el mismo
+        comportamiento que esta prueba necesita: un canal que siempre
+        falla de forma controlada (nunca lanza)."""
+        from src.paper_trading.notification_channels import CompositeNotificationChannel, NullNotificationChannel
 
         repo = _repo(tmp_path)
         _seed_alert(repo)
         composite = CompositeNotificationChannel(
-            [NullNotificationChannel(), WebhookNotificationChannel()], repository=repo, max_attempts=3,
+            [NullNotificationChannel(), FailingSink()], repository=repo, max_attempts=3,
         )
         service = AlertDeliveryService(repo, composite, max_attempts=3)
         result = service.deliver_pending_alerts()

@@ -3717,7 +3717,8 @@ memoria del proceso -- esta capa reduce la exposición accidental de
 ### 29.12 Explícitamente fuera de alcance
 
 Webhook genérico sigue bloqueado como placeholder (§25.3, sin cambios,
-único placeholder restante); ninguna dependencia nueva
+único placeholder restante en esta etapa -- implementado como canal
+real en la Etapa 6.15, ver §30); ninguna dependencia nueva
 (`sendgrid`/`mailgun`/`boto3`/`requests`/`httpx`/`aiosmtplib`/`yagmail`
 -- solo `smtplib`/`ssl`/`math`/`dataclasses`/`email.message`/
 `email.utils`/`typing` de la biblioteca estándar); ningún reintento
@@ -3726,3 +3727,331 @@ destinatarios/Reply-To/prioridad/tracking/imágenes/plantillas externas
 (solo texto plano); división de un email largo en varios envíos; ningún
 envío SMTP real durante la implementación de esta etapa; no se
 modificó Telegram ni Slack.
+
+## 30. Canal de notificaciones Webhook HTTP genérico (Etapa 6.15)
+
+Cuarto y último canal externo real de `inspection_notifications`,
+construido con el mismo patrón ya aprobado para Telegram/Slack/Email
+(§27/§27.x/§28/§28.x/§29): `AlertDeliveryService` sigue sin conocer
+canales concretos, `WebhookNotificationChannel` sigue sin conocer
+`InspectionAlert` ni el endpoint/secreto, y la idempotencia por canal
+(§25.2) opera igual. Deshabilitado por defecto; no requiere ninguna
+configuración de endpoint mientras esté deshabilitado. No se modificó
+Telegram/Slack/Email en esta etapa. Con este canal, **ya no queda
+ningún placeholder** dentro de `inspection_notifications` (§25.3):
+`_PLACEHOLDER_CHANNEL_NAMES` en `composition.py` queda vacío.
+
+### 30.1 Flujo completo
+
+```
+InspectionAlert
+  ↓
+DefaultInspectionNotificationTemplate   (§26 -- sin cambios en 6.15)
+  ↓
+NotificationMessage                     (§26.x -- sin cambios en 6.15)
+  ↓
+_build_webhook_payload()                (nuevo en 6.15: adapta el mensaje a un payload JSON)
+  ↓
+WebhookNotificationChannel              (nuevo en 6.15: envía el payload vía el transporte)
+  ↓
+WebhookTransport (Protocol)              (nuevo en 6.15: abstracción de transporte)
+  ↓
+UrllibWebhookTransport                   (nuevo en 6.15: única implementación real)
+  ↓
+Endpoint HTTPS configurado
+```
+
+Configuración:
+
+```
+Settings
+   ↓
+Composition Root
+   ↓
+WebhookEndpointConfig ──→ UrllibWebhookTransport
+                          ↓
+NotificationMessage ──→ WebhookNotificationChannel
+                          ↓
+              transport.send_payload(payload=_build_webhook_payload(message))
+```
+
+### 30.2 Responsabilidades por capa
+
+- **Template**: sin cambios (§26).
+- **`_build_webhook_payload()`** (`notification_channels.py`): función
+  pura `(NotificationMessage) -> dict`. Única responsable de traducir el
+  mensaje al payload JSON (§30.6) y de truncar `alert.body` cuando sea
+  necesario para respetar `WEBHOOK_MAX_PAYLOAD_BYTES` (importado desde
+  `webhook_transport.py`, única fuente de verdad del límite).
+- **`WebhookNotificationChannel`** (`notification_channels.py`): recibe
+  únicamente `NotificationMessage`. No accede al repositorio, no
+  persiste estado, no decide reintentos, y realiza como máximo una
+  solicitud HTTP por llamada a `deliver()`. No conoce ni almacena
+  `endpoint_url`/`authorization_secret`/`timeout_seconds` -- solo
+  `transport`/`clock` (mismo criterio que Telegram/Slack/Email).
+- **`WebhookTransport`/`UrllibWebhookTransport`** (`webhook_transport.py`,
+  único módulo que conoce `urllib`/`ssl`): serializa el payload,
+  construye la solicitud POST, la envía con un contexto TLS seguro, y
+  convierte cualquier fallo en `WebhookTransportError` con mensaje
+  sanitizado. No conoce el contenido semántico del mensaje, no
+  reintenta, no persiste, no lee variables de entorno.
+- **Endpoint HTTPS**: el servicio externo real -- fuera del alcance del
+  proyecto (puede ser cualquier receptor HTTP genérico que el usuario
+  configure).
+
+### 30.3 `WebhookEndpointConfig`
+
+Value object inmutable con `endpoint_url`/`authorization_secret` (ambos
+con `field(repr=False)`). Validación estructural (nunca por red ni
+DNS), en orden determinista:
+
+1. **tipo/no vacío**: `endpoint_url` debe ser un `str` no vacío/no solo
+   espacios (`"Webhook endpoint URL is required when Webhook
+   notifications are enabled."`);
+2. **esquema**: exactamente `https` -- nunca `http`/`ftp`/`file`/
+   `data`/`javascript`/esquema vacío (`"Webhook endpoint URL must use
+   HTTPS."`);
+3. **host**: debe existir (`"Webhook endpoint URL must include a
+   host."`);
+4. **userinfo**: `parsed.username`/`parsed.password` deben estar
+   ausentes (`"Webhook endpoint URL must not include user
+   information."`);
+5. **query string**: debe estar ausente -- decisión explícita de esta
+   etapa, para evitar que un secreto quede incrustado accidentalmente
+   en la URL y reduzca la exposición en registros de infraestructura
+   (`"Webhook endpoint URL must not include a query string."`);
+6. **fragment**: debe estar ausente (`"Webhook endpoint URL must not
+   include a fragment."`);
+7. **puerto**: ausente o exactamente `443` (`try/except ValueError`
+   alrededor de `parsed.port` para sintaxis inválida, ej. `:abc` ->
+   `"Webhook endpoint URL contains an invalid port."`; puerto distinto
+   -> `"Webhook endpoint URL must use the default HTTPS port."`);
+8. **host no local/interno (protección SSRF mínima, §30.4)**: rechaza
+   `localhost`/`*.localhost` (comparación de texto) y, si el host es un
+   literal IP (`ipaddress.ip_address(parsed.hostname)`), rechaza
+   `is_private`/`is_loopback`/`is_link_local`/`is_multicast`/
+   `is_reserved`/`is_unspecified` (`"Webhook endpoint URL must not
+   target a local or internal host."`);
+9. **path**: debe existir, empezar con `/`, no ser solo `/`, y ningún
+   segmento puede ser vacío/`.`/`..` -- ni literalmente ni tras
+   `urllib.parse.unquote()` (para atrapar `%2E`/`%2E%2E`/`%2F`), y
+   ningún segmento decodificado puede contener `/` (slash codificado
+   ambiguo) (`"Webhook endpoint URL must include a valid non-root
+   path."`). No exige una estructura fija (a diferencia de Slack,
+   §28.x): el webhook es genérico;
+10. **secreto de autorización** (si está presente): `str` no vacío/no
+    solo espacios, sin `\r`/`\n`, y sin el prefijo `"Bearer"` (con o sin
+    mayúsculas) -- las tres condiciones comparten el mismo mensaje
+    (`"Webhook authorization secret must be a non-empty value without a
+    Bearer prefix or line breaks."`).
+
+Ningún mensaje de validación incluye la URL/el host/el secreto
+rechazado.
+
+### 30.4 Protección SSRF y sus límites reales
+
+La validación es puramente estructural, sobre el literal de la URL, y
+**nunca realiza resolución DNS** durante la construcción de
+`WebhookEndpointConfig` (ni tampoco una conexión de prueba al iniciar).
+Para un host que es una IP literal en la URL, se rechazan las
+direcciones privadas/loopback/link-local/multicast/reservadas/no
+especificadas (IPv4 e IPv6, usando únicamente `ipaddress` de la
+biblioteca estándar). Para un nombre DNS que no es una IP literal, solo
+se rechazan `localhost`/`*.localhost` por comparación de texto; ningún
+otro nombre se resuelve ni se verifica más allá de eso.
+
+**Limitación real, documentada explícitamente (no una promesa de
+seguridad completa)**: esto significa que un nombre de dominio que hoy
+resuelve a una IP pública podría, en el futuro, resolver a una IP
+privada/interna ("DNS rebinding") sin que esta validación lo detecte --
+la protección cubre IPs literales en la URL y los nombres reservados
+conocidos, no el universo completo de ataques SSRF basados en DNS.
+Deliberadamente no se crea una lista fija de dominios permitidos (a
+diferencia de Slack, que apunta a un servicio conocido, §28.x): este
+webhook es genérico por diseño, el usuario controla completamente el
+destino.
+
+### 30.5 `UrllibWebhookTransport`
+
+`__init__(*, config: WebhookEndpointConfig, timeout_seconds: float =
+10.0)` recibe la configuración una sola vez; conserva `self._config` (un
+único objeto), nunca copias sueltas (`self._endpoint_url`/
+`self._authorization_secret`, etc.). Valida el timeout igual que
+Telegram/Slack/Email (`math.isfinite(timeout_seconds) and
+timeout_seconds > 0`, rechaza `bool` explícitamente).
+
+`send_payload(*, payload: dict) -> None`:
+
+- Serializa el payload de forma determinista (§30.7) y aplica un
+  chequeo defensivo, **estructural**, de tamaño (rechaza si ya excede
+  `WEBHOOK_MAX_PAYLOAD_BYTES` -- sin intentar truncar, ya que el
+  transporte no tiene conocimiento semántico del contenido; el
+  truncado real vive en `_build_webhook_payload()`, §30.6).
+- Construye un `urllib.request.Request` HTTPS con método `POST`,
+  cuerpo JSON UTF-8, y encabezados fijos: `Content-Type: application/
+  json; charset=utf-8`, `Accept: application/json`, `User-Agent:
+  Crypto-AI-Operation-Center/1`, más `Authorization: Bearer <secret>`
+  únicamente cuando `authorization_secret` está presente (nunca
+  encabezados arbitrarios/configurables en esta etapa).
+- Usa un `urllib.request.build_opener()` con dos handlers explícitos:
+  `_NoRedirectHandler` (bloquea toda redirección, §30.6) y
+  `HTTPSHandler(context=ssl.create_default_context())` (TLS seguro,
+  §30.8).
+- Considera éxito cualquier código HTTP 200-299 (sin exigir un cuerpo
+  específico); lee como máximo 4096 bytes de la respuesta, sin
+  persistirla ni incluirla en ningún error.
+- Sin reintentos internos: como máximo una solicitud HTTP por llamada.
+
+### 30.6 Bloqueo de redirecciones
+
+El webhook **nunca sigue redirecciones automáticamente**: podrían
+enviar el secreto de autorización a otro host, eludir la protección
+SSRF (§30.4), o cambiar de HTTPS a otro destino. `_NoRedirectHandler`
+(subclase de `urllib.request.HTTPRedirectHandler`) sobrescribe
+`redirect_request()` para lanzar `urllib.error.HTTPError` con el mismo
+código de estado -- la forma oficialmente documentada de abortar una
+redirección en `urllib`. El manejador de errores del transporte
+distingue estos códigos (`301`/`302`/`303`/`307`/`308`) y produce
+`"Webhook redirects are not allowed."`, sin mencionar `Location` ni
+ningún encabezado -- nunca se construye una segunda solicitud.
+
+### 30.7 Payload JSON
+
+`_build_webhook_payload()` (`notification_channels.py`) es pura y
+determinista: nunca muta `NotificationMessage`, nunca incluye metadata
+arbitraria, credenciales, marcas de tiempo nuevas ni datos del
+repositorio. Estructura fija:
+
+```json
+{
+  "version": "1",
+  "event_type": "paper_trading.inspection_alert",
+  "alert": {
+    "id": "alert_id",
+    "title": "title",
+    "body": "body",
+    "severity": "CRITICAL"
+  }
+}
+```
+
+`severity` es el texto del enum (`IssueSeverity.value`) o `null` cuando
+la alerta no tiene severidad. `version`/`event_type` son constantes
+fijas.
+
+**Tamaño máximo y truncado** (`WEBHOOK_MAX_PAYLOAD_BYTES = 65536`,
+definido en `webhook_transport.py`, única fuente de verdad, importado
+en `notification_channels.py`): el límite aplica al JSON final
+codificado en UTF-8. Si el payload con el cuerpo completo excede el
+límite, se trunca únicamente `alert.body` (nunca `id`/`title`/
+`severity`) mediante búsqueda binaria sobre la cantidad de caracteres,
+agregando la marca `"\n[Mensaje truncado]"` y volviendo a serializar en
+cada intento para garantizar que el resultado final nunca excede el
+límite -- nunca se divide en varias solicitudes. Si incluso con el
+cuerpo vacío el payload seguiría sin entrar (por ejemplo, un
+`alert_id`/`title` desmedido), se lanza `WebhookTransportError("Webhook
+payload exceeds the maximum allowed size.")` antes de intentar
+cualquier conexión real.
+
+### 30.8 Serialización determinista y TLS
+
+`json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+sort_keys=True).encode("utf-8")` -- nunca `default=str`. Un valor no
+serializable se convierte en `WebhookTransportError("Webhook payload
+could not be serialized.")`, sin incluir el valor problemático. TLS
+siempre usa `ssl.create_default_context()` (verificación de hostname y
+de certificado activadas por defecto); nunca
+`ssl._create_unverified_context()`, nunca una opción configurable para
+omitir la verificación.
+
+### 30.9 Manejo y sanitización de errores
+
+`WebhookTransportError` distingue: respuesta HTTP no exitosa (`"Webhook
+request failed (HTTP {code})."`), timeout, error de red/DNS, fallo de
+validación TLS, redirección bloqueada (§30.6), fallo de serialización
+(§30.8), tamaño excedido (§30.7), y cualquier excepción inesperada de
+una capa inferior (catch-all defensivo, mismo criterio que Telegram/
+Slack/Email). Ningún mensaje incluye el endpoint, el secreto de
+autorización, encabezados, el payload completo, ni el cuerpo completo
+de la respuesta.
+
+### 30.10 Configuración
+
+Reutiliza el sistema existente, sin crear uno nuevo:
+
+- **Activación**: `paper_trading.inspection_notifications.webhook`
+  (config.yaml, ya existía desde la Etapa 6.10) -- `false` por
+  defecto. Ningún flag de entorno redundante.
+- **Configuración del endpoint**: `WebhookSettings`, nueva clase análoga
+  a `TelegramSettings`/`SlackSettings`/`EmailSettings`, leída de
+  `WEBHOOK_ENDPOINT_URL`/`WEBHOOK_AUTHORIZATION_SECRET`/
+  `WEBHOOK_TIMEOUT_SECONDS` en `.env` (nunca desde config.yaml). Solo
+  obligatorio (URL válida) cuando
+  `inspection_notifications.webhook=true`. Igual que
+  `SlackSettings`/`EmailSettings`, no existe un `Settings.webhook` de
+  nivel superior -- `WebhookSettings` vive únicamente dentro de
+  `PaperTradingConfig.webhook`.
+
+### 30.11 Orden determinista de canales
+
+`_build_notification_channel()` agrega los canales en este orden fijo:
+`LoggingNotificationChannel` -> `TelegramNotificationChannel` ->
+`SlackNotificationChannel` -> `EmailNotificationChannel` ->
+`WebhookNotificationChannel`. Cambiar este orden en el futuro debe
+documentarse aquí explícitamente.
+
+### 30.12 Identidad persistente e idempotencia
+
+Sin cambios respecto al mecanismo general (§25.2): la identidad del
+canal es `type(channel).__name__ == "WebhookNotificationChannel"`. Un
+envío ya `DELIVERED` nunca se reintenta, sobrevive reinicios y
+reconstrucciones de la Composition Root. Verificado también en
+combinación con Logging/Telegram/Slack/Email en el mismo Composite (los
+5 canales reales): si Webhook falla mientras los demás tienen éxito,
+estos últimos no se repiten en el siguiente intento; si Webhook luego
+tiene éxito, solo Webhook se reintenta.
+
+### 30.13 Eliminación del último placeholder
+
+Con `WebhookNotificationChannel` ya real, `_PLACEHOLDER_CHANNEL_NAMES`
+en `composition.py` queda vacío (`{}`) -- se conserva la validación
+(nunca falla con el diccionario vacío) por si una etapa futura agrega
+un canal nuevo que empiece, otra vez, como placeholder. Habilitar
+Webhook ya no produce `NotImplementedError`; ya no queda ningún canal
+placeholder dentro de `inspection_notifications`.
+
+### 30.14 Seguridad
+
+`endpoint_url`/`authorization_secret` nunca aparecen en `repr`/`str`
+(config, transport, channel -- `WebhookEndpointConfig` usa
+`field(repr=False)` en ambos; ni el transporte ni el canal definen un
+`__repr__`/`__str__` propio que los exponga), logs, mensajes de
+excepción, documentación (esta sección no incluye ninguna URL/secreto
+con formato real), pruebas (usan valores claramente ficticios, ej.
+`https://example.com/hook-path-abc123`/`secretvalue789xyz`) ni commits.
+`.env` está ignorado por git; `.env.example` solo contiene placeholders
+vacíos. Ninguna prueba automatizada realiza una conexión HTTP real
+(`urllib.request.build_opener` siempre se reemplaza por un doble en las
+pruebas del transporte; el canal siempre recibe un
+`FakeWebhookTransport` en sus propias pruebas).
+
+**Limitación real (no una promesa de seguridad)**: igual que Telegram/
+Slack/Email (§27.x/§29.11), Python no garantiza el borrado físico de un
+`str` de la memoria del proceso -- esta capa reduce la exposición
+accidental del endpoint/secreto, no elimina el secreto de memoria. La
+protección SSRF tampoco es completa frente a DNS rebinding (§30.4).
+
+### 30.15 Explícitamente fuera de alcance
+
+Ya no queda ningún placeholder dentro de `inspection_notifications`
+(§25.3); ninguna dependencia nueva (`requests`/`httpx`/`aiohttp`/
+`webhooks`/`fastapi`/`flask` -- solo `json`/`math`/`ssl`/
+`urllib.error`/`urllib.parse`/`urllib.request`/`ipaddress`/
+`dataclasses`/`typing` de la biblioteca estándar); ningún reintento
+interno en transporte/canal; encabezados HTTP arbitrarios/
+configurables; más de una estrategia de autenticación (solo `Bearer`);
+resolución DNS durante la validación del endpoint; conexión de prueba
+al iniciar; lista fija de dominios permitidos (el webhook es genérico);
+división de un payload grande en varias solicitudes; ningún envío HTTP
+real durante la implementación de esta etapa; no se modificó Telegram/
+Slack/Email en esta etapa.

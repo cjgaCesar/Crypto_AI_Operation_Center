@@ -238,6 +238,44 @@ def test_email_settings_password_absent_from_repr(tmp_path):
     assert "super_secreto_de_prueba" not in repr(settings.paper_trading.email)
 
 
+def test_webhook_settings_defaults_when_env_unset(tmp_path, monkeypatch):
+    for var in ("WEBHOOK_ENDPOINT_URL", "WEBHOOK_AUTHORIZATION_SECRET", "WEBHOOK_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
+
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    settings = load_settings(config_path=config_path, env_path=tmp_path / ".env")
+
+    assert settings.paper_trading.webhook.endpoint_url is None
+    assert settings.paper_trading.webhook.authorization_secret is None
+    assert settings.paper_trading.webhook.timeout_seconds == 10.0
+
+
+def test_webhook_settings_reads_all_fields_from_env(tmp_path, monkeypatch):
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "WEBHOOK_ENDPOINT_URL=https://example.com/hook-de-prueba\n"
+        "WEBHOOK_AUTHORIZATION_SECRET=secreto_de_prueba\nWEBHOOK_TIMEOUT_SECONDS=12.5\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert settings.paper_trading.webhook.endpoint_url == "https://example.com/hook-de-prueba"
+    assert settings.paper_trading.webhook.authorization_secret == "secreto_de_prueba"
+    assert settings.paper_trading.webhook.timeout_seconds == 12.5
+
+
+def test_webhook_settings_secret_absent_from_repr(tmp_path):
+    config_path = _write_yaml(tmp_path, _valid_yaml())
+    env_path = tmp_path / ".env"
+    env_path.write_text("WEBHOOK_AUTHORIZATION_SECRET=super_secreto_de_prueba\n", encoding="utf-8")
+
+    settings = load_settings(config_path=config_path, env_path=env_path)
+
+    assert "super_secreto_de_prueba" not in repr(settings.paper_trading.webhook)
+
+
 def test_missing_config_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_settings(config_path=tmp_path / "no_existe.yaml", env_path=tmp_path / ".env")
