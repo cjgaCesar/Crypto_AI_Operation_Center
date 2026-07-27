@@ -526,6 +526,20 @@ SQLite en modo real `mode=ro`, nunca crea la base ni escribe nada. Ver
 antes como después del subcomando (ambas formas son equivalentes):
 `portfolio_cli --database-path db.sqlite --format json summary` y
 `portfolio_cli summary --database-path db.sqlite --format json`.
+**Etapa 6.19**: CLI administrativa `python -m src.paper_trading.order_cli`
+(`accept`/`fill`/`cancel`/`submit`) para operar manualmente órdenes
+simuladas de Paper Trading desde terminal -- expone tal cual los
+cuatro casos de uso ya existentes de `PaperTradingApplication` (Etapas
+6.5/6.7), sin duplicar ninguna regla de negocio. Escribe exclusivamente
+en la base de Paper Trading simulada configurada oficialmente
+(`config/config.yaml` + `.env`, sin `--database-path`); `--confirm` es
+obligatorio para autorizar cualquier escritura (real, aunque siempre
+simulada) -- sin él, no se construye ningún contexto ni se ejecuta
+ninguna operación. Solo MARKET, solo posiciones LONG. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §34](docs/ARQUITECTURA_PAPER_TRADING.md).
+PostgreSQL (`postgres_repository.py`) y el backup/restauración de la
+base SQLite siguen pendientes, como fases futuras independientes -- el
+proyecto no se declara listo para producción ni para Live Trading.
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para

@@ -4737,3 +4737,145 @@ expone ninguna acción administrativa -- para reconciliar/reparar/
 inspeccionar/entregar alertas, seguir usando
 `reconciliation_cli.py`/`inspection_cli.py` (Etapas 6.8/6.9), que esta
 etapa no modifica.
+
+## 34. CLI administrativa de órdenes manuales — Etapa 6.19
+
+### 34.1 Objetivo y decisión arquitectónica
+
+La auditoría previa a esta etapa confirmó que el ciclo de vida completo
+de una orden manual (aceptar/llenar/cancelar/someter de punta a punta)
+ya existía y estaba probado en `PaperTradingApplication` desde las
+Etapas 6.5/6.7 -- pero sin ninguna puerta operativa por terminal ni
+Dashboard: para usarlo, un operador tenía que escribir un script Python
+propio. `python -m src.paper_trading.order_cli` cierra exactamente esa
+brecha, sin agregar ningún caso de uso nuevo: expone tal cual los
+cuatro métodos ya existentes de `PaperTradingApplication`, nunca
+`create`/`place`/`execute`/`close`/`buy`/`sell` como conceptos
+independientes.
+
+### 34.2 Mapeo de subcomandos a `PaperTradingApplication`
+
+| Subcomando | Método delegado |
+|---|---|
+| `accept` | `PaperTradingApplication.accept_manual_market_order()` |
+| `fill` | `PaperTradingApplication.fill_manual_pending_order()` |
+| `cancel` | `PaperTradingApplication.cancel_manual_pending_order()` |
+| `submit` | `PaperTradingApplication.submit_manual_market_order()` |
+
+Ningún cálculo de riesgo, reserva, comisión, PnL o fill vive en esta
+CLI: todo sigue exclusivamente en `RiskEngine`/`ReservationEngine`/
+`FillEngine`/`PositionEngine`/`PnLEngine`, orquestados por
+`PaperTradingService` detrás de `PaperTradingApplication` -- la CLI
+solo traduce argumentos de línea de comandos en la llamada exacta al
+método correspondiente y renderiza el resultado devuelto, sin
+modificarlo.
+
+### 34.3 Aislamiento de capa
+
+`order_cli.py` reutiliza únicamente `build_paper_trading_context()`
+(`composition.py`, sin modificar) y `PaperTradingApplication` -- nunca
+importa directamente `RiskEngine`/`FillEngine`/`PositionEngine`/
+`PnLEngine`/`ReservationEngine`/`SQLitePaperTradingRepository`/
+`sqlite3` (verificado por una prueba `ast`, no búsqueda textual, mismo
+criterio que `TestIsolation` de `portfolio_cli.py`). No abre ninguna
+conexión SQLite propia ni ejecuta SQL: toda persistencia pasa por el
+Composition Root ya aprobado.
+
+### 34.4 Configuración
+
+Opera exclusivamente sobre `config/config.yaml` + `.env` (vía
+`load_settings()`), la misma base que usa el resto del proyecto -- a
+diferencia de `portfolio_cli.py` (solo lectura), esta CLI **no admite
+`--database-path`** ni ningún otro override de configuración: al
+escribir, debe operar siempre sobre la base oficialmente configurada,
+nunca sobre una base temporal elegida por línea de comandos. Las
+pruebas inyectan un `PaperTradingContext` de prueba monkeypencheando
+el helper privado `_build_context()`, igual que
+`reconciliation_cli.py`/`inspection_cli.py`.
+
+`accept`/`submit` (y `fill`, cuando existen otras posiciones abiertas
+en otros símbolos) consultan el mismo `RepositoryMarketPriceProvider`
+que ya usa `src/main.py` (`build_paper_trading()`), sobre una
+instancia propia de `SQLiteMarketDataRepository` -- nunca un precio
+manual ni un `--price` inventado por esta CLI. `fill` conserva la
+política ya aprobada "MARKET se llena al precio reservado durante la
+aceptación" (§21.3): nunca recalcula el precio de la orden que llena.
+
+### 34.5 Confirmación obligatoria
+
+Los cuatro subcomandos escriben o pueden escribir estado de negocio
+(simulado). `--confirm` es obligatorio y se valida **antes** de
+construir cualquier dependencia: sin él, no se llama a
+`load_settings()`, no se construye ningún `PaperTradingContext`, no se
+consulta ningún precio, no se genera ningún id y no se ejecuta ninguna
+operación -- se devuelve directamente el código de confirmación
+requerida (5), con un mensaje claro en `stderr` y `stdout` vacío. Nunca
+usa `input()`: es automatizable, no interactiva.
+
+### 34.6 Formatos y posición de los argumentos globales
+
+`--format table|json` (default `table`) y `--confirm` son argumentos
+globales compartidos entre el parser raíz y los cuatro subparsers, vía
+el mismo patrón de parser padre + `argument_default=argparse.SUPPRESS`
+aprobado en la Etapa 6.18.1: ambos se aceptan tanto antes como después
+del subcomando, sin que el default de un subparser sobrescriba
+silenciosamente un valor ya reconocido por el parser raíz.
+
+### 34.7 Códigos de salida
+
+| Código | Significado |
+|---|---|
+| 0 | Operación completada |
+| 2 | Error de argumentos de argparse |
+| 3 | Configuración inválida |
+| 4 | Paper Trading deshabilitado (`PaperTradingDisabledError`) |
+| 5 | Confirmación requerida (falta `--confirm`) |
+| 6 | Orden rechazada por riesgo (`approved=false`, solo `accept`/`submit`) |
+| 7 | Estado de orden inválido o entidad inexistente |
+| 8 | Error operativo controlado |
+| 9 | Error inesperado, sanitizado |
+
+`fill_manual_pending_order()` es el único caso de uso que levanta un
+`ValueError` genérico (no `InvalidOrderStateError`) cuando la orden no
+existe -- no existe un `OrderNotFoundError` en `exceptions.py` que
+capturar. `order_cli.py` reclasifica ese caso específico al código 7
+(misma categoría que un estado inválido) releyendo el pedido ya
+inyectado por el Composition Root, nunca con SQL propio ni
+inspeccionando el texto del mensaje.
+
+### 34.8 Riesgo
+
+Un rechazo de `RiskEngine` (`approved=false`) nunca se trata como una
+excepción: `accept`/`submit` muestran `approved: false`, el código y
+mensaje reales de `RiskValidationResult`, y devuelven el código 6 --
+sin afirmar que la orden fue creada (el `order_id` generado nunca se
+persiste) y sin dejar ninguna reserva parcial.
+
+### 34.9 Atomicidad
+
+La CLI no persiste nada por su cuenta: reutiliza íntegramente las
+garantías transaccionales ya existentes de
+`PaperTradingService`/`SQLitePaperTradingRepository` (Etapas 6.3/6.7).
+Un rechazo de riesgo o un error de estado inválido no dejan ningún
+registro parcial -- confirmado con pruebas de integración que comparan
+el estado del repositorio antes/después de cada escenario de rechazo.
+
+### 34.10 Seguridad
+
+Nunca imprime configuración completa, ruta absoluta de la base, SQL,
+credenciales, variables de entorno ni el `repr()` del contexto. Los
+errores inesperados se sanitizan a un mensaje genérico ("Order
+operation failed unexpectedly."), sin `str(exc)` ni traceback. No
+acepta secretos por argumentos, no envía notificaciones externas y no
+se conecta a ningún exchange real: todo sigue siendo Paper Trading
+simulado.
+
+### 34.11 Limitaciones
+
+Solo `OrderType.MARKET`, solo posiciones `LONG` (una `SELL` reduce o
+cierra una posición `LONG` existente; nunca abre ni aumenta un
+`SHORT`). Sin PostgreSQL, sin backup/restauración -- ambos permanecen
+fuera de esta etapa. No expone ningún subcomando `init`: la
+inicialización (creación de tablas, siembra del capital inicial) sigue
+siendo responsabilidad exclusiva de `build_paper_trading_context()`,
+igual que en `reconciliation_cli.py`/`inspection_cli.py`.
