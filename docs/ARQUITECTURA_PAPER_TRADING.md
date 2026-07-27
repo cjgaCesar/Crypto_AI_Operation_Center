@@ -3134,7 +3134,9 @@ doble en las pruebas del transporte; el canal siempre recibe un
 ### 27.12 Explícitamente fuera de alcance
 
 Slack/Email/Webhooks siguen bloqueados como placeholders (§25.3, sin
-cambios); ninguna dependencia nueva (`requests`/`httpx`/`aiohttp`/
+cambios en esta etapa -- implementados como canales reales en las
+Etapas 6.13/6.14/6.15, ver §28/§29/§30); ninguna dependencia nueva
+(`requests`/`httpx`/`aiohttp`/
 `telegram`/`python-telegram-bot`/`telebot` -- solo `urllib`/`json` de
 la biblioteca estándar); ningún reintento interno en transporte/canal;
 ninguna división de mensajes largos en múltiples envíos; ningún envío
@@ -3424,7 +3426,9 @@ en sus propias pruebas).
 ### 28.12 Explícitamente fuera de alcance
 
 Email/Webhook genérico siguen bloqueados como placeholders (§25.3, sin
-cambios); ninguna dependencia nueva (`requests`/`httpx`/`aiohttp`/
+cambios en esta etapa -- implementados como canales reales en las
+Etapas 6.14/6.15, ver §29/§30); ninguna dependencia nueva
+(`requests`/`httpx`/`aiohttp`/
 `slack_sdk`/`slack-bolt` -- solo `urllib`/`json`/`math`/`dataclasses`/
 `typing` de la biblioteca estándar); ningún reintento interno en
 transporte/canal; ninguna división de mensajes largos en múltiples
@@ -4055,3 +4059,226 @@ al iniciar; lista fija de dominios permitidos (el webhook es genérico);
 división de un payload grande en varias solicitudes; ningún envío HTTP
 real durante la implementación de esta etapa; no se modificó Telegram/
 Slack/Email en esta etapa.
+
+## 31. Cierre operativo del sistema multicanal (Etapa 6.16)
+
+Etapa de auditoría y endurecimiento transversal, sin agregar ningún
+canal nuevo (Logging/Telegram/Slack/Email/Webhook siguen siendo los
+cinco únicos, Etapas 6.10-6.15) ni modificar reglas de negocio de Paper
+Trading, Dashboard ni Trading Engine. Objetivo: confirmar que los cinco
+canales funcionan como un único sistema coherente y cerrar los
+pequeños huecos de consistencia que solo se hacen visibles al auditar
+los cinco a la vez.
+
+### 31.1 Inventario de canales
+
+| Canal | Transporte | Secreto | Formato |
+|---|---|---|---|
+| Logging | interno (`logging` stdlib) | no | texto/log |
+| Telegram | `urllib` (`UrllibTelegramTransport`) | bot token/chat ID | texto |
+| Slack | `urllib` (`UrllibSlackTransport`) | Incoming Webhook | texto |
+| Email | `smtplib` (`SmtpEmailTransport`) | usuario/password | subject/body |
+| Webhook | `urllib` (`UrllibWebhookTransport`) | endpoint/Bearer | JSON v1 |
+
+Ningún valor real de secreto/endpoint aparece en esta tabla ni en
+ningún otro lugar del código/documentación/pruebas.
+
+### 31.2 Orden determinista
+
+`_build_notification_channel()` (`composition.py`) agrega los canales
+habilitados, siempre en este orden fijo -- nunca depende de la
+iteración de un diccionario: `LoggingNotificationChannel` ->
+`TelegramNotificationChannel` -> `SlackNotificationChannel` ->
+`EmailNotificationChannel` -> `WebhookNotificationChannel`.
+Deshabilitar cualquier subconjunto de canales nunca altera el orden
+relativo de los que quedan habilitados (verificado con pruebas
+parametrizadas sobre todas las combinaciones relevantes, ver
+`tests/test_paper_trading_notification_contracts.py`,
+`TestCompositionOrderContract`).
+
+### 31.3 Contrato común
+
+Los siete tipos (`LoggingNotificationChannel`,
+`TelegramNotificationChannel`, `SlackNotificationChannel`,
+`EmailNotificationChannel`, `WebhookNotificationChannel`,
+`NullNotificationChannel`, `CompositeNotificationChannel`) implementan
+exactamente `deliver(self, message: NotificationMessage) ->
+AlertDeliveryResult`. Todos:
+
+- reciben únicamente `NotificationMessage`, nunca `InspectionAlert`;
+- usan el `Clock` inyectado para `delivered_at` (nunca `datetime.now()`
+  directo);
+- nunca propagan una excepción de su propia lógica interna (formato,
+  logging) ni de su transporte -- `deliver()` **siempre** devuelve un
+  `AlertDeliveryResult`, nunca lanza;
+- no reintentan internamente (como máximo una solicitud/sesión/llamada
+  por invocación de `deliver()`);
+- no persisten directamente (la persistencia por canal es
+  responsabilidad exclusiva de `CompositeNotificationChannel`);
+- no modifican el `NotificationMessage` recibido;
+- no conocen el repositorio (excepto `CompositeNotificationChannel`,
+  que sí lo recibe para su idempotencia por canal, §25.2).
+
+**Hallazgo real corregido en esta etapa** (no un cambio cosmético): en
+`TelegramNotificationChannel`/`SlackNotificationChannel`/
+`EmailNotificationChannel`, la construcción del texto/asunto
+(`_format_telegram_text`/`_format_slack_text`/`_format_email_subject`/
+`_format_email_body`) se invocaba ANTES del `try/except` de
+`deliver()`. Como estos formatters son puros y nunca fallan con un
+`NotificationMessage` válido, el defecto nunca se manifestó en
+producción -- pero violaba en la práctica el contrato documentado
+("nunca lanza"), a diferencia de `WebhookNotificationChannel`, que ya
+construía su payload dentro del `try/except` desde la Etapa 6.15. Se
+corrigió moviendo la construcción del contenido dentro del
+`try/except` en los tres canales, sin cambiar ninguna firma pública.
+Confirmado con una prueba que inyecta un formatter que lanza
+artificialmente (`unittest.mock.patch`) y verifica que `deliver()` ya
+no propaga.
+
+### 31.4 Configuración: habilitado/deshabilitado
+
+Deshabilitado (default para los 4 canales externos): no se construye
+ninguna credencial/config/transporte, no se valida ningún secreto ni
+endpoint, no se abre ninguna conexión, no se requiere ninguna variable
+de entorno. Habilitado: se valida en el arranque (antes del primer
+envío) -- Telegram (bot token/chat ID/timeout), Slack (webhook/timeout),
+Email (host/puerto/sender/recipient/security/credenciales
+consistentes/timeout), Webhook (endpoint/secreto de autorización
+opcional/timeout) -- con errores sanitizados que identifican la
+categoría inválida, nunca el valor rechazado, y sin realizar ninguna
+conexión real durante la validación.
+
+Auditado explícitamente: `None`/`""`/`"   "` se tratan de forma
+coherente en los cuatro canales -- ninguno convierte silenciosamente un
+secreto en blanco a `None` cuando el canal está habilitado; los tres
+casos se rechazan igual (`.strip()` vacío).
+
+### 31.5 Sanitización
+
+`_truncate_delivery_error()`/`MAX_DELIVERY_ERROR_LENGTH = 500`
+(`notification_channels.py`, Etapa 6.16): utilidad compartida, aplicada
+en los 5 `deliver()`, en `CompositeNotificationChannel` (excepción
+directa de un canal, y el mensaje agregado final) y en
+`AlertDeliveryService` (excepción directa de template/canal) -- acota
+de forma determinista cualquier `error_message` antes de devolverlo,
+persistirlo o registrarlo en logs, con una marca de corte (`"…"`).
+**No sanitiza contenido**: eso sigue siendo responsabilidad exclusiva
+de cada `*TransportError` (mensajes estáticos por categoría, nunca
+`str(exc)` de una excepción de una capa inferior sin pasar antes por
+esa conversión). No se centralizó la categorización de errores
+específicos de cada transporte (HTTP/timeout/TLS/etc.): permanece en
+cada transporte, donde tiene más contexto y claridad.
+
+Representación segura confirmada en los cuatro canales externos:
+`bot_token`/webhook completo (Slack)/`username`/`password`/`endpoint_url`/
+`authorization_secret` nunca aparecen en `repr`/`str` de config,
+transporte ni canal. `chat_id` (Telegram) y las direcciones
+`sender`/`recipient` (Email) se consideran identificadores de destino,
+no secretos -- decisión de diseño ya vigente desde las Etapas
+6.12/6.14, confirmada (no cambiada) en esta auditoría.
+
+Logs (`grep -RInE "logger\.|logging\.|print\(" src/paper_trading`):
+ninguna línea imprime config/credenciales/token/password/webhook/
+endpoint/headers/payload/direcciones SMTP. El único logging del
+subsistema (`LoggingNotificationChannel.deliver()` y el `logger.warning()`
+de `CompositeNotificationChannel` ante un fallo por canal) solo incluye
+`message.title`/`message.body` (contenido humano, no credenciales) o
+nombre del canal/alert_id/número de intento/categoría de error ya
+sanitizada -- nunca se agregó logging nuevo.
+
+### 31.6 Reintentos e idempotencia
+
+Sin reintentos internos en ningún transporte (Telegram: una solicitud;
+Slack: una solicitud; Email: una sesión SMTP; Webhook: una solicitud) ni
+en ningún canal -- confirmado con pruebas contractuales parametrizadas
+(`TestNoInternalRetriesContract`). Los reintentos siguen siendo
+exclusivos de `AlertDeliveryService`/`CompositeNotificationChannel`/la
+persistencia por canal (`InspectionAlertChannelDelivery`, identidad
+`alert_id` + `type(channel).__name__`).
+
+`max_attempts` se cuenta de forma independiente **por canal**, nunca
+de forma global compartida: un canal exitoso no consume intentos
+futuros; canales distintos pueden estar en estados distintos
+simultáneamente (uno `DELIVERED`, otro `PENDING`, otro `FAILED`) con el
+mismo `max_attempts` configurado; el contador nunca se reinicia al
+reconstruir la Composition Root (persiste en SQLite). Verificado con
+una matriz completa de reintentos escalonados sobre los 5 canales
+(`TestFullIdempotencyAndRetryMatrix`): Logging/Telegram/Slack exitosos
+de inmediato, Email falla 2 rondas y luego tiene éxito, Webhook falla 3
+rondas y luego tiene éxito -- cada canal ya `DELIVERED` deja de
+invocarse en las rondas siguientes, el estado global de la alerta pasa
+a `DELIVERED` solo cuando los 5 lo están, y un "reinicio" (nueva
+instancia de repositorio sobre el mismo archivo) no vuelve a invocar
+ningún canal ya resuelto.
+
+También verificado el escenario de fallo simultáneo de los 4 canales
+externos (`TestAllExternalChannelsFailSimultaneously`): Logging queda
+`DELIVERED`, los otros 4 quedan `PENDING` con su propio mensaje de
+error independiente (uno nunca sobrescribe a otro), la alerta global
+queda `PENDING`, y cada canal se reintenta individualmente en la
+siguiente ronda.
+
+### 31.7 Observabilidad operativa
+
+Sin tablas ni métricas nuevas: la API existente del repositorio ya
+permite responder qué alerta falló
+(`get_inspection_alert_by_deduplication_key`), qué canal falló y con
+qué error/cuántos intentos/cuándo se entregó
+(`fetch_alert_channel_deliveries`/`get_alert_channel_delivery`), y el
+estado global de la alerta. Confirmado con una prueba de lectura
+directa contra la API existente (`TestObservabilityQueries`).
+
+### 31.8 Persistencia
+
+Sin migraciones, sin cambios de nombre de tabla/columna, sin cambios de
+estados persistidos (`AlertStatus`) ni de la clave de identidad por
+canal (`alert_id` + `type(channel).__name__`). Una base creada en
+cualquier etapa anterior (6.9 en adelante) sigue siendo legible sin
+cambios.
+
+### 31.9 Entrega secuencial
+
+La entrega multicanal es secuencial y determinista: `CompositeNotificationChannel`
+itera `self._channels` en un `for` simple, invocando `channel.deliver()`
+uno a la vez, en el mismo orden de la lista, sin ningún mecanismo de
+concurrencia. Esta etapa no introduce `threading`/`asyncio`/
+`multiprocessing`/`concurrent.futures` -- confirmado estructuralmente
+(`TestSequentialDeliveryDocumented`). Motivo, documentado
+explícitamente: preservar el orden, la trazabilidad y la idempotencia
+sencilla, evitando duplicados que una ejecución concurrente podría
+introducir.
+
+### 31.10 Ausencia de placeholders y de nuevos canales
+
+Confirmado: `_PLACEHOLDER_CHANNEL_NAMES` (`composition.py`) está vacío
+desde la Etapa 6.15; ningún canal nuevo se agregó en la Etapa 6.16;
+ningún comentario desactualizado describe un canal ya implementado
+como placeholder (auditado y corregido puntualmente en
+`alert_sink.py`/`src/utils/config.py`, sin reescribir documentación
+histórica que describe correctamente etapas anteriores).
+
+### 31.11 Pruebas contractuales
+
+`tests/test_paper_trading_notification_contracts.py` (nuevo, Etapa
+6.16): pruebas transversales que no duplican las suites específicas
+por canal/transporte. Cubre: firma de `deliver()`, uso del `Clock`
+inyectado, forma de `AlertDeliveryResult` (éxito y fallo transitorio,
+siempre `terminal=False` para fallos no terminales), no-mutación del
+mensaje, ausencia de reintentos internos, representación segura
+(config/transporte/canal), orden de composición, identidad
+persistente, configuración deshabilitada, límite de longitud de error,
+sanitización ante excepciones inesperadas con contenido sensible y muy
+largo, consistencia del mismo `NotificationMessage` a través de los 5
+formatters/payload, observabilidad, conteo de intentos independiente
+por canal, fallo simultáneo de los 4 canales externos, y la matriz
+completa de idempotencia/reintentos de la sección 31.6.
+
+### 31.12 Limitaciones (sin cambios de política)
+
+No se implementó: colas, workers, `asyncio`, circuit breakers, rate
+limiting, fallback automático entre canales, métricas Prometheus,
+tracing distribuido, ni ninguna concurrencia -- explícitamente fuera de
+alcance de esta etapa. La protección SSRF de Webhook (§30.4) y las
+demás limitaciones de seguridad ya documentadas en §27-§30 siguen
+vigentes sin cambios: esta etapa endurece consistencia/observabilidad/
+sanitización transversal, no agrega nuevas capacidades de red.

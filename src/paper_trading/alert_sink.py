@@ -4,11 +4,13 @@ InspectionAlertSink -- abstracción de entrega de alertas (Etapa 6.9).
 Ver docs/ARQUITECTURA_PAPER_TRADING.md §23.9. Desde la Etapa 6.10
 (§24.8), la implementación canónica de estos canales vive en
 `notification_channels.py` (patrón Strategy, con
-`CompositeNotificationChannel` y placeholders de Email/Slack/Telegram/
-Webhook); este módulo se conserva íntegro, con `LoggingInspectionAlertSink`/
-`NullInspectionAlertSink` como alias directos de
-`LoggingNotificationChannel`/`NullNotificationChannel`, para que ningún
-import ni prueba existente de la Etapa 6.9 se rompa.
+`CompositeNotificationChannel`, Logging/Null y los cuatro canales
+externos reales -- Telegram/Slack/Email/Webhook, Etapas 6.12-6.15,
+ninguno placeholder desde la Etapa 6.15); este módulo se conserva
+íntegro, con `LoggingInspectionAlertSink`/`NullInspectionAlertSink`
+como alias directos de `LoggingNotificationChannel`/
+`NullNotificationChannel`, para que ningún import ni prueba existente
+de la Etapa 6.9 se rompa.
 """
 
 from typing import Protocol

@@ -38,13 +38,21 @@ cuyo `alert_id` no coincida exactamente con `alert.id`, se tratan
 exactamente igual que un fallo de canal: nunca se propagan, nunca se
 invoca ningún canal con ese mensaje, `delivery_attempts` se incrementa
 y `last_error` queda con un mensaje que identifica la causa.
+
+Etapa 6.16 (§31/§32, auditoría transversal): el `error_message`
+sintético que se construye cuando `template.render()`/`channel.deliver()`
+lanzan directamente ahora pasa por `_truncate_delivery_error()`
+(`notification_channels.py`, `MAX_DELIVERY_ERROR_LENGTH = 500`) antes
+de convertirse en `AlertDeliveryResult` -- mismo límite que ya se
+aplica dentro de cada canal y de `CompositeNotificationChannel`, para
+que ningún `last_error` persistido pueda crecer sin límite.
 """
 
 from typing import NamedTuple, Optional
 
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus
 from src.paper_trading.base import PaperTradingRepository
-from src.paper_trading.notification_channels import InspectionNotificationChannel
+from src.paper_trading.notification_channels import InspectionNotificationChannel, _truncate_delivery_error
 from src.paper_trading.notification_templates import (
     DefaultInspectionNotificationTemplate, InspectionNotificationTemplate, NotificationMessage,
 )
@@ -103,7 +111,8 @@ class AlertDeliveryService:
                 # fallo de entrega, con su propio registro y conteo de
                 # intentos; en ningún caso se llega a invocar el canal.
                 result = AlertDeliveryResult(
-                    success=False, error_message=str(exc), delivered_at=self._clock.now(), terminal=False,
+                    success=False, error_message=_truncate_delivery_error(str(exc)),
+                    delivered_at=self._clock.now(), terminal=False,
                 )
 
             attempts = alert.delivery_attempts + 1

@@ -108,8 +108,13 @@ class TestUrllibTelegramTransportConstructor:
         transport = UrllibTelegramTransport(credentials=_credentials(), timeout_seconds=5.0)
         assert transport is not None
 
-    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5, math.nan, math.inf, -math.inf])
+    @pytest.mark.parametrize("bad_timeout", [0, -1, -0.5, math.nan, math.inf, -math.inf, True, False])
     def test_rejects_invalid_timeout(self, bad_timeout):
+        """Etapa 6.16 (§31, auditoría transversal): `True`/`False` deben
+        rechazarse igual que Slack/Email/Webhook -- corrige un defecto
+        real detectado en la auditoría (como `bool` es subclase de
+        `int`, `timeout_seconds=True` pasaba silenciosamente la
+        validación anterior y se aceptaba como 1.0 segundos)."""
         with pytest.raises(ValueError):
             UrllibTelegramTransport(credentials=_credentials(), timeout_seconds=bad_timeout)
 

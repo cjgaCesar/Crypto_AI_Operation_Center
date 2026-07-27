@@ -90,6 +90,39 @@ truncado UTF-8-seguro del cuerpo para respetar
 `WEBHOOK_MAX_PAYLOAD_BYTES` (definida en webhook_transport.py, única
 fuente de verdad, importada aquí). Con este canal ya real, no queda
 ningún placeholder dentro de `inspection_notifications`.
+
+Etapa 6.16 (§31, cierre operativo y endurecimiento transversal, sin
+agregar ningún canal nuevo): auditoría de los cinco canales como un
+único sistema coherente. Cambios concretos:
+
+- `_truncate_delivery_error()`/`MAX_DELIVERY_ERROR_LENGTH = 500`:
+  utilidad compartida que acota de forma determinista la longitud de
+  cualquier `error_message` antes de que se devuelva en un
+  `AlertDeliveryResult`, se persista (por canal o a nivel de alerta) o
+  se registre en logs -- nunca sanitiza contenido (eso sigue siendo
+  responsabilidad exclusiva de cada `*TransportError`), solo acota
+  longitud. Se aplica en los 5 `deliver()`, en ambos puntos de
+  `CompositeNotificationChannel` donde se construye un
+  `error_message` (una excepción directa de un canal, y el mensaje
+  agregado final), y en `AlertDeliveryService` (importada desde aquí).
+- Corrección de un defecto real detectado en la auditoría: en
+  `EmailNotificationChannel`/`SlackNotificationChannel`/
+  `TelegramNotificationChannel`, la construcción del texto/asunto
+  (`_format_*`) se movió DENTRO del `try/except` de `deliver()` --
+  antes ocurría afuera, violando en la práctica (aunque nunca se había
+  disparado en producción, ya que los formatters son puros y no
+  fallan con un `NotificationMessage` válido) el contrato documentado
+  de `InspectionNotificationChannel.deliver()`: "nunca lanza". Ahora
+  los 5 canales garantizan estructuralmente que ninguna excepción de
+  su propia lógica de formato escapa de `deliver()`, igual que ya
+  hacía `WebhookNotificationChannel` desde la Etapa 6.15.
+- Ver también la corrección equivalente en `telegram_transport.py`
+  (validación de timeout ahora rechaza `bool` explícitamente, igual
+  que Slack/Email/Webhook).
+
+No se agregó ningún canal, proveedor, cola, worker, concurrencia,
+métrica ni UI en esta etapa; el alcance es auditoría, endurecimiento
+transversal, documentación y pruebas contractuales.
 """
 
 import json
@@ -120,6 +153,26 @@ EMAIL_MAX_BODY_LENGTH = 10000
 _EMAIL_BODY_TRUNCATION_MARK = "\n[Mensaje truncado]"
 
 _WEBHOOK_BODY_TRUNCATION_MARK = "\n[Mensaje truncado]"
+
+MAX_DELIVERY_ERROR_LENGTH = 500
+_DELIVERY_ERROR_TRUNCATION_MARK = "…"
+
+
+def _truncate_delivery_error(message: str) -> str:
+    """Acota cualquier `error_message` de entrega a `MAX_DELIVERY_ERROR_LENGTH`
+    caracteres, de forma determinista (Etapa 6.16, §31/§32).
+
+    Se aplica siempre DESPUÉS de que el mensaje ya fue sanitizado en su
+    origen (un `*TransportError` propio de cada transporte, o el
+    `str(exc)` de una excepción inesperada capturada por un canal/por
+    `CompositeNotificationChannel`/por `AlertDeliveryService`) -- esta
+    función nunca sanitiza contenido por sí sola, solo acota longitud.
+    El corte ocurre sobre el sufijo del string ya considerado seguro,
+    nunca revela nada que el mensaje original no mostrara ya."""
+    if len(message) <= MAX_DELIVERY_ERROR_LENGTH:
+        return message
+    truncated_length = MAX_DELIVERY_ERROR_LENGTH - len(_DELIVERY_ERROR_TRUNCATION_MARK)
+    return message[:truncated_length] + _DELIVERY_ERROR_TRUNCATION_MARK
 
 
 class InspectionNotificationChannel(Protocol):
@@ -158,7 +211,9 @@ class LoggingNotificationChannel:
                 logger.info("%s -- %s", message.title, message.body)
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
-            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
+            return AlertDeliveryResult(
+                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+            )
 
 
 class NullNotificationChannel:
@@ -248,13 +303,15 @@ class EmailNotificationChannel:
         self._clock = clock
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        subject = _format_email_subject(message)
-        body = _format_email_body(message)
         try:
+            subject = _format_email_subject(message)
+            body = _format_email_body(message)
             self._transport.send_message(subject=subject, body=body)
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
-            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
+            return AlertDeliveryResult(
+                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+            )
 
 
 def _neutralize_slack_mentions(text: str) -> str:
@@ -328,12 +385,14 @@ class SlackNotificationChannel:
         self._clock = clock
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        text = _format_slack_text(message)
         try:
+            text = _format_slack_text(message)
             self._transport.send_message(text=text)
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
-            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
+            return AlertDeliveryResult(
+                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+            )
 
 
 def _format_telegram_text(message: NotificationMessage) -> str:
@@ -387,12 +446,14 @@ class TelegramNotificationChannel:
         self._clock = clock
 
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
-        text = _format_telegram_text(message)
         try:
+            text = _format_telegram_text(message)
             self._transport.send_message(text=text)
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
-            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
+            return AlertDeliveryResult(
+                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+            )
 
 
 def _serialize_webhook_payload(payload: dict) -> bytes:
@@ -508,7 +569,9 @@ class WebhookNotificationChannel:
             self._transport.send_payload(payload=payload)
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
-            return AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=self._clock.now())
+            return AlertDeliveryResult(
+                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+            )
 
 
 class CompositeNotificationChannel:
@@ -603,7 +666,9 @@ class CompositeNotificationChannel:
             try:
                 result = channel.deliver(message)
             except Exception as exc:
-                result = AlertDeliveryResult(success=False, error_message=str(exc), delivered_at=now)
+                result = AlertDeliveryResult(
+                    success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=now,
+                )
 
             if result.success:
                 self._repository.upsert_alert_channel_delivery(InspectionAlertChannelDelivery(
@@ -631,7 +696,7 @@ class CompositeNotificationChannel:
 
         return AlertDeliveryResult(
             success=all_delivered,
-            error_message="; ".join(errors) if errors else None,
+            error_message=_truncate_delivery_error("; ".join(errors)) if errors else None,
             delivered_at=self._clock.now(),
             terminal=any_terminal_failure,
         )

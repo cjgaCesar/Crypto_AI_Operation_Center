@@ -377,8 +377,10 @@ class InspectionNotificationsConfig:
     Bloque **opcional** dentro de `paper_trading` en config.yaml: si no
     existe, `logging=True` preserva exactamente el comportamiento ya
     aprobado en la Etapa 6.9 (`LoggingInspectionAlertSink` como único
-    canal); los otros 4 son placeholders (§24.10, sin conexión real
-    todavía) y quedan `False` por defecto.
+    canal); los otros 4 (`telegram`/`slack`/`email`/`webhook`) ya son
+    canales externos reales (Etapas 6.12-6.15, ya no placeholders) y
+    quedan `False` por defecto -- deshabilitados hasta que se
+    configuren explícitamente sus credenciales/endpoint en `.env`.
     """
 
     logging: bool = True

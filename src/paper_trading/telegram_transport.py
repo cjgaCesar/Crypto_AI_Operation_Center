@@ -40,6 +40,14 @@ Fuera de alcance (responsabilidad de otras capas): el formato del
 mensaje (`notification_channels.py`), reintentos (`AlertDeliveryService`/
 `CompositeNotificationChannel`, ver §25.2), persistencia, idempotencia,
 y la lectura de variables de entorno (Composition Root/`src/utils/config.py`).
+
+Etapa 6.16 (§31, auditoría transversal): la validación de
+`timeout_seconds` ahora rechaza explícitamente `bool` (`isinstance(...,
+bool)`), igual que Slack/Email/Webhook -- corrige una inconsistencia
+real detectada en la auditoría: como `bool` es subclase de `int` en
+Python, `timeout_seconds=True` pasaba silenciosamente la validación
+anterior (`math.isfinite(True) and True > 0`) y se aceptaba como un
+timeout válido de 1.0 segundos.
 """
 
 import json
@@ -114,7 +122,7 @@ class UrllibTelegramTransport:
     los lugares donde el secreto vive en memoria."""
 
     def __init__(self, *, credentials: TelegramCredentials, timeout_seconds: float = 10.0):
-        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("Telegram timeout must be a finite number greater than zero.")
         self._credentials = credentials
         self._timeout_seconds = timeout_seconds
