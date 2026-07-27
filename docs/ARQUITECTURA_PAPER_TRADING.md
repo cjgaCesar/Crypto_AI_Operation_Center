@@ -4940,3 +4940,216 @@ que reutilice `PaperTradingApplication` directamente). `main()` sigue
 capturando `PaperTradingDisabledError` como una defensa adicional,
 aunque en el camino normal de esta CLI es inalcanzable porque el gate
 temprano ya filtró ese caso.
+
+## 35. Backup y recuperación operativa SQLite — Etapa 6.20
+
+### 35.1 Objetivo
+
+La auditoría previa a esta etapa identificó la ausencia completa de un
+contrato de backup/recuperación como la brecha operativa prioritaria
+restante: sin procedimiento para copiar la base SQLite de forma segura,
+sin verificación operativa, sin restauración, sin tratamiento de
+archivos corruptos. `python -m src.paper_trading.backup_cli`
+(`backup`/`verify`/`restore`) cierra esa brecha para la base de Paper
+Trading -- no para `data/crypto_data.db` (mercado/indicadores/señales/
+IA), que queda explícitamente fuera de esta etapa.
+
+### 35.2 Arquitectura y separación de capas
+
+Toda la lógica SQLite reutilizable vive en `sqlite_backup.py`
+(`SQLitePaperTradingBackupService`): crear backup, verificar
+integridad/schema, restaurar, validar rutas, publicar de forma atómica.
+`backup_cli.py` solo traduce línea de comandos <-> esa clase --
+argparse, carga de configuración, confirmación, formato de salida,
+mapeo de excepciones a códigos de salida. Ninguno de los dos archivos
+importa `PaperTradingApplication`/`PaperTradingService`/ningún motor
+(`RiskEngine`/`FillEngine`/`PositionEngine`/`PnLEngine`/
+`ReservationEngine`) ni ningún transporte de notificaciones: el
+subsistema de backup es completamente independiente del dominio de
+trading, nunca construye un `PaperTradingContext`
+(`TestStructuralIsolation`, vía `ast`).
+
+`SQLitePaperTradingBackupService` solo necesita una ruta de archivo
+(`database_path: str`) -- nunca `PaperTradingConfig`/`Settings`
+completos, y no se agregó esta responsabilidad a
+`SQLitePaperTradingRepository`/`PaperTradingApplication`/
+`PaperTradingService` (archivos sin modificar en esta etapa).
+
+### 35.3 Método de backup: `sqlite3.Connection.backup()`
+
+El mecanismo principal de copia es la API de Backup Online de SQLite
+(`source_conn.backup(dest_conn)`), nunca `shutil.copy()`/
+`Path.read_bytes()`: una copia de bytes cruda no garantiza consistencia
+si existe un escritor con una transacción en curso. La conexión origen
+se abre siempre en modo real de solo lectura
+(`sqlite3.connect(f"file:{path}?mode=ro", uri=True)`) -- nunca crea ni
+modifica el origen; si la base configurada no existe, no se crea
+(`repo.init()`/migraciones/`seed_initial_cash_balance()` nunca se
+llaman durante backup). `shutil`/`os.replace()` solo se usan para
+publicar un archivo temporal ya copiado, verificado y cerrado.
+
+### 35.4 Consistencia ante un escritor activo
+
+Verificado empíricamente (no solo documentado): con una conexión
+manteniendo `BEGIN IMMEDIATE` + una escritura sin `commit()`, el
+`Connection.backup()` desde una conexión `mode=ro` separada completa
+casi instantáneamente y produce una copia que contiene únicamente el
+último estado *confirmado* -- nunca los cambios sin confirmar del
+escritor activo (`TestBackupWithConcurrentWriter`, con
+`threading.Barrier`, nunca `sleep()` como único mecanismo de
+sincronización). Mismo comportamiento ya caracterizado para lectores
+normales en la Etapa 6.17 (§32.2/§32.12): el modo `journal_mode=delete`
+vigente (WAL sigue sin habilitarse, decisión de la Etapa 6.17 sin
+revisar aquí) ya permite esto para el patrón de uso real del proyecto.
+
+### 35.5 Publicación atómica
+
+Tanto `create_backup()` como el backup previo interno de
+`restore_backup()` siguen el mismo flujo: validar rutas -> crear un
+archivo temporal en el **mismo directorio** del destino
+(`tempfile.mkstemp(dir=destination.parent, ...)`, para que
+`os.replace()` sea atómico dentro del mismo filesystem) -> copiar vía
+`Connection.backup()` -> verificar el temporal (`PRAGMA quick_check`)
+-> cerrar todas las conexiones -> publicar con `os.replace()`. Ante
+cualquier fallo antes de esa publicación, el destino anterior (si
+existía) queda intacto y el temporal se elimina en un `finally` --
+nunca queda un backup parcial visible como válido. El archivo existente
+nunca se borra antes de que el temporal haya terminado, pasado
+verificación y esté cerrado.
+
+### 35.6 Sobrescritura (`backup`)
+
+Con `--output` apuntando a un destino que ya existe: sin `--overwrite`,
+error controlado (`BackupDestinationExistsError`, código 6) sin pedir
+confirmación (no tendría efecto sin `--overwrite`); con `--overwrite`
+sin `--confirm`, código 5 (confirmación requerida) antes de tocar
+ningún archivo; con `--overwrite --confirm`, reemplazo atómico. Sin
+`--overwrite` y destino inexistente, no se exige `--confirm` en
+absoluto.
+
+### 35.7 `verify`: integridad y schema, por separado
+
+`verify` acepta exactamente uno de `--backup-path PATH` (un archivo de
+backup cualquiera) o `--configured-database` (la base de Paper Trading
+oficialmente configurada) -- nunca ambos, nunca ninguno (grupo
+mutuamente exclusivo y obligatorio de `argparse`). Sin `--full`, usa
+`PRAGMA quick_check`; con `--full`, `PRAGMA integrity_check`. Además de
+la integridad física, verifica que existan las 11 tablas mínimas de
+Paper Trading -- una única constante,
+`REQUIRED_PAPER_TRADING_TABLES` (`sqlite_backup.py`), nunca codificada
+dos veces. Integridad y schema son ejes independientes: una base
+físicamente válida pero sin ninguna tabla `paper_trading_*` reporta
+`integrity_ok=true`, `schema_ok=false`, `valid=false` (código 8) --
+nunca se afirma que un archivo es un backup válido de Paper Trading
+solo porque pasó `integrity_check`. `verify` nunca escribe, nunca crea
+tablas faltantes, y puede ejecutarse aunque `paper_trading.enabled` sea
+`false` (no construye ningún `PaperTradingContext`, no usa el gate de
+`order_cli.py`).
+
+### 35.8 `restore`: preflight, backup previo y restauración atómica
+
+Orden de preflight, antes de modificar la base configurada: (1)
+`--confirm` (antes de cualquier otro efecto, incluida la carga de
+configuración); (2) cargar `Settings`; (3) confirmar que el backup
+existe; (4) verificar su integridad (`integrity_check`, la variante más
+exhaustiva, dado el riesgo de la operación); (5) verificar su schema de
+Paper Trading; (6) confirmar que backup y destino no son el mismo
+archivo; (7) si el destino existe, comprobar que no está bloqueado por
+otro escritor (§35.9). Si cualquier validación falla, la base
+configurada queda intacta -- ninguna de ellas escribe nada.
+
+Por defecto, si el destino ya existe, se crea un backup previo
+(`<nombre>.pre_restore.<timestamp>.sqlite`, mismo mecanismo de
+`Connection.backup()` + publicación atómica que `create_backup()`)
+antes de tocar el destino. `--no-pre-restore-backup` lo deshabilita,
+exigiendo igualmente `--confirm`; deshabilitarlo reduce la capacidad de
+recuperación ante un error durante la propia restauración.
+
+Restauración, nunca una copia directa sobre el destino: backup previo
+(salvo `--no-pre-restore-backup`) -> temporal junto al destino ->
+copiar el backup ya validado hacia el temporal vía `Connection.backup()`
+-> verificar de nuevo el temporal (`quick_check`) -> cerrar conexiones
+-> `os.replace()` -> re-verificar el destino ya publicado
+(`quick_check` + schema). Un fallo antes de `os.replace()` dispara
+`RestoreError`/`BackupIntegrityError` (código 7 o 10) y el destino
+original queda intacto; un fallo hipotético después de `os.replace()`
+(no observado en las pruebas: `os.replace()` es una operación atómica
+de sistema de archivos) se reportaría como fallo crítico, señalando la
+disponibilidad del backup previo -- esta etapa no intenta ninguna
+reparación automática compleja.
+
+### 35.9 Detección de escritor activo
+
+No existe coordinación distribuida de escritores en el proyecto. Antes
+de restaurar sobre un destino existente, `_ensure_not_busy()` abre una
+conexión propia con `timeout=0` y ejecuta `BEGIN IMMEDIATE`: si SQLite
+la rechaza de inmediato (`sqlite3.OperationalError: database is
+locked`, sin esperar el timeout normal de 5s), se concluye que otro
+proceso tiene una escritura activa (`DatabaseBusyError`, código 9) y la
+restauración se aborta sin escribir nada; si la adquiere, se hace
+`ROLLBACK` de inmediato -- nunca queda una transacción abierta. Esto no
+mata procesos ni cierra conexiones ajenas: el operador debe detener
+manualmente `inspection_scheduler.py`/`src/main.py`/cualquier otra CLI
+administrativa de Paper Trading antes de restaurar; la CLI detecta el
+bloqueo cuando SQLite lo permite, pero no puede garantizar que otro
+proceso no comience a escribir inmediatamente después de la
+comprobación -- no se implementa (ni se pretende implementar en esta
+etapa) un sistema de locks distribuido.
+
+### 35.10 Archivos WAL/SHM
+
+La Etapa 6.17 no habilitó WAL y esta etapa no lo revisa. El uso de
+`Connection.backup()` evita depender de copiar archivos `-wal`/`-shm`;
+esta CLI nunca los crea manualmente ni los elimina.
+
+### 35.11 Formatos y salida
+
+`--format table|json` (default `table`), compartido entre el parser
+raíz y los tres subparsers vía el mismo patrón de parser padre +
+`argument_default=argparse.SUPPRESS` aprobado en la Etapa 6.18.1 (antes
+o después del subcomando). En JSON: `datetime` -> ISO 8601, tupla ->
+lista, `bool` -> `true`/`false`, `None` -> `null`. Los resultados
+(`BackupResult`/`VerificationResult`/`RestoreResult`, `dataclass`
+inmutables) nunca incluyen una ruta absoluta completa: `destination`/
+`backup_path`/`pre_restore_backup` usan una ruta relativa al directorio
+de trabajo cuando es posible, o el nombre del archivo (`_safe_display()`
+en `sqlite_backup.py`) -- nunca el directorio personal completo,
+variables de entorno, `Settings` ni credenciales. Los backups
+producidos contienen únicamente la base SQLite de Paper Trading: nunca
+`.env`, tokens ni configuración.
+
+### 35.12 Códigos de salida
+
+| Código | Significado |
+|---|---|
+| 0 | Operación completada |
+| 2 | Error de argumentos de argparse |
+| 3 | Configuración inválida |
+| 4 | Base o backup inexistente/inaccesible |
+| 5 | Confirmación requerida |
+| 6 | Destino existente o conflicto de rutas |
+| 7 | Verificación de integridad fallida |
+| 8 | Schema de Paper Trading inválido |
+| 9 | Base bloqueada por otro escritor |
+| 10 | Error operativo controlado |
+| 11 | Error inesperado, sanitizado |
+
+`verify` nunca lanza una excepción por un resultado inválido (eso es un
+resultado normal, no un error): el código de salida se decide después
+de calcular `VerificationResult` (7 si `integrity_ok=false`, 8 si
+`schema_ok=false` pero la integridad es correcta). Las excepciones
+inesperadas se sanitizan a un mensaje genérico ("Backup operation
+failed unexpectedly."), sin `str(exc)`, sin SQL, sin ruta absoluta, sin
+traceback.
+
+### 35.13 Limitaciones
+
+No implementa backups automáticos programados, retención por días,
+subida a la nube, compresión, cifrado, PostgreSQL, replicación ni
+sincronización remota. No hace backup de `data/crypto_data.db`
+(mercado/indicadores/señales/IA) ni de credenciales/`.env`. No sustituye
+un backup externo real (ej. copiar el directorio `backups/` a otro
+disco/proveedor sigue siendo responsabilidad del operador). No está
+diseñado para múltiples escritores distribuidos ni para coordinar el
+apagado de otros procesos -- el operador debe detenerlos manualmente
+antes de restaurar (§35.9).

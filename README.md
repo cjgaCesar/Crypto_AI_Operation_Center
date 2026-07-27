@@ -537,9 +537,9 @@ obligatorio para autorizar cualquier escritura (real, aunque siempre
 simulada) -- sin él, no se construye ningún contexto ni se ejecuta
 ninguna operación. Solo MARKET, solo posiciones LONG. Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §34](docs/ARQUITECTURA_PAPER_TRADING.md).
-PostgreSQL (`postgres_repository.py`) y el backup/restauración de la
-base SQLite siguen pendientes, como fases futuras independientes -- el
-proyecto no se declara listo para producción ni para Live Trading.
+PostgreSQL (`postgres_repository.py`) sigue pendiente, como fase futura
+independiente -- el proyecto no se declara listo para producción ni
+para Live Trading.
 **Etapa 6.19.1**: `order_cli.py` ahora comprueba
 `paper_trading.enabled` inmediatamente después de cargar la
 configuración y **antes** de inicializar cualquier repositorio -- con
@@ -547,6 +547,19 @@ configuración y **antes** de inicializar cualquier repositorio -- con
 crear ni modificar ninguna base SQLite (ni la de mercado ni la de
 Paper Trading), sin importar si `--order-id` existe. Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §34.12](docs/ARQUITECTURA_PAPER_TRADING.md).
+**Etapa 6.20**: CLI administrativa
+`python -m src.paper_trading.backup_cli` (`backup`/`verify`/`restore`)
+para la base SQLite de Paper Trading, vía `sqlite3.Connection.backup()`
+(nunca copia de bytes cruda) y publicación atómica (`os.replace()`
+sobre un temporal ya verificado). Ejemplos:
+`backup_cli backup --output backups/paper_trading_2026-07-27.sqlite`,
+`backup_cli verify --backup-path backups/paper_trading_2026-07-27.sqlite`,
+`backup_cli restore --backup-path backups/paper_trading_2026-07-27.sqlite --confirm`
+(`--confirm` es obligatorio para `restore`, y crea un backup previo por
+defecto). No sustituye un backup externo real, no incluye cifrado ni
+subida a la nube, no programa backups automáticos, y no está diseñado
+para múltiples escritores distribuidos. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §35](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para
