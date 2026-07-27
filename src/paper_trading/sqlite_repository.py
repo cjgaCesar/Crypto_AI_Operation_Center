@@ -43,12 +43,35 @@ docs/ARQUITECTURA_PAPER_TRADING.md):
   `check_position_pnl_consistency()` compara ambas fuentes sin
   modificar ninguna -- la reconciliación real (si alguna vez difieren)
   es decisión de un futuro Service (Etapa 6.4), no de este repositorio.
+
+Etapa 6.17 (§32, concurrencia y contención SQLite): antes de esta etapa,
+`_get_connection()` llamaba `sqlite3.connect(path)` sin `timeout=`
+explícito -- Python ya aplicaba su propio default (5.0 segundos,
+equivalente a `PRAGMA busy_timeout = 5000`), pero de forma implícita,
+no configurable ni verificada por ninguna prueba. Se caracterizó el
+comportamiento real (dos conexiones, una con `BEGIN IMMEDIATE` sin
+commit, la otra escribiendo) antes de modificar nada: la segunda
+escritura espera el tiempo del timeout y falla de forma controlada
+(`sqlite3.OperationalError: database is locked`), sin cuelgue, sin
+corrupción -- ver tests/test_paper_trading_sqlite_concurrency.py. El
+cambio aplicado es mínimo: `timeout_seconds` pasa a ser un parámetro
+explícito del constructor (mismo valor por defecto, 5.0, para no
+alterar el comportamiento ya vigente), validado, y propagado a
+`sqlite3.connect(..., timeout=timeout_seconds)`. `PRAGMA journal_mode`
+se mide (queda en `delete`, el modo por defecto) pero **no se activa
+WAL**: no se demostró un problema real que WAL resolviera para el
+patrón de uso actual (conexión nueva y transacción corta por
+operación) -- ver la sección 32 de docs/ARQUITECTURA_PAPER_TRADING.md
+para el detalle completo de la evidencia y la decisión.
 """
 
+import math
 from pathlib import Path
 import sqlite3
 from decimal import Decimal
 from typing import Optional
+
+DEFAULT_SQLITE_TIMEOUT_SECONDS = 5.0
 
 from src.paper_trading.alert_models import AlertStatus, InspectionAlert, InspectionAlertChannelDelivery
 from src.paper_trading.base import PaperTradingRepository
@@ -120,13 +143,23 @@ _PNL_SNAPSHOT_COLUMNS = (
 
 
 class SQLitePaperTradingRepository(PaperTradingRepository):
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, timeout_seconds: float = DEFAULT_SQLITE_TIMEOUT_SECONDS):
+        if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("SQLite timeout must be a finite number greater than zero.")
         self.db_path = db_path
+        self._timeout_seconds = timeout_seconds
 
     def _get_connection(self) -> sqlite3.Connection:
+        """Conexión nueva por operación (nunca compartida entre hilos, nunca
+        un singleton): mismo patrón ya vigente desde la Etapa 6.3, ahora con
+        `timeout=self._timeout_seconds` explícito -- antes de la Etapa
+        6.17, este valor ya era 5.0s (default de Python), solo que
+        implícito y no configurable. `PRAGMA foreign_keys = ON` se aplica
+        aquí, en cada conexión nueva -- no solo en `init()` -- porque
+        SQLite no conserva ese pragma entre conexiones distintas."""
         path = Path(self.db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path)
+        conn = sqlite3.connect(path, timeout=self._timeout_seconds)
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 

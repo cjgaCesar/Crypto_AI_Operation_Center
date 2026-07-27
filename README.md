@@ -506,10 +506,18 @@ todavía**: sin Strategy Engine, sin señales ni IA ejecutando órdenes,
 sin cambios en el Dashboard (sigue de solo lectura). Ver
 [docs/ALCANCE_ETAPA_6.md](docs/ALCANCE_ETAPA_6.md) y
 [docs/ARQUITECTURA_PAPER_TRADING.md](docs/ARQUITECTURA_PAPER_TRADING.md).
-Pendiente tu auditoría y aprobación formal de la Etapa 6.9 antes de
-continuar.
+**Etapas 6.10-6.16.1**: sistema de notificaciones multicanal cerrado --
+Logging/Telegram/Slack/Email/Webhook, sin placeholders restantes,
+auditoría transversal y sanitización de excepciones inesperadas
+completas. **Etapa 6.17**: caracterización y endurecimiento mínimo de
+concurrencia SQLite (`SQLitePaperTradingRepository`): timeout explícito
+y validado (`timeout_seconds`, mismo default de 5.0s ya vigente antes
+de esta etapa), sin habilitar WAL (sin evidencia que lo justificara),
+con pruebas reales de escritores/lectores concurrentes, atomicidad bajo
+contención, reinicio e integridad. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §32](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
-de conectar un proveedor de IA real; aprobación de la Etapa 6.9 antes de
-continuar con Paper Trading (entrega de alertas por canales adicionales,
-migración PostgreSQL real).
+de conectar un proveedor de IA real; migración a PostgreSQL real para
+Paper Trading (`postgres_repository.py` sigue siendo un stub
+preparado, sin implementar).

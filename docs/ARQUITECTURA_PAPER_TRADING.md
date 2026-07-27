@@ -4347,3 +4347,216 @@ alcance de esta etapa. La protección SSRF de Webhook (§30.4) y las
 demás limitaciones de seguridad ya documentadas en §27-§30 siguen
 vigentes sin cambios: esta etapa endurece consistencia/observabilidad/
 sanitización transversal, no agrega nuevas capacidades de red.
+
+## 32. Concurrencia y contención SQLite — Etapa 6.17
+
+Etapa de caracterización y endurecimiento mínimo del comportamiento de
+`SQLitePaperTradingRepository` bajo acceso concurrente. Metodología
+obligatoria: **medir primero, endurecer después** -- no se asumió que
+WAL o un timeout nuevo fueran necesarios antes de reproducir el
+comportamiento real con pruebas (`tests/test_paper_trading_sqlite_concurrency.py`,
+26 pruebas, ejecutadas 3 veces consecutivas sin ninguna intermitencia).
+
+### 32.1 Modelo de conexión
+
+Sin cambios de fondo respecto a la Etapa 6.3: una conexión SQLite nueva
+por operación (`_get_connection()`), `try/finally: conn.close()`,
+nunca una conexión compartida entre hilos ni un singleton. Las
+operaciones multi-tabla (`save_fill_transaction`,
+`save_order_acceptance_transaction`/`_cancellation_transaction`,
+`save_reconciliation_transaction`, `save_inspection_run_transaction`)
+abren una única conexión, ejecutan sus pasos, y hacen un único
+`commit()`; cualquier excepción dispara `rollback()` antes de
+relanzarla -- ya vigente antes de esta etapa, confirmado con una nueva
+dimensión de prueba: contención real durante la transacción (§32.9).
+
+### 32.2 Caracterización inicial (antes de modificar nada)
+
+Se reprodujo el comportamiento real, con dos conexiones SQLite crudas,
+antes de tocar `sqlite_repository.py`:
+
+- `sqlite3.connect(path)` sin `timeout=` explícito ya aplicaba el
+  default de Python (5.0 segundos, equivalente a
+  `PRAGMA busy_timeout = 5000`) -- pero de forma **implícita**: no
+  configurable, no documentada, no verificada por ninguna prueba.
+- `PRAGMA journal_mode` por defecto es `delete` (rollback journal
+  clásico), no WAL.
+- Con una conexión manteniendo `BEGIN IMMEDIATE` + una escritura sin
+  `commit()`, un lector con una conexión separada pudo leer el último
+  valor **confirmado** sin bloquearse -- el modo actual ya no bloquea
+  lectores contra una transacción de escritura todavía no confirmada,
+  para este patrón de uso.
+- Con la misma conexión bloqueante, un segundo escritor esperó
+  aproximadamente el timeout configurado y falló de forma controlada:
+  `sqlite3.OperationalError: database is locked` -- nunca un cuelgue,
+  nunca corrupción.
+
+### 32.3 Hallazgo demostrado
+
+El comportamiento bajo contención ya era correcto (timeout finito,
+fallo controlado, sin corrupción), pero **no estaba caracterizado ni
+era configurable**: cero pruebas de concurrencia existían antes de esta
+etapa (confirmado en la auditoría previa a la Etapa 6.17), y el valor
+del timeout dependía enteramente del default interno de Python, sin
+ningún punto de extensión ni validación.
+
+### 32.4 Decisión sobre WAL: NO habilitado
+
+No se activó `PRAGMA journal_mode=WAL`. Justificación basada en la
+evidencia medida (§32.2), no en una suposición: para el patrón de uso
+real de este repositorio (conexión nueva y transacción corta por
+operación, nunca una transacción de larga duración mantenida
+deliberadamente), el modo por defecto ya permite que un lector vea
+datos confirmados mientras otra conexión mantiene una transacción de
+escritura sin confirmar, y la contención escritor-escritor ya se
+resuelve con un fallo controlado dentro del timeout configurado. No se
+demostró ningún escenario real (ver §32.9-§32.11) donde WAL cambiara el
+resultado observable. Activar WAL sin evidencia habría añadido una
+superficie nueva (archivos `-wal`/`-shm`, comportamiento distinto ante
+bases en memoria o sistemas de archivos de red) sin un beneficio
+demostrado -- exactamente el criterio que esta etapa exige respetar
+("si no existe una mejora demostrable, no habilitar WAL").
+
+### 32.5 Timeout
+
+`SQLitePaperTradingRepository.__init__(self, db_path: str, *,
+timeout_seconds: float = 5.0)` -- nuevo parámetro **opcional y
+compatible**: `SQLitePaperTradingRepository(path)` (uso posicional
+existente en todo el proyecto) sigue funcionando exactamente igual,
+con el mismo valor efectivo que ya tenía por defecto. Validación
+(rechaza `bool`/`0`/negativo/NaN/infinito, mismo criterio que
+`UrllibTelegramTransport`/`UrllibSlackTransport`/`SmtpEmailTransport`/
+`UrllibWebhookTransport`, Etapas 6.12-6.15): `"SQLite timeout must be a
+finite number greater than zero."`. Se propaga directamente a
+`sqlite3.connect(path, timeout=self._timeout_seconds)`, que Python
+traduce internamente a `PRAGMA busy_timeout = timeout_seconds * 1000`
+-- verificado consultando `PRAGMA busy_timeout` realmente (nunca por
+inspección de código), confirmando la conversión determinista de
+segundos a milisegundos.
+
+No se conectó a `PaperTradingConfig`/`config.yaml`: no se demostró una
+necesidad operativa real de un timeout distinto al default (5.0s ya
+resuelve el patrón de uso actual) -- agregar una configuración global
+sin esa evidencia habría sido alcance no justificado.
+
+### 32.6 Comportamiento ante contención
+
+- **Bloqueo liberado antes del timeout** (§32.10): el segundo escritor
+  espera (bloqueado dentro de SQLite, no en el código de la
+  aplicación) hasta que el primero libera el bloqueo, y completa
+  normalmente -- sin ningún reintento manual en el repositorio (el
+  único "reintento" es interno de SQLite mientras espera el bloqueo,
+  no un reintento de negocio), sin pérdida ni duplicación.
+- **Bloqueo que supera el timeout** (§32.2/§32.9): la escritura falla
+  con `sqlite3.OperationalError` (mensaje de SQLite, "database is
+  locked") -- se decidió **no** envolver esta excepción en un tipo
+  propio: el proyecto ya tiene el patrón establecido de dejar que
+  `sqlite3.OperationalError`/`IntegrityError` se propaguen sin
+  traducir desde el repositorio (ver `save_fill_transaction`, que
+  relanza tras `rollback()`), y no existe today ninguna jerarquía de
+  excepciones de persistencia equivalente a los `*TransportError` de
+  notificaciones que justifique crear una nueva solo para este caso.
+  El mensaje de SQLite no incluye la ruta completa de la base ni datos
+  sensibles.
+
+### 32.7 Helper de conexión
+
+`_get_connection()` ya era el único punto que llamaba
+`sqlite3.connect(...)` en todo el archivo (verificado: ninguna otra
+llamada directa) -- no se creó un helper nuevo, se centralizó el
+`timeout=` ahí mismo. Sigue sin ser un singleton: conexión nueva por
+operación, cierre determinista (`finally: conn.close()`), sin compartir
+objetos `sqlite3.Connection` entre hilos.
+
+### 32.8 Foreign keys
+
+`PRAGMA foreign_keys = ON` ya se ejecutaba dentro de `_get_connection()`
+(no solo en `init()`) -- confirmado que SQLite no conserva ese pragma
+entre conexiones distintas (una conexión externa cruda, abierta fuera
+del repositorio, lo tiene deshabilitado por defecto) y que, por lo
+tanto, la garantía depende de que toda conexión pase por
+`_get_connection()`, como ya ocurre en el 100% de los métodos públicos.
+Sin cambios de código; se agregó una prueba que lo confirma consultando
+`PRAGMA foreign_keys` realmente, y otra que confirma el rechazo de una
+`Execution` huérfana.
+
+### 32.9 Atomicidad bajo contención
+
+`save_fill_transaction()` (la única transacción multi-tabla) se probó
+bajo contención real (una conexión externa manteniendo `BEGIN IMMEDIATE`
+sin commit): la escritura falla con `OperationalError` en su primera
+sentencia, y se confirmó que **ninguna** de las tablas involucradas
+(`paper_trading_orders`/`_executions`/`_positions`/`_cash_balances`)
+recibió un cambio parcial -- o se persiste completa, o no se persiste
+nada, exactamente como ya garantizaba el `try/except: rollback()` desde
+la Etapa 6.3, ahora confirmado también bajo contención real.
+
+### 32.10-32.11 Escenarios de reintento y liberación
+
+Ver §32.6. Probado con `threading.Barrier` para sincronizar el inicio,
+nunca `sleep()` como único mecanismo de sincronización (se usa un
+`sleep` acotado solo para simular cuánto tiempo un hilo mantiene el
+bloqueo, no para sincronizar el inicio de los hilos).
+
+### 32.12 Lectores durante escritura
+
+WAL no se habilitó (§32.4), así que no se exige la garantía de "lectores
+nunca bloqueados" que WAL proveería -- se documentó el comportamiento
+real del modo por defecto (`delete`): un lector con su propia conexión
+pudo leer el último valor confirmado mientras otra conexión mantenía
+una transacción de escritura abierta sin confirmar, sin bloquearse, para
+el escenario probado. No se afirma una garantía general de SQLite en
+este modo más allá de lo efectivamente medido.
+
+### 32.13 Varios escritores y reinicio
+
+4 hilos × 10 operaciones cada uno (IDs únicos): todos terminan, la
+cantidad final es exacta (40), sin duplicados. Tras cerrar todas las
+conexiones y crear una nueva instancia del repositorio
+(`init()` idempotente, confirmado de nuevo), los 20 registros de un
+segundo escenario equivalente siguen disponibles íntegros.
+`PRAGMA integrity_check` devuelve `ok` después del escenario de
+múltiples escritores (verificación de prueba únicamente, nunca en una
+operación productiva).
+
+### 32.14 Scheduler y acceso simultáneo
+
+Se probó una sola iteración de `InspectionJob.run_once()` (representando
+el scheduler) concurrentemente con `PaperTradingService.accept_market_order()`
+sobre el mismo archivo -- ambas operaciones completan, ambos estados
+quedan persistidos, sin escritura parcial. El lock en memoria de
+`InspectionJob` (`threading.Lock`, no reentrante) protege un único
+proceso, nunca multiproceso -- limitación ya documentada desde la Etapa
+6.9 (§23.12), sin cambios en esta etapa.
+
+### 32.15 Dashboard
+
+No se agregó una prueba de concurrencia Dashboard-vs-escritor nueva: el
+Dashboard ya es estrictamente de solo lectura (sin cambios en esta
+etapa), y como WAL no se habilitó y el cambio de conexión (timeout
+explícito) no altera el comportamiento de lectura ya caracterizado en
+§32.2/§32.12, no había ninguna propiedad nueva que verificar
+específicamente para el Dashboard -- criterio explícito de esta etapa
+("Solo agregar esta prueba si WAL o el cambio de conexión afecta
+realmente al comportamiento de lectura").
+
+### 32.16 Reintento SQLite vs. reintento de negocio
+
+Distinción explícita: la espera interna de SQLite mientras un escritor
+tiene el bloqueo (hasta `timeout_seconds`) es un mecanismo del propio
+motor de base de datos, transparente para el código de la aplicación
+-- nunca constituye un "reintento de negocio". Los reintentos de
+negocio (reintentar la entrega de una alerta, reintentar una operación
+completa) siguen siendo exclusivos de `AlertDeliveryService`/
+`CompositeNotificationChannel` (Etapas 6.9-6.16.1) y de quien invoque
+explícitamente al repositorio -- este repositorio nunca reintenta una
+escritura por sí mismo.
+
+### 32.17 Limitaciones (sin cambios de política)
+
+SQLite sigue siendo apropiado para una carga local o controlada (un
+solo archivo, procesos en la misma máquina), no para escalamiento
+horizontal ni múltiples nodos -- esta etapa no afirma ni implica
+soporte general de alta concurrencia. La paridad con PostgreSQL sigue
+sin implementarse (`postgres_repository.py` continúa siendo un stub,
+ver auditoría previa a la Etapa 6.17); esta etapa no la aborda.
