@@ -1,20 +1,37 @@
 """
-Pruebas para src/paper_trading/order_cli.py (Etapa 6.19).
+Pruebas para src/paper_trading/order_cli.py (Etapa 6.19, endurecido en
+6.19.1 con el gate temprano de `paper_trading.enabled`).
 
-Nunca llama a `main()`/`_build_context()` contra la configuración real
-(`load_settings()`/`data/crypto_data.db`): construye su propio
-`PaperTradingContext` con `SQLitePaperTradingRepository` real sobre
-`tmp_path`, y monkeypatchea `_build_context` para inyectarlo -- mismo
-patrón que `test_paper_trading_reconciliation_cli.py`/
+Nunca llama a `main()` contra la configuración real
+(`load_settings()`/`data/crypto_data.db`): monkeypatchea `_load_settings`
+(para controlar `enabled` sin tocar `config/config.yaml`) y `_build_context`
+(que ahora recibe `settings`, Etapa 6.19.1) para inyectar un
+`PaperTradingContext` de prueba con `SQLitePaperTradingRepository` real
+sobre `tmp_path` -- mismo patrón que
+`test_paper_trading_reconciliation_cli.py`/
 `test_paper_trading_inspection_cli.py`.
+
+Dos categorías de prueba para `enabled=false`, deliberadamente separadas
+(§21 de la Etapa 6.19.1):
+- `TestApplicationDefenseInDepthWhenDisabled`: el contexto YA está
+  construido (con `enabled=False` en su config) y se confirma que
+  `PaperTradingApplication._require_enabled()` sigue protegiendo por su
+  cuenta -- defensa de dominio, sin relación con el gate de la CLI.
+- `TestEarlyDisabledGate`: el gate de la CLI se dispara ANTES de
+  construir absolutamente nada (ni `SQLiteMarketDataRepository`, ni
+  `RepositoryMarketPriceProvider`, ni `build_paper_trading_context()`,
+  ni `SystemClock`/`UUIDIdGenerator`) -- la evidencia real de que no hay
+  inicialización ni escritura SQLite con `enabled=false`.
 """
 
+import argparse
 import ast
 import json
 import subprocess
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -101,8 +118,24 @@ def _context(tmp_path, prices=None, id_generator=None, **config_overrides):
     )
 
 
-def _patch_context(monkeypatch, context):
-    monkeypatch.setattr(order_cli, "_build_context", lambda: context)
+def _fake_settings(enabled: bool = True):
+    """El único campo de `Settings` que `main()` lee directamente antes
+    de construir el contexto es `settings.paper_trading.enabled` (Etapa
+    6.19.1) -- `_build_context` se monkeypatchea aparte para devolver un
+    `PaperTradingContext` ya armado, así que un `SimpleNamespace` mínimo
+    alcanza para las pruebas de `_load_settings`."""
+    return SimpleNamespace(paper_trading=SimpleNamespace(enabled=enabled))
+
+
+def _patch_context(monkeypatch, context, *, settings_enabled: bool = True):
+    """Inyecta un `PaperTradingContext` de prueba ya construido.
+    `settings_enabled` controla lo que `_load_settings()` reporta (el
+    gate temprano de la CLI, Etapa 6.19.1) -- independiente de
+    `context.application._config.enabled` (lo que ya trae el contexto
+    inyectado, usado por `TestApplicationDefenseInDepthWhenDisabled`
+    para probar la defensa de `PaperTradingApplication` por separado)."""
+    monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(settings_enabled))
+    monkeypatch.setattr(order_cli, "_build_context", lambda settings: context)
 
 
 # ==========================================================================
@@ -165,31 +198,31 @@ class TestQuantityValidation:
         assert order_cli._quantity_type("0.01") == Decimal("0.01")
 
     def test_rejects_empty(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("")
 
     def test_rejects_zero(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("0")
 
     def test_rejects_negative(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("-1")
 
     def test_rejects_nan(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("NaN")
 
     def test_rejects_infinity(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("Infinity")
 
     def test_rejects_negative_infinity(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("-Infinity")
 
     def test_rejects_invalid_text(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._quantity_type("abc")
 
     def test_never_rounds(self):
@@ -212,7 +245,7 @@ class TestSideValidation:
         assert order_cli._side_type("SELL") == OrderSide.SELL
 
     def test_invalid_side_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             order_cli._side_type("LONG")
 
     def test_invalid_side_via_main_exits_2(self):
@@ -221,6 +254,22 @@ class TestSideValidation:
                 "accept", "--exchange", "Binance", "--symbol", "BTCUSDT",
                 "--side", "SHORT", "--quantity", "0.1", "--confirm",
             ])
+        assert excinfo.value.code == 2
+
+
+class TestNonEmptyTextTypeValidation:
+    def test_valid_text_passes_through(self):
+        validator = order_cli._non_empty_text_type("--reason")
+        assert validator("Cancelación manual") == "Cancelación manual"
+
+    def test_rejects_empty(self):
+        validator = order_cli._non_empty_text_type("--reason")
+        with pytest.raises(argparse.ArgumentTypeError):
+            validator("")
+
+    def test_invalid_reason_via_main_exits_2(self):
+        with pytest.raises(SystemExit) as excinfo:
+            order_cli.main(["cancel", "--order-id", "order-1", "--reason", "", "--confirm"])
         assert excinfo.value.code == 2
 
 
@@ -580,18 +629,31 @@ class TestRiskRejection:
 
 
 # ==========================================================================
-# §16/§30 -- Paper Trading deshabilitado
+# §16/§30 (Etapa 6.19) -- Application ya construida + deshabilitada
+# (defensa de dominio, PaperTradingApplication._require_enabled(), sin
+# relación con el gate temprano de la CLI -- ver TestEarlyDisabledGate
+# más abajo para la evidencia real de "sin inicialización" de la 6.19.1)
 # ==========================================================================
 
-class TestDisabled:
-    _COMMANDS = {
-        "accept": ["accept", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY", "--quantity", "0.1"],
-        "fill": ["fill", "--order-id", "order-1"],
-        "cancel": ["cancel", "--order-id", "order-1", "--reason", "test"],
-        "submit": ["submit", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY", "--quantity", "0.1"],
-    }
+_DISABLED_COMMANDS = {
+    "accept": ["accept", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY", "--quantity", "0.1"],
+    "fill": ["fill", "--order-id", "order-1"],
+    "cancel": ["cancel", "--order-id", "order-1", "--reason", "test"],
+    "submit": ["submit", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY", "--quantity", "0.1"],
+}
 
-    @pytest.mark.parametrize("argv", _COMMANDS.values(), ids=_COMMANDS.keys())
+
+class TestApplicationDefenseInDepthWhenDisabled:
+    """El `PaperTradingContext` inyectado ya está completamente
+    construido, con `enabled=False` en su propia config -- deliberado:
+    demuestra que `PaperTradingApplication._require_enabled()` (Etapa
+    6.5, sin modificar) sigue rechazando por su cuenta incluso si algo
+    llegara a construir el contexto (`_load_settings()` se monkeypatchea
+    aquí para reportar `enabled=True`, ver `_patch_context`, así que
+    esta prueba nunca ejercita el gate temprano de la CLI -- esa
+    evidencia vive en `TestEarlyDisabledGate`)."""
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
     def test_disabled_exits_4_with_sanitized_message(self, argv, tmp_path, monkeypatch, capsys):
         id_generator = DeterministicIdGenerator()
         context = _context(tmp_path, id_generator=id_generator, enabled=False)
@@ -602,7 +664,7 @@ class TestDisabled:
         assert captured.out == ""
         assert captured.err.strip() == "Paper Trading is disabled in configuration."
 
-    @pytest.mark.parametrize("argv", _COMMANDS.values(), ids=_COMMANDS.keys())
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
     def test_disabled_never_queries_price_or_generates_ids(self, argv, tmp_path, monkeypatch):
         id_generator = DeterministicIdGenerator()
         context = _context(
@@ -615,7 +677,7 @@ class TestDisabled:
         assert price_provider.queried_symbols == []
         assert id_generator.total_calls == 0
 
-    @pytest.mark.parametrize("argv", _COMMANDS.values(), ids=_COMMANDS.keys())
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
     def test_disabled_never_writes(self, argv, tmp_path, monkeypatch):
         context = _context(tmp_path, enabled=False)
         before = context.repository.get_cash_balance("USDT")
@@ -624,6 +686,341 @@ class TestDisabled:
         after = context.repository.get_cash_balance("USDT")
         assert before == after
         assert context.repository.fetch_orders() == []
+
+
+# ==========================================================================
+# Etapa 6.19.1 -- Gate temprano de habilitación: el defecto bloqueante
+# detectado en la auditoría era que `_build_context()` (y, por lo tanto,
+# `SQLiteMarketDataRepository`/su `init()`/`RepositoryMarketPriceProvider`/
+# `build_paper_trading_context()`/`SystemClock`/`UUIDIdGenerator`) se
+# ejecutaba ANTES de que `PaperTradingApplication._require_enabled()`
+# tuviera oportunidad de rechazar -- con `enabled=false`, la CLI podía
+# crear bases/tablas/balance antes de devolver el código 4. Estas
+# pruebas demuestran que ninguno de esos colaboradores llega a
+# construirse: `_load_settings()` se monkeypatchea para reportar
+# `enabled=False`, y `_build_context`/las clases productivas se
+# reemplazan por espías que fallan si se instancian.
+# ==========================================================================
+
+class TestEarlyDisabledGate:
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_exits_4_before_building_any_context(self, argv, monkeypatch, capsys):
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(enabled=False))
+
+        def _fail(settings):
+            raise AssertionError("_build_context(settings) must not be called when disabled")
+
+        monkeypatch.setattr(order_cli, "_build_context", _fail)
+
+        exit_code = order_cli.main([*argv, "--confirm"])
+        assert exit_code == 4
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() == "Paper Trading is disabled in configuration."
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_never_instantiates_market_repository(self, argv, monkeypatch):
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(enabled=False))
+
+        class _SpyMarketRepository:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("SQLiteMarketDataRepository must not be instantiated when disabled")
+
+        monkeypatch.setattr(order_cli, "SQLiteMarketDataRepository", _SpyMarketRepository)
+        assert order_cli.main([*argv, "--confirm"]) == 4
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_never_builds_paper_trading_context(self, argv, monkeypatch):
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(enabled=False))
+
+        def _fail(**kwargs):
+            raise AssertionError("build_paper_trading_context() must not be called when disabled")
+
+        monkeypatch.setattr(order_cli, "build_paper_trading_context", _fail)
+        assert order_cli.main([*argv, "--confirm"]) == 4
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_never_constructs_price_provider(self, argv, monkeypatch):
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(enabled=False))
+
+        class _SpyPriceProvider:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("RepositoryMarketPriceProvider must not be instantiated when disabled")
+
+        monkeypatch.setattr(order_cli, "RepositoryMarketPriceProvider", _SpyPriceProvider)
+        assert order_cli.main([*argv, "--confirm"]) == 4
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_never_constructs_clock_or_id_generator(self, argv, monkeypatch):
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(enabled=False))
+
+        class _SpyClock:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("SystemClock must not be instantiated when disabled")
+
+        class _SpyIdGenerator:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("UUIDIdGenerator must not be instantiated when disabled")
+
+        monkeypatch.setattr(order_cli, "SystemClock", _SpyClock)
+        monkeypatch.setattr(order_cli, "UUIDIdGenerator", _SpyIdGenerator)
+        assert order_cli.main([*argv, "--confirm"]) == 4
+
+    def test_fill_of_nonexistent_order_still_exits_4_not_7(self, monkeypatch, capsys):
+        """§9 del ticket: el resultado no debe depender de la existencia
+        del order_id -- con enabled=false, incluso un --order-id que no
+        existiría en ninguna base también termina en 4, nunca en 7."""
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: _fake_settings(enabled=False))
+
+        def _fail(settings):
+            raise AssertionError("_build_context(settings) must not be called when disabled")
+
+        monkeypatch.setattr(order_cli, "_build_context", _fail)
+
+        exit_code = order_cli.main(["fill", "--order-id", "does-not-exist-anywhere", "--confirm"])
+        assert exit_code == 4
+        assert capsys.readouterr().err.strip() == "Paper Trading is disabled in configuration."
+
+
+class TestNoMarketDatabaseInitializationWhenDisabled:
+    """§10 del ticket: con `enabled=false`, ni el archivo de la base de
+    mercado ni su directorio deben crearse -- prueba de integración
+    real, sin reemplazar `_build_context` (solo `_load_settings`)."""
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_market_database_file_is_never_created(self, argv, tmp_path, monkeypatch):
+        market_db_dir = tmp_path / "does_not_exist_yet"
+        market_db_path = market_db_dir / "market.db"
+        pt_db_path = tmp_path / "does_not_exist_yet_either" / "paper_trading.db"
+
+        settings = SimpleNamespace(
+            database=SimpleNamespace(sqlite_path=str(market_db_path)),
+            paper_trading=_config(tmp_path, database_path=str(pt_db_path), enabled=False),
+        )
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: settings)
+
+        exit_code = order_cli.main([*argv, "--confirm"])
+
+        assert exit_code == 4
+        assert not market_db_dir.exists()
+        assert not market_db_path.exists()
+
+
+class TestNoPaperTradingInitializationWhenDisabled:
+    """§11 del ticket: con `enabled=false`, `build_paper_trading_context()`
+    nunca se invoca -- ni la base de Paper Trading ni su directorio se
+    crean, ni se siembra ningún `CashBalance`."""
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_paper_trading_database_file_is_never_created(self, argv, tmp_path, monkeypatch):
+        market_db_path = tmp_path / "market_dir" / "market.db"
+        pt_db_dir = tmp_path / "pt_dir"
+        pt_db_path = pt_db_dir / "paper_trading.db"
+
+        settings = SimpleNamespace(
+            database=SimpleNamespace(sqlite_path=str(market_db_path)),
+            paper_trading=_config(tmp_path, database_path=str(pt_db_path), enabled=False),
+        )
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: settings)
+
+        def _fail(**kwargs):
+            raise AssertionError("build_paper_trading_context() must not be called when disabled")
+
+        monkeypatch.setattr(order_cli, "build_paper_trading_context", _fail)
+
+        exit_code = order_cli.main([*argv, "--confirm"])
+
+        assert exit_code == 4
+        assert not pt_db_dir.exists()
+        assert not pt_db_path.exists()
+
+
+class TestDisabledWithNonExistentDatabases:
+    """§14 del ticket -- la prueba principal que faltó en la Etapa 6.19:
+    dos rutas SQLite inexistentes, solo `_load_settings()` reemplazado
+    (nunca `_build_context`, para ejercitar el código productivo real de
+    principio a fin), los cuatro comandos confirmados. Ningún archivo ni
+    directorio SQLite nuevo debe aparecer."""
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_no_sqlite_artifact_is_created_end_to_end(self, argv, tmp_path, monkeypatch, capsys):
+        market_db_path = tmp_path / "market_subdir" / "market.db"
+        pt_db_path = tmp_path / "pt_subdir" / "paper_trading.db"
+        assert not market_db_path.exists()
+        assert not pt_db_path.exists()
+
+        settings = SimpleNamespace(
+            database=SimpleNamespace(sqlite_path=str(market_db_path)),
+            paper_trading=_config(tmp_path, database_path=str(pt_db_path), enabled=False),
+        )
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: settings)
+
+        exit_code = order_cli.main([*argv, "--confirm"])
+
+        assert exit_code == 4
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() == "Paper Trading is disabled in configuration."
+        assert not market_db_path.exists()
+        assert not market_db_path.parent.exists()
+        assert not pt_db_path.exists()
+        assert not pt_db_path.parent.exists()
+
+
+class TestDisabledWithExistingDatabases:
+    """§15 del ticket: bases ya existentes con contenido identificable --
+    con `enabled=false`, ni el schema ni las filas deben cambiar en
+    absoluto para ninguno de los cuatro comandos."""
+
+    def _seed_databases(self, tmp_path):
+        market_db_path = tmp_path / "market.db"
+        pt_db_path = tmp_path / "pt.db"
+
+        from src.database.sqlite_repository import SQLiteMarketDataRepository as RealMarketRepo
+        market_repo = RealMarketRepo(str(market_db_path))
+        market_repo.init()
+
+        pt_repo = SQLitePaperTradingRepository(str(pt_db_path))
+        pt_repo.init()
+        pt_repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("10000"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+        return market_db_path, pt_db_path, pt_repo
+
+    @staticmethod
+    def _snapshot(db_path):
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        try:
+            tables = sorted(
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+            contents = {
+                table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                for table in tables
+            }
+        finally:
+            conn.close()
+        return tables, contents
+
+    @pytest.mark.parametrize("argv", _DISABLED_COMMANDS.values(), ids=_DISABLED_COMMANDS.keys())
+    def test_existing_databases_are_untouched(self, argv, tmp_path, monkeypatch):
+        market_db_path, pt_db_path, _ = self._seed_databases(tmp_path)
+
+        settings = SimpleNamespace(
+            database=SimpleNamespace(sqlite_path=str(market_db_path)),
+            paper_trading=_config(tmp_path, database_path=str(pt_db_path), enabled=False),
+        )
+        monkeypatch.setattr(order_cli, "_load_settings", lambda: settings)
+
+        market_before = self._snapshot(market_db_path)
+        pt_before = self._snapshot(pt_db_path)
+
+        exit_code = order_cli.main([*argv, "--confirm"])
+
+        assert exit_code == 4
+        assert self._snapshot(market_db_path) == market_before
+        assert self._snapshot(pt_db_path) == pt_before
+
+
+# ==========================================================================
+# §17/§18 -- Carga única de configuración, con enabled=true
+# ==========================================================================
+
+class TestSettingsLoadedExactlyOnce:
+    def test_enabled_path_calls_load_settings_and_build_context_once(self, tmp_path, monkeypatch, capsys):
+        context = _context(tmp_path)
+        load_settings_calls = []
+        build_context_calls = []
+
+        def _spy_load_settings():
+            load_settings_calls.append(1)
+            return _fake_settings(enabled=True)
+
+        def _spy_build_context(settings):
+            build_context_calls.append(settings)
+            return context
+
+        monkeypatch.setattr(order_cli, "_load_settings", _spy_load_settings)
+        monkeypatch.setattr(order_cli, "_build_context", _spy_build_context)
+
+        exit_code = order_cli.main([
+            "accept", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY",
+            "--quantity", "0.1", "--confirm",
+        ])
+
+        assert exit_code == 0
+        assert len(load_settings_calls) == 1
+        assert len(build_context_calls) == 1
+
+    def test_disabled_path_calls_load_settings_exactly_once_and_never_builds(self, monkeypatch):
+        load_settings_calls = []
+
+        def _spy_load_settings():
+            load_settings_calls.append(1)
+            return _fake_settings(enabled=False)
+
+        def _fail(settings):
+            raise AssertionError("_build_context(settings) must not be called when disabled")
+
+        monkeypatch.setattr(order_cli, "_load_settings", _spy_load_settings)
+        monkeypatch.setattr(order_cli, "_build_context", _fail)
+
+        exit_code = order_cli.main([
+            "submit", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY",
+            "--quantity", "0.1", "--confirm",
+        ])
+
+        assert exit_code == 4
+        assert len(load_settings_calls) == 1
+
+    def test_without_confirm_never_calls_load_settings_at_all(self, monkeypatch):
+        def _fail():
+            raise AssertionError("_load_settings() must not be called without --confirm")
+
+        monkeypatch.setattr(order_cli, "_load_settings", _fail)
+        exit_code = order_cli.main([
+            "submit", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY", "--quantity", "0.1",
+        ])
+        assert exit_code == 5
+
+
+# ==========================================================================
+# §17 -- Con enabled=true, los cuatro comandos siguen funcionando
+# ==========================================================================
+
+class TestEnabledStillWorks:
+    def test_accept_still_works(self, tmp_path, monkeypatch, capsys):
+        context = _context(tmp_path)
+        _patch_context(monkeypatch, context)
+        exit_code = order_cli.main([
+            "accept", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY",
+            "--quantity", "0.1", "--confirm", "--format", "json",
+        ])
+        assert exit_code == 0
+        assert json.loads(capsys.readouterr().out)["approved"] is True
+
+    def test_submit_still_works(self, tmp_path, monkeypatch, capsys):
+        context = _context(tmp_path)
+        _patch_context(monkeypatch, context)
+        exit_code = order_cli.main([
+            "submit", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY",
+            "--quantity", "0.1", "--confirm", "--format", "json",
+        ])
+        assert exit_code == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "FILLED"
+
+    def test_fill_still_works(self, tmp_path, monkeypatch, capsys):
+        context = _context(tmp_path)
+        _patch_context(monkeypatch, context)
+        order_cli.main([
+            "accept", "--exchange", "Binance", "--symbol", "BTCUSDT", "--side", "BUY",
+            "--quantity", "0.1", "--confirm",
+        ])
+        capsys.readouterr()
+        exit_code = order_cli.main(["fill", "--order-id", "order-1", "--confirm", "--format", "json"])
+        assert exit_code == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "FILLED"
 
 
 # ==========================================================================

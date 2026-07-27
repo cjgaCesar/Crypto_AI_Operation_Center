@@ -540,6 +540,13 @@ ninguna operación. Solo MARKET, solo posiciones LONG. Ver
 PostgreSQL (`postgres_repository.py`) y el backup/restauración de la
 base SQLite siguen pendientes, como fases futuras independientes -- el
 proyecto no se declara listo para producción ni para Live Trading.
+**Etapa 6.19.1**: `order_cli.py` ahora comprueba
+`paper_trading.enabled` inmediatamente después de cargar la
+configuración y **antes** de inicializar cualquier repositorio -- con
+`enabled: false`, los cuatro subcomandos devuelven el código 4 sin
+crear ni modificar ninguna base SQLite (ni la de mercado ni la de
+Paper Trading), sin importar si `--order-id` existe. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §34.12](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para

@@ -49,10 +49,26 @@ aceptación" (§21.3): nunca recalcula el precio de la orden que llena.
 
 Confirmación obligatoria: los cuatro subcomandos escriben o pueden
 escribir estado de negocio (simulado). Sin `--confirm`, esta CLI no
-construye ningún contexto, no llama a `load_settings()`, no consulta
-ningún precio, no genera ningún id y no ejecuta ninguna operación --
-devuelve el código de confirmación requerida antes de cualquier otro
-efecto. Nunca usa `input()`: es automatizable, no interactiva.
+carga configuración, no construye ningún contexto, no consulta ningún
+precio, no genera ningún id y no ejecuta ninguna operación -- devuelve
+el código de confirmación requerida antes de cualquier otro efecto.
+Nunca usa `input()`: es automatizable, no interactiva.
+
+Gate temprano de habilitación (Etapa 6.19.1): `--confirm` se valida
+antes de cargar configuración; `load_settings()` se llama exactamente
+una vez, y `paper_trading.enabled` se comprueba inmediatamente después
+-- antes de instanciar `SQLiteMarketDataRepository`, de llamar a su
+`init()`, de construir `RepositoryMarketPriceProvider`, de llamar a
+`build_paper_trading_context()` (que a su vez inicializa el
+repositorio de Paper Trading y siembra el capital inicial), y antes de
+construir `SystemClock`/`UUIDIdGenerator`. Con `enabled=false`, ninguno
+de esos colaboradores se instancia: los cuatro subcomandos devuelven el
+código 4 sin crear ni modificar ninguna base SQLite, sin importar si
+`--order-id` existe o no. `PaperTradingApplication._require_enabled()`
+(Etapa 6.5) sigue intacta y sin invocarse en el camino feliz: es una
+segunda defensa de dominio para cualquier otro caller, nunca modificada
+por esta etapa -- el gate de la CLI evita efectos operativos previos,
+el de la aplicación protege el propio caso de uso.
 
 Alcance: solo MARKET, solo posiciones LONG (una SELL reduce/cierra una
 posición LONG existente; nunca abre ni aumenta un SHORT). Sin
@@ -76,7 +92,7 @@ from src.paper_trading.enums import OrderSide
 from src.paper_trading.exceptions import InvalidOrderStateError, PaperTradingDomainError
 from src.paper_trading.price_provider import RepositoryMarketPriceProvider
 from src.paper_trading.runtime import SystemClock, UUIDIdGenerator
-from src.utils.config import load_settings
+from src.utils.config import Settings, load_settings
 
 EXIT_OK = 0
 EXIT_ARGUMENT_ERROR = 2
@@ -109,12 +125,27 @@ class ConfigurationError(Exception):
 
 
 # --------------------------------------------------------------------------
-# Construcción del contexto (Composition Root existente, sin modificar)
+# Configuración y construcción del contexto (Composition Root existente,
+# sin modificar) -- Etapa 6.19.1: separados a propósito para poder
+# comprobar `settings.paper_trading.enabled` ANTES de instanciar
+# cualquier colaborador con efectos secundarios (ver §7 del ticket).
 # --------------------------------------------------------------------------
 
-def _build_context() -> PaperTradingContext:
-    """Construye el `PaperTradingContext` real, igual patrón que
-    `reconciliation_cli.py`/`inspection_cli.py`: `load_settings()` +
+def _load_settings() -> Settings:
+    """Única llamada a `load_settings()` de todo el ciclo de vida de un
+    comando (§18 del ticket: nunca se recarga)."""
+    try:
+        return load_settings()
+    except Exception:
+        raise ConfigurationError(
+            "Could not load configuration to build the Paper Trading context."
+        ) from None
+
+
+def _build_context(settings: Settings) -> PaperTradingContext:
+    """Construye el `PaperTradingContext` real a partir de un `Settings`
+    ya cargado (nunca vuelve a llamar `load_settings()`), igual patrón
+    de colaboradores que `reconciliation_cli.py`/`inspection_cli.py`:
     `build_paper_trading_context()`, con `SystemClock`/`UUIDIdGenerator`
     reales. A diferencia de esas dos CLIs (que nunca consultan un
     precio), `accept`/`fill`/`submit` sí pueden necesitar uno real -- se
@@ -124,14 +155,14 @@ def _build_context() -> PaperTradingContext:
     proyecto abre su propia conexión por operación; instanciar otro
     apuntando al mismo archivo es seguro, mismo criterio ya documentado
     en `src/main.py`).
-    """
-    try:
-        settings = load_settings()
-    except Exception:
-        raise ConfigurationError(
-            "Could not load configuration to build the Paper Trading context."
-        ) from None
 
+    Solo debe llamarse una vez `settings.paper_trading.enabled` ya se
+    confirmó `True` (ver `main()`): esta función, por sí sola, no repite
+    esa comprobación -- instancia `SQLiteMarketDataRepository`, la
+    inicializa, y construye el contexto completo (que a su vez
+    inicializa el repositorio de Paper Trading y siembra el capital
+    inicial) incondicionalmente.
+    """
     market_repository = SQLiteMarketDataRepository(settings.database.sqlite_path)
     market_repository.init()
 
@@ -432,21 +463,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_format = getattr(args, "format", "table")
     confirmed = getattr(args, "confirm", False)
 
-    # §15/§31: la confirmación se valida antes de construir cualquier
-    # dependencia -- ni load_settings(), ni el contexto, ni el precio,
-    # ni ningún id se generan si falta --confirm.
+    # §15/§31 (Etapa 6.19) y §16 (Etapa 6.19.1): la confirmación se valida
+    # antes de cargar configuración -- ni load_settings(), ni enabled, ni
+    # el contexto, ni el precio, ni ningún id se generan si falta --confirm.
     if not confirmed:
         print(_CONFIRMATION_MESSAGE, file=sys.stderr)
         return EXIT_CONFIRMATION_REQUIRED
 
-    context: Optional[PaperTradingContext] = None
     try:
-        context = _build_context()
-        payload = _run_command(context, args)
+        settings = _load_settings()
     except ConfigurationError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG_ERROR
+
+    # Gate temprano de habilitación (Etapa 6.19.1, §7): se comprueba
+    # inmediatamente después de cargar la configuración -- antes de
+    # SQLiteMarketDataRepository/su init()/RepositoryMarketPriceProvider/
+    # build_paper_trading_context()/SystemClock/UUIDIdGenerator. Con
+    # enabled=false ninguno de esos colaboradores llega a instanciarse,
+    # así que los cuatro subcomandos terminan aquí sin ninguna
+    # inicialización ni escritura SQLite, sin importar --order-id.
+    if not settings.paper_trading.enabled:
+        print(_DISABLED_MESSAGE, file=sys.stderr)
+        return EXIT_DISABLED
+
+    context: Optional[PaperTradingContext] = None
+    try:
+        context = _build_context(settings)
+        payload = _run_command(context, args)
     except PaperTradingDisabledError:
+        # Defensa adicional del dominio (PaperTradingApplication.
+        # _require_enabled(), Etapa 6.5, sin modificar): en el camino
+        # normal es inalcanzable porque el gate temprano de arriba ya
+        # filtró enabled=false, pero se conserva como "defense in depth"
+        # (§20 del ticket) para cualquier otro caller futuro.
         print(_DISABLED_MESSAGE, file=sys.stderr)
         return EXIT_DISABLED
     except InvalidOrderStateError as exc:

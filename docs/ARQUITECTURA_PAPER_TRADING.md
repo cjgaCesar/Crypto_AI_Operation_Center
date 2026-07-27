@@ -4879,3 +4879,64 @@ fuera de esta etapa. No expone ningún subcomando `init`: la
 inicialización (creación de tablas, siembra del capital inicial) sigue
 siendo responsabilidad exclusiva de `build_paper_trading_context()`,
 igual que en `reconciliation_cli.py`/`inspection_cli.py`.
+
+### 34.12 Gate temprano de habilitación — Etapa 6.19.1
+
+> **Defecto corregido**: la auditoría posterior a la Etapa 6.19 detectó
+> que, tras validar `--confirm`, `main()` construía el contexto completo
+> (`SQLiteMarketDataRepository` + su `init()`,
+> `RepositoryMarketPriceProvider`, `build_paper_trading_context()` --
+> que a su vez llama `SQLitePaperTradingRepository.init()` y siembra el
+> `CashBalance` inicial) **antes** de que
+> `PaperTradingApplication._require_enabled()` tuviera oportunidad de
+> rechazar la operación. Con `paper_trading.enabled: false`, esto
+> significaba que la CLI podía crear ambas bases SQLite (mercado y
+> Paper Trading), sus tablas y el balance inicial, para terminar
+> igualmente devolviendo el código 4 -- una inicialización con efectos
+> reales que el contrato de "sin escritura cuando está deshabilitado"
+> no permitía.
+
+**Orden de preflight obligatorio, de principio a fin:**
+
+1. Parsear argumentos (`argparse`).
+2. Validar `--confirm` -- sin él, código 5, nada más ocurre.
+3. `_load_settings()` -- única llamada a `load_settings()` de todo el
+   ciclo de vida del comando (nunca se recarga).
+4. Comprobar `settings.paper_trading.enabled` -- si es `false`, código
+   4, mensaje `"Paper Trading is disabled in configuration."`, sin
+   construir ningún colaborador.
+5. Solo si `enabled=true`: `_build_context(settings)` (instancia
+   `SQLiteMarketDataRepository`, lo inicializa, construye
+   `RepositoryMarketPriceProvider`, llama a
+   `build_paper_trading_context()` con `SystemClock`/`UUIDIdGenerator`
+   reales) y ejecuta el subcomando.
+
+**Separación de responsabilidades**: `_build_context()` (Etapa 6.19) se
+dividió en `_load_settings() -> Settings` y
+`_build_context(settings: Settings) -> PaperTradingContext` -- la
+segunda función ya no llama `load_settings()` internamente, así que
+`main()` puede intercalar la comprobación de `enabled` entre ambas
+sin recargar la configuración.
+
+**Resultado observable**: con `enabled=false`, ninguno de estos
+colaboradores llega a instanciarse: `SQLiteMarketDataRepository`,
+`RepositoryMarketPriceProvider`, `SystemClock`, `UUIDIdGenerator`,
+`build_paper_trading_context()` (y, por lo tanto, tampoco
+`SQLitePaperTradingRepository.init()` ni `seed_initial_cash_balance()`).
+Los cuatro subcomandos (`accept`/`fill`/`cancel`/`submit`) terminan en
+el código 4 sin crear ni modificar ningún archivo SQLite -- verificado
+con bases inexistentes (ningún archivo ni directorio nuevo aparece) y
+con bases ya existentes (schema y filas exactamente iguales antes y
+después), y sin depender de si `--order-id` existe o no.
+
+**Defense in depth (§20 del ticket)**: el gate de la CLI y
+`PaperTradingApplication._require_enabled()` (Etapa 6.5, sin modificar
+en esta etapa) son complementarios, no redundantes -- el primero evita
+inicialización/escritura SQLite previa a cualquier caso de uso; el
+segundo sigue protegiendo el propio caso de uso para cualquier otro
+caller que construya un `PaperTradingContext` con
+`paper_trading.enabled=false` sin pasar por este gate (ej. un script
+que reutilice `PaperTradingApplication` directamente). `main()` sigue
+capturando `PaperTradingDisabledError` como una defensa adicional,
+aunque en el camino normal de esta CLI es inalcanzable porque el gate
+temprano ya filtró ese caso.
