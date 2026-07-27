@@ -634,60 +634,88 @@ def _add_limit_argument(parser: argparse.ArgumentParser) -> None:
 # Punto de entrada
 # --------------------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="python -m src.paper_trading.portfolio_cli",
-        description="CLI operativa y estrictamente de solo lectura para consultar el estado de Paper Trading.",
-    )
+def _build_common_parser() -> argparse.ArgumentParser:
+    """Argumentos globales (`--database-path`/`--format`), compartidos
+    entre el parser raíz y cada uno de los once subparsers (Etapa
+    6.18.1, §5/§6): permite que ambos se acepten tanto antes como
+    después del subcomando.
+
+    `argument_default=argparse.SUPPRESS`: ningún atributo se agrega al
+    Namespace si el usuario no proporcionó el argumento -- ni aquí ni
+    en el subparser. Esto evita que el default del subparser
+    sobrescriba silenciosamente un valor ya reconocido por el parser
+    raíz (§7); los defaults reales (`table`/`None`) se aplican una
+    sola vez, después de `parse_args()`, con `getattr(args, ..., default)`.
+    """
+    parser = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
     parser.add_argument(
-        "--database-path", dest="database_path", default=None,
+        "--database-path", dest="database_path",
         help="Ruta al archivo SQLite. Si se omite, se reutiliza paper_trading.database_path de la configuración.",
     )
     parser.add_argument(
-        "--format", dest="format", choices=["table", "json"], default="table",
+        "--format", dest="format", choices=["table", "json"],
         help="Formato de salida (default: table).",
+    )
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common_parser = _build_common_parser()
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.paper_trading.portfolio_cli",
+        description="CLI operativa y estrictamente de solo lectura para consultar el estado de Paper Trading.",
+        parents=[common_parser],
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("summary", help="Resumen general de la cuenta (solo lectura).")
+    subparsers.add_parser(
+        "summary", parents=[common_parser], help="Resumen general de la cuenta (solo lectura).",
+    )
 
-    balances_parser = subparsers.add_parser("balances", help="Balances de efectivo por moneda.")
+    balances_parser = subparsers.add_parser(
+        "balances", parents=[common_parser], help="Balances de efectivo por moneda.",
+    )
     _add_limit_argument(balances_parser)
 
-    positions_parser = subparsers.add_parser("positions", help="Posiciones actuales.")
+    positions_parser = subparsers.add_parser("positions", parents=[common_parser], help="Posiciones actuales.")
     positions_parser.add_argument("--exchange", default=None)
     positions_parser.add_argument("--symbol", default=None)
     positions_parser.add_argument("--status", choices=["open", "flat", "all"], default="all")
     _add_limit_argument(positions_parser)
 
-    orders_parser = subparsers.add_parser("orders", help="Órdenes.")
+    orders_parser = subparsers.add_parser("orders", parents=[common_parser], help="Órdenes.")
     orders_parser.add_argument("--exchange", default=None)
     orders_parser.add_argument("--symbol", default=None)
     orders_parser.add_argument("--status", type=_enum_choice_type(OrderStatus, "--status"), default=None)
     orders_parser.add_argument("--source", type=_enum_choice_type(OrderSource, "--source"), default=None)
     _add_limit_argument(orders_parser)
 
-    executions_parser = subparsers.add_parser("executions", help="Ejecuciones (fills).")
+    executions_parser = subparsers.add_parser("executions", parents=[common_parser], help="Ejecuciones (fills).")
     executions_parser.add_argument("--order-id", dest="order_id", default=None)
     executions_parser.add_argument("--exchange", default=None)
     executions_parser.add_argument("--symbol", default=None)
     _add_limit_argument(executions_parser)
 
-    trades_parser = subparsers.add_parser("trades", help="Trades cerrados.")
+    trades_parser = subparsers.add_parser("trades", parents=[common_parser], help="Trades cerrados.")
     trades_parser.add_argument("--exchange", default=None)
     trades_parser.add_argument("--symbol", default=None)
     _add_limit_argument(trades_parser)
 
-    snapshots_parser = subparsers.add_parser("snapshots", help="Snapshots de cartera o de PnL.")
+    snapshots_parser = subparsers.add_parser(
+        "snapshots", parents=[common_parser], help="Snapshots de cartera o de PnL.",
+    )
     snapshots_parser.add_argument("--type", dest="snapshot_type", choices=["portfolio", "pnl"], required=True)
     _add_limit_argument(snapshots_parser)
 
-    inspections_parser = subparsers.add_parser("inspections", help="Corridas de inspección.")
+    inspections_parser = subparsers.add_parser(
+        "inspections", parents=[common_parser], help="Corridas de inspección.",
+    )
     inspections_parser.add_argument("--status", choices=["success", "failed"], default=None)
     _add_limit_argument(inspections_parser)
 
-    alerts_parser = subparsers.add_parser("alerts", help="Alertas de inspección.")
+    alerts_parser = subparsers.add_parser("alerts", parents=[common_parser], help="Alertas de inspección.")
     alerts_parser.add_argument("--status", type=_enum_choice_type(AlertStatus, "--status"), default=None)
     alerts_parser.add_argument("--type", dest="alert_type", type=_enum_choice_type(AlertType, "--type"), default=None)
     alerts_parser.add_argument(
@@ -695,13 +723,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_limit_argument(alerts_parser)
 
-    deliveries_parser = subparsers.add_parser("deliveries", help="Estado de entrega por canal.")
+    deliveries_parser = subparsers.add_parser(
+        "deliveries", parents=[common_parser], help="Estado de entrega por canal.",
+    )
     deliveries_parser.add_argument("--alert-id", dest="alert_id", default=None)
     deliveries_parser.add_argument("--status", type=_enum_choice_type(AlertStatus, "--status"), default=None)
     deliveries_parser.add_argument("--channel", default=None)
     _add_limit_argument(deliveries_parser)
 
-    audits_parser = subparsers.add_parser("reconciliation-audits", help="Auditorías de reconciliación.")
+    audits_parser = subparsers.add_parser(
+        "reconciliation-audits", parents=[common_parser], help="Auditorías de reconciliación.",
+    )
     audits_parser.add_argument("--run-id", dest="run_id", default=None)
     audits_parser.add_argument("--status", choices=["success", "failure"], default=None)
     _add_limit_argument(audits_parser)
@@ -794,8 +826,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Etapa 6.18.1 (§7): --database-path/--format usan argument_default=SUPPRESS
+    # en el parser compartido (ver _build_common_parser()) para que el
+    # default del subparser nunca sobrescriba un valor ya reconocido por
+    # el parser raíz (o viceversa) -- el atributo puede estar
+    # directamente ausente del Namespace si el usuario nunca lo dio, ni
+    # antes ni después del subcomando. Los defaults reales se aplican
+    # aquí, una sola vez, después de parse_args().
+    explicit_database_path = getattr(args, "database_path", None)
+    output_format = getattr(args, "format", "table")
+
     try:
-        database_path = _resolve_database_path(args.database_path)
+        database_path = _resolve_database_path(explicit_database_path)
     except ConfigurationError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG_ERROR
@@ -818,7 +860,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         conn.close()
 
-    if args.format == "json":
+    if output_format == "json":
         print(render_json(result))
     elif args.command == "summary":
         print(render_key_value(result))

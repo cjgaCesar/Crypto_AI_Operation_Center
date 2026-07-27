@@ -956,3 +956,283 @@ class TestIsolation:
         }
         overlap = call_names & forbidden_calls
         assert not overlap, f"forbidden calls found in AST: {overlap}"
+
+
+class TestGlobalArgumentPosition:
+    """Etapa 6.18.1: `--database-path`/`--format` deben aceptarse tanto
+    antes como después del subcomando, con el mismo comportamiento
+    observable en ambos casos."""
+
+    def _seed_pending_order(self, repo):
+        repo.save_order(Order(
+            id="order-1", exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, order_type=OrderType.MARKET,
+            quantity=Decimal("0.1"), status=OrderStatus.PENDING, source=OrderSource.MANUAL,
+            created_at=_now(), updated_at=_now(),
+        ))
+
+    # --- §11: main(), summary sin opciones propias --------------------
+
+    def test_globals_before_subcommand(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        exit_code = portfolio_cli.main([
+            "--database-path", repo.db_path, "--format", "json", "summary",
+        ])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        payload = json.loads(captured.out)
+        assert payload["currency"] == "USDT"
+        assert captured.err == ""
+
+    def test_globals_after_subcommand(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        exit_code = portfolio_cli.main([
+            "summary", "--database-path", repo.db_path, "--format", "json",
+        ])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        payload = json.loads(captured.out)
+        assert payload["currency"] == "USDT"
+        assert captured.err == ""
+
+    def test_both_positions_produce_equivalent_output(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        self._seed_pending_order(repo)
+
+        portfolio_cli.main(["--database-path", repo.db_path, "--format", "json", "summary"])
+        output_before = capsys.readouterr().out
+
+        portfolio_cli.main(["summary", "--database-path", repo.db_path, "--format", "json"])
+        output_after = capsys.readouterr().out
+
+        assert json.loads(output_before) == json.loads(output_after)
+
+    # --- §12: comando con opciones propias (orders) --------------------
+
+    def test_globals_after_subcommand_with_own_options(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        self._seed_pending_order(repo)
+        repo.save_order(Order(
+            id="order-2", exchange="Binance", symbol="BTCUSDT", side=OrderSide.BUY, order_type=OrderType.MARKET,
+            quantity=Decimal("0.1"), status=OrderStatus.FILLED, filled_quantity=Decimal("0.1"),
+            average_fill_price=Decimal("50000"), source=OrderSource.MANUAL, created_at=_now(), updated_at=_now(),
+        ))
+
+        exit_code = portfolio_cli.main([
+            "orders", "--database-path", repo.db_path, "--format", "json", "--status", "PENDING", "--limit", "20",
+        ])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert captured.err == ""
+        payload = json.loads(captured.out)
+        assert len(payload) <= 20
+        assert all(order["status"] == "PENDING" for order in payload)
+        assert [order["id"] for order in payload] == ["order-1"]
+
+    def test_globals_before_subcommand_with_own_options_is_equivalent(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        self._seed_pending_order(repo)
+
+        portfolio_cli.main([
+            "orders", "--database-path", repo.db_path, "--format", "json", "--status", "PENDING", "--limit", "20",
+        ])
+        output_after = capsys.readouterr().out
+
+        portfolio_cli.main([
+            "--database-path", repo.db_path, "--format", "json", "orders", "--status", "PENDING", "--limit", "20",
+        ])
+        output_before = capsys.readouterr().out
+
+        assert json.loads(output_before) == json.loads(output_after)
+
+    # --- §13: formato por defecto (table) en ambas posiciones ----------
+
+    def test_default_format_is_table_when_globals_after_subcommand(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        exit_code = portfolio_cli.main(["summary", "--database-path", repo.db_path])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(captured.out)
+        assert "currency: USDT" in captured.out
+
+    def test_default_format_is_table_when_globals_before_subcommand(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        exit_code = portfolio_cli.main(["--database-path", repo.db_path, "summary"])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(captured.out)
+        assert "currency: USDT" in captured.out
+
+    # --- §14: resolución de configuración, en ambas posiciones ---------
+
+    def test_explicit_path_after_subcommand_never_calls_load_settings(self, tmp_path, monkeypatch):
+        repo = _repo(tmp_path)
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("load_settings() must not be called when --database-path is explicit.")
+
+        monkeypatch.setattr("src.utils.config.load_settings", _fail)
+        exit_code = portfolio_cli.main(["summary", "--database-path", repo.db_path])
+        assert exit_code == 0
+
+    def test_explicit_path_before_subcommand_never_calls_load_settings(self, tmp_path, monkeypatch):
+        repo = _repo(tmp_path)
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("load_settings() must not be called when --database-path is explicit.")
+
+        monkeypatch.setattr("src.utils.config.load_settings", _fail)
+        exit_code = portfolio_cli.main(["--database-path", repo.db_path, "summary"])
+        assert exit_code == 0
+
+    # --- §15: subprocess real ------------------------------------------
+
+    def test_subprocess_summary_globals_after_subcommand(self, tmp_path):
+        repo = _repo(tmp_path)
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "src.paper_trading.portfolio_cli",
+                "summary", "--database-path", repo.db_path, "--format", "json",
+            ],
+            capture_output=True, text=True, cwd=".",
+        )
+        assert result.returncode == 0
+        assert result.stderr == ""
+        payload = json.loads(result.stdout)
+        assert payload["currency"] == "USDT"
+
+    def test_subprocess_orders_globals_after_subcommand_with_own_options(self, tmp_path):
+        repo = _repo(tmp_path)
+        self._seed_pending_order(repo)
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "src.paper_trading.portfolio_cli",
+                "orders", "--database-path", repo.db_path, "--format", "json",
+                "--status", "PENDING", "--limit", "20",
+            ],
+            capture_output=True, text=True, cwd=".",
+        )
+        assert result.returncode == 0
+        assert result.stderr == ""
+        payload = json.loads(result.stdout)
+        assert [order["id"] for order in payload] == ["order-1"]
+
+    # --- §16: errores de argumentos, en ambas posiciones ----------------
+
+    def test_invalid_format_after_subcommand_exits_2(self, tmp_path):
+        repo = _repo(tmp_path)
+        with pytest.raises(SystemExit) as exc_info:
+            portfolio_cli.main(["summary", "--database-path", repo.db_path, "--format", "xml"])
+        assert exc_info.value.code == 2
+
+    def test_invalid_limit_zero_after_subcommand_exits_2(self, tmp_path):
+        repo = _repo(tmp_path)
+        with pytest.raises(SystemExit) as exc_info:
+            portfolio_cli.main(["orders", "--database-path", repo.db_path, "--limit", "0"])
+        assert exc_info.value.code == 2
+
+    def test_invalid_limit_over_maximum_after_subcommand_exits_2(self, tmp_path):
+        repo = _repo(tmp_path)
+        with pytest.raises(SystemExit) as exc_info:
+            portfolio_cli.main(["orders", "--database-path", repo.db_path, "--limit", "1001"])
+        assert exc_info.value.code == 2
+
+    def test_invalid_status_before_subcommand_exits_2(self, tmp_path):
+        repo = _repo(tmp_path)
+        with pytest.raises(SystemExit) as exc_info:
+            portfolio_cli.main(["--database-path", repo.db_path, "orders", "--status", "INVALID"])
+        assert exc_info.value.code == 2
+
+    # --- §8: argumentos duplicados: el último valor gana ----------------
+
+    def test_duplicated_format_last_value_wins(self, tmp_path, capsys):
+        repo = _repo(tmp_path)
+        exit_code = portfolio_cli.main([
+            "--format", "table", "summary", "--database-path", repo.db_path, "--format", "json",
+        ])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        payload = json.loads(captured.out)  # si "table" hubiera ganado, esto lanzaría JSONDecodeError
+        assert payload["currency"] == "USDT"
+
+    def test_duplicated_database_path_last_value_wins(self, tmp_path, capsys):
+        repo_a = _repo(tmp_path / "a")
+        (tmp_path / "b").mkdir()
+        repo_b_path = str(tmp_path / "b" / "test.db")
+        repo_b = SQLitePaperTradingRepository(repo_b_path)
+        repo_b.init()
+        repo_b.save_cash_balance(CashBalance(
+            currency="EUR", total_balance=Decimal("1"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+
+        exit_code = portfolio_cli.main([
+            "--database-path", repo_a.db_path, "balances", "--database-path", repo_b_path, "--format", "json",
+        ])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        payload = json.loads(captured.out)
+        assert [b["currency"] for b in payload] == ["EUR"]  # repo_b (el último valor) ganó
+
+    # --- §10: ayuda principal y por subcomando --------------------------
+
+    def test_subcommand_help_includes_global_arguments(self, capsys):
+        with pytest.raises(SystemExit):
+            portfolio_cli.main(["orders", "--help"])
+        output = capsys.readouterr().out
+        assert "--database-path" in output
+        assert "--format" in output
+        assert "--status" in output
+        assert "--source" in output
+        assert "--limit" in output
+        assert "--exchange" in output
+        assert "--symbol" in output
+
+    def test_main_help_includes_global_arguments(self, capsys):
+        with pytest.raises(SystemExit):
+            portfolio_cli.main(["--help"])
+        output = capsys.readouterr().out
+        assert "--database-path" in output
+        assert "--format" in output
+
+
+class TestReadOnlyGuaranteesAfterParserFix:
+    """Etapa 6.18.1, §17: la corrección del parser no debe alterar
+    ninguna garantía read-only -- reconfirmación puntual usando la
+    nueva posición (globales después del subcomando)."""
+
+    def test_missing_database_still_exits_4_with_globals_after_subcommand(self, tmp_path):
+        db_path = tmp_path / "missing.db"
+        exit_code = portfolio_cli.main(["summary", "--database-path", str(db_path)])
+        assert exit_code == 4
+        assert not db_path.exists()
+
+    def test_readonly_connection_still_rejects_writes(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("1"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+        conn = portfolio_cli._open_readonly_connection(repo.db_path)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute(
+                    "INSERT INTO paper_trading_cash_balances (currency, total_balance, reserved_balance, updated_at) "
+                    "VALUES ('EUR', '1', '0', '2026-01-01T00:00:00+00:00')"
+                )
+        finally:
+            conn.close()
+
+    def test_no_write_guarantee_with_globals_after_subcommand(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("100"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+        before = repo.fetch_cash_balances()
+
+        for command in [
+            ["summary"], ["balances"], ["orders"], ["positions", "--status", "open"],
+        ]:
+            portfolio_cli.main([*command, "--database-path", repo.db_path, "--format", "json"])
+
+        after = repo.fetch_cash_balances()
+        assert before == after

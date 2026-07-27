@@ -4621,6 +4621,31 @@ ante un argumento inválido -- comportamiento nativo de la biblioteca
 estándar, coherente con el código 2 ya definido). Sin `input()`
 interactivo, sin menús, sin color ANSI obligatorio.
 
+**Posición de `--database-path`/`--format` (Etapa 6.18.1):** ambos son
+argumentos globales y se aceptan tanto **antes** como **después** del
+subcomando -- las dos formas siguientes son equivalentes:
+
+```
+python -m src.paper_trading.portfolio_cli --database-path data/paper_trading.db --format json summary
+python -m src.paper_trading.portfolio_cli summary --database-path data/paper_trading.db --format json
+```
+
+Implementación: un parser padre compartido (`_build_common_parser()`,
+`add_help=False`, `argument_default=argparse.SUPPRESS`) se pasa como
+`parents=[...]` tanto al parser raíz como a cada uno de los once
+subparsers. `argument_default=SUPPRESS` evita que el default de un
+subparser sobrescriba silenciosamente un valor ya reconocido en el
+parser raíz (o viceversa): si el usuario nunca da el argumento, el
+atributo queda directamente ausente del `Namespace` en vez de recibir
+un valor por defecto duplicado; los defaults reales (`format="table"`,
+`database_path=None`) se aplican una única vez, después de
+`parse_args()`, con `getattr(args, "database_path", None)`/
+`getattr(args, "format", "table")`. Si el mismo argumento se repite
+(antes y después del subcomando, o dos veces en la misma posición), el
+**último valor gana** -- comportamiento nativo de `argparse` al
+compartir el mismo `Namespace` entre el parser raíz y el subparser, sin
+ninguna validación manual agregada.
+
 ### 33.4 Subcomandos
 
 `summary`, `balances`, `positions`, `orders`, `executions`, `trades`,

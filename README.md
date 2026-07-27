@@ -522,6 +522,10 @@ contención, reinicio e integridad. Ver
 formatos `table`/`json`) -- **estrictamente de solo lectura**: abre
 SQLite en modo real `mode=ro`, nunca crea la base ni escribe nada. Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §33](docs/ARQUITECTURA_PAPER_TRADING.md).
+**Etapa 6.18.1**: `--database-path`/`--format` ahora se aceptan tanto
+antes como después del subcomando (ambas formas son equivalentes):
+`portfolio_cli --database-path db.sqlite --format json summary` y
+`portfolio_cli summary --database-path db.sqlite --format json`.
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para
