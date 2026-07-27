@@ -19,6 +19,7 @@ por dobles de prueba)."""
 
 import inspect
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -290,45 +291,115 @@ class TestNoInternalRetriesContract:
         assert len(transport.calls) == 1
 
 
+_SENSITIVE_EXCEPTION_TEXT = (
+    "token=SECRET-ABC123 "
+    "password=hunter2 "
+    "url=https://secret.example/hook "
+    "Authorization=Bearer TOP-SECRET"
+)
+
+
 class TestUnexpectedFailureSanitization:
-    """§31, punto 18: un fake transport que lanza una excepción con
-    contenido sensible y muy largo nunca debe filtrarse ni exceder
-    MAX_DELIVERY_ERROR_LENGTH."""
+    """§31.x (Etapa 6.16.1): una excepción inesperada (RuntimeError,
+    ValueError, TypeError, KeyError, Exception genérica -- nunca uno de
+    los cuatro `*TransportError` controlados) jamás expone `str(exc)`/
+    `repr(exc)`/`exc.args`/traceback -- se reemplaza siempre por
+    `"Unexpected failure in <ChannelClassName>."`, determinista y sin
+    ningún dato del origen real."""
 
-    _SENSITIVE_PAYLOAD = "token=SECRET-ABC123 password=hunter2-very-secret " + ("x" * 2000)
-
-    @pytest.mark.parametrize("name,transport_factory,channel_factory", [
-        ("TelegramNotificationChannel", lambda exc: FakeTelegramTransport(fail_times=1, raises=exc),
+    @pytest.mark.parametrize("channel_name,exception_cls,transport_factory,channel_factory", [
+        ("TelegramNotificationChannel", RuntimeError,
+         lambda exc: FakeTelegramTransport(fail_times=1, raises=exc),
          lambda t, clock: TelegramNotificationChannel(transport=t, clock=clock)),
-        ("SlackNotificationChannel", lambda exc: FakeSlackTransport(fail_times=1, raises=exc),
+        ("SlackNotificationChannel", ValueError,
+         lambda exc: FakeSlackTransport(fail_times=1, raises=exc),
          lambda t, clock: SlackNotificationChannel(transport=t, clock=clock)),
-        ("EmailNotificationChannel", lambda exc: FakeEmailTransport(fail_times=1, raises=exc),
+        ("EmailNotificationChannel", TypeError,
+         lambda exc: FakeEmailTransport(fail_times=1, raises=exc),
          lambda t, clock: EmailNotificationChannel(transport=t, clock=clock)),
-        ("WebhookNotificationChannel", lambda exc: FakeWebhookTransport(fail_times=1, raises=exc),
+        ("WebhookNotificationChannel", KeyError,
+         lambda exc: FakeWebhookTransport(fail_times=1, raises=exc),
          lambda t, clock: WebhookNotificationChannel(transport=t, clock=clock)),
     ])
-    def test_unexpected_exception_never_propagates_and_is_bounded(self, name, transport_factory, channel_factory):
-        exc = RuntimeError(self._SENSITIVE_PAYLOAD)
+    def test_unexpected_exception_never_propagates_and_is_fully_sanitized(
+        self, channel_name, exception_cls, transport_factory, channel_factory,
+    ):
+        exc = exception_cls(_SENSITIVE_EXCEPTION_TEXT)
         transport = transport_factory(exc)
         channel = channel_factory(transport, FixedClock(_now()))
         result = channel.deliver(_message())  # no debe lanzar
+
         assert result.success is False
         assert result.terminal is False
+        assert result.error_message
         assert len(result.error_message) <= MAX_DELIVERY_ERROR_LENGTH
 
-    def test_logging_channel_failure_is_controlled(self, monkeypatch):
+        assert "SECRET-ABC123" not in result.error_message
+        assert "hunter2" not in result.error_message
+        assert "secret.example" not in result.error_message
+        assert "TOP-SECRET" not in result.error_message
+        assert "Authorization" not in result.error_message
+
+        assert result.error_message == f"Unexpected failure in {channel_name}."
+
+    def test_logging_channel_failure_is_fully_sanitized(self, monkeypatch):
         import src.paper_trading.notification_channels as module
 
         channel = LoggingNotificationChannel(clock=FixedClock(_now()))
 
         def _raise(*args, **kwargs):
-            raise RuntimeError(self._SENSITIVE_PAYLOAD)
+            raise RuntimeError(_SENSITIVE_EXCEPTION_TEXT)
 
         monkeypatch.setattr(module.logger, "info", _raise)
         result = channel.deliver(_message())  # no debe lanzar
+
         assert result.success is False
         assert result.terminal is False
+        assert result.error_message
         assert len(result.error_message) <= MAX_DELIVERY_ERROR_LENGTH
+
+        assert "SECRET-ABC123" not in result.error_message
+        assert "hunter2" not in result.error_message
+        assert "secret.example" not in result.error_message
+        assert "TOP-SECRET" not in result.error_message
+        assert "Authorization" not in result.error_message
+
+        assert result.error_message == "Unexpected failure in LoggingNotificationChannel."
+
+
+class TestControlledTransportErrorsArePreserved:
+    """§31.x: un error controlado de transporte conserva su mensaje
+    exacto (información operativa útil), acotado solo por
+    MAX_DELIVERY_ERROR_LENGTH -- nunca reemplazado por el mensaje
+    genérico."""
+
+    @pytest.mark.parametrize("expected,transport_factory,channel_factory", [
+        ("Telegram API request failed (HTTP 500).",
+         lambda exc: FakeTelegramTransport(fail_times=1, raises=exc),
+         lambda t, clock: TelegramNotificationChannel(transport=t, clock=clock)),
+        ("Slack webhook returned an unsuccessful response.",
+         lambda exc: FakeSlackTransport(fail_times=1, raises=exc),
+         lambda t, clock: SlackNotificationChannel(transport=t, clock=clock)),
+        ("SMTP authentication failed.",
+         lambda exc: FakeEmailTransport(fail_times=1, raises=exc),
+         lambda t, clock: EmailNotificationChannel(transport=t, clock=clock)),
+        ("Webhook request failed (HTTP 400).",
+         lambda exc: FakeWebhookTransport(fail_times=1, raises=exc),
+         lambda t, clock: WebhookNotificationChannel(transport=t, clock=clock)),
+    ])
+    def test_controlled_error_message_is_preserved_exactly(self, expected, transport_factory, channel_factory):
+        error_classes = {
+            "Telegram API request failed (HTTP 500).": TelegramTransportError,
+            "Slack webhook returned an unsuccessful response.": SlackTransportError,
+            "SMTP authentication failed.": EmailTransportError,
+            "Webhook request failed (HTTP 400).": WebhookTransportError,
+        }
+        exc = error_classes[expected](expected)
+        transport = transport_factory(exc)
+        channel = channel_factory(transport, FixedClock(_now()))
+        result = channel.deliver(_message())
+        assert result.success is False
+        assert result.error_message == expected
 
 
 class TestSecretsNeverInRepresentationContract:
@@ -683,12 +754,45 @@ class TestErrorLengthLimitContract:
         ("WebhookNotificationChannel", lambda exc: FakeWebhookTransport(fail_times=1, raises=exc),
          lambda t, clock: WebhookNotificationChannel(transport=t, clock=clock)),
     ])
-    def test_huge_exception_message_is_truncated_deterministically(self, name, transport_factory, channel_factory):
+    def test_huge_unexpected_exception_produces_short_generic_message(self, name, transport_factory, channel_factory):
+        """Etapa 6.16.1 (§31.x): una excepción inesperada, sin importar
+        cuán larga sea, nunca se trunca desde su propio contenido -- se
+        descarta por completo y se reemplaza por el mensaje genérico
+        corto y determinista."""
         huge_message = "z" * 50000
         transport = transport_factory(RuntimeError(huge_message))
         channel = channel_factory(transport, FixedClock(_now()))
         result_1 = channel.deliver(_message())
         transport2 = transport_factory(RuntimeError(huge_message))
+        channel2 = channel_factory(transport2, FixedClock(_now()))
+        result_2 = channel2.deliver(_message())
+        assert result_1.error_message == result_2.error_message  # determinista
+        assert result_1.error_message == f"Unexpected failure in {name}."
+        assert len(result_1.error_message) <= MAX_DELIVERY_ERROR_LENGTH
+        assert huge_message not in result_1.error_message
+
+    @pytest.mark.parametrize("name,transport_factory,channel_factory,error_cls", [
+        ("TelegramNotificationChannel", lambda exc: FakeTelegramTransport(fail_times=1, raises=exc),
+         lambda t, clock: TelegramNotificationChannel(transport=t, clock=clock), TelegramTransportError),
+        ("SlackNotificationChannel", lambda exc: FakeSlackTransport(fail_times=1, raises=exc),
+         lambda t, clock: SlackNotificationChannel(transport=t, clock=clock), SlackTransportError),
+        ("EmailNotificationChannel", lambda exc: FakeEmailTransport(fail_times=1, raises=exc),
+         lambda t, clock: EmailNotificationChannel(transport=t, clock=clock), EmailTransportError),
+        ("WebhookNotificationChannel", lambda exc: FakeWebhookTransport(fail_times=1, raises=exc),
+         lambda t, clock: WebhookNotificationChannel(transport=t, clock=clock), WebhookTransportError),
+    ])
+    def test_huge_controlled_error_message_is_truncated_deterministically(
+        self, name, transport_factory, channel_factory, error_cls,
+    ):
+        """Un error controlado (`*TransportError`) inusualmente largo --
+        en la práctica los transportes solo producen mensajes estáticos
+        cortos, pero esto confirma el mecanismo de truncado en sí --
+        también respeta MAX_DELIVERY_ERROR_LENGTH, de forma determinista."""
+        huge_message = "z" * 50000
+        transport = transport_factory(error_cls(huge_message))
+        channel = channel_factory(transport, FixedClock(_now()))
+        result_1 = channel.deliver(_message())
+        transport2 = transport_factory(error_cls(huge_message))
         channel2 = channel_factory(transport2, FixedClock(_now()))
         result_2 = channel2.deliver(_message())
         assert len(result_1.error_message) == MAX_DELIVERY_ERROR_LENGTH
@@ -842,3 +946,133 @@ class TestFullIdempotencyAndRetryMatrix:
         assert len(slack_fake.calls) == 1
         assert len(email_fake.calls) == 3
         assert len(webhook_fake.calls) == 4
+
+
+class TestFormatterFailureSanitization:
+    """§31.x, punto 16: si un formatter/constructor de payload lanza una
+    excepción inesperada con contenido sensible, el resultado debe ser
+    genérico y nunca filtrar el contenido -- verificado inyectando la
+    excepción vía `unittest.mock.patch` sobre la función del módulo
+    (Python resuelve la referencia en tiempo de llamada, así que el
+    parche afecta a `deliver()` sin tocar su código)."""
+
+    def test_telegram_formatter_failure_is_sanitized(self):
+        import src.paper_trading.notification_channels as module
+
+        channel = TelegramNotificationChannel(transport=FakeTelegramTransport())
+        with patch.object(module, "_format_telegram_text", side_effect=RuntimeError(_SENSITIVE_EXCEPTION_TEXT)):
+            result = channel.deliver(_message())
+        assert result.success is False
+        assert result.error_message == "Unexpected failure in TelegramNotificationChannel."
+
+    def test_slack_formatter_failure_is_sanitized(self):
+        import src.paper_trading.notification_channels as module
+
+        channel = SlackNotificationChannel(transport=FakeSlackTransport())
+        with patch.object(module, "_format_slack_text", side_effect=RuntimeError(_SENSITIVE_EXCEPTION_TEXT)):
+            result = channel.deliver(_message())
+        assert result.success is False
+        assert result.error_message == "Unexpected failure in SlackNotificationChannel."
+
+    def test_email_subject_formatter_failure_is_sanitized(self):
+        import src.paper_trading.notification_channels as module
+
+        channel = EmailNotificationChannel(transport=FakeEmailTransport())
+        with patch.object(module, "_format_email_subject", side_effect=RuntimeError(_SENSITIVE_EXCEPTION_TEXT)):
+            result = channel.deliver(_message())
+        assert result.success is False
+        assert result.error_message == "Unexpected failure in EmailNotificationChannel."
+
+    def test_email_body_formatter_failure_is_sanitized(self):
+        import src.paper_trading.notification_channels as module
+
+        channel = EmailNotificationChannel(transport=FakeEmailTransport())
+        with patch.object(module, "_format_email_body", side_effect=RuntimeError(_SENSITIVE_EXCEPTION_TEXT)):
+            result = channel.deliver(_message())
+        assert result.success is False
+        assert result.error_message == "Unexpected failure in EmailNotificationChannel."
+
+    def test_webhook_payload_builder_failure_is_sanitized(self):
+        import src.paper_trading.notification_channels as module
+
+        channel = WebhookNotificationChannel(transport=FakeWebhookTransport())
+        with patch.object(module, "_build_webhook_payload", side_effect=RuntimeError(_SENSITIVE_EXCEPTION_TEXT)):
+            result = channel.deliver(_message())
+        assert result.success is False
+        assert result.error_message == "Unexpected failure in WebhookNotificationChannel."
+        for forbidden in ("SECRET-ABC123", "hunter2", "secret.example", "TOP-SECRET", "Authorization"):
+            assert forbidden not in result.error_message
+
+
+class TestCompositeDefensiveSanitization:
+    """§31.x, punto 17: un canal defectuoso que lanza directamente (en
+    vez de devolver su propio AlertDeliveryResult fallido, violando su
+    contrato) nunca debe filtrar contenido sensible a través de
+    CompositeNotificationChannel -- defensa en profundidad."""
+
+    class ExplodingChannel:
+        def deliver(self, message):
+            raise RuntimeError(_SENSITIVE_EXCEPTION_TEXT)
+
+    def test_exploding_channel_does_not_propagate_and_next_channel_still_runs(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-explode", deduplication_key="k-explode")
+        _seed_alert(repo, alert)
+
+        exploding = self.ExplodingChannel()
+        webhook_fake = FakeWebhookTransport()
+        webhook_channel = WebhookNotificationChannel(transport=webhook_fake, clock=FixedClock(_now()))
+
+        composite = CompositeNotificationChannel(
+            [exploding, webhook_channel], repository=repo, max_attempts=3, clock=FixedClock(_now()),
+        )
+        result = composite.deliver(_message(alert_id="alert-explode"))  # no debe lanzar
+
+        # El canal posterior se procesó igual.
+        assert len(webhook_fake.calls) == 1
+        webhook_state = repo.get_alert_channel_delivery("alert-explode", "WebhookNotificationChannel")
+        assert webhook_state.status == AlertStatus.DELIVERED
+
+        # El canal explosivo queda en un estado fallido según la política existente (PENDING, bajo max_attempts).
+        exploding_state = repo.get_alert_channel_delivery("alert-explode", "ExplodingChannel")
+        assert exploding_state.status == AlertStatus.PENDING
+        assert exploding_state.last_error is not None
+        assert len(exploding_state.last_error) <= MAX_DELIVERY_ERROR_LENGTH
+
+        for forbidden in ("SECRET-ABC123", "hunter2", "secret.example", "TOP-SECRET", "Authorization"):
+            assert forbidden not in exploding_state.last_error
+            assert forbidden not in result.error_message
+
+        assert result.success is False
+        assert len(result.error_message) <= MAX_DELIVERY_ERROR_LENGTH
+        assert exploding_state.last_error == "Unexpected failure in ExplodingChannel."
+
+
+class TestAlertDeliveryServiceDefensiveSanitization:
+    """§31.x, punto 18: un sink/canal defectuoso que lanza directamente
+    nunca debe filtrar contenido sensible a través de
+    AlertDeliveryService -- ni en el AlertDeliveryResult ni en
+    InspectionAlert.last_error persistido."""
+
+    class ExplodingSink:
+        def deliver(self, message):
+            raise RuntimeError(_SENSITIVE_EXCEPTION_TEXT)
+
+    def test_exploding_sink_result_and_persisted_alert_are_sanitized(self, tmp_path):
+        repo = _repo(tmp_path)
+        alert = _alert(id="alert-explode-service", deduplication_key="k-explode-service")
+        _seed_alert(repo, alert)
+
+        service = AlertDeliveryService(repo, self.ExplodingSink(), max_attempts=3, clock=FixedClock(_now()))
+        batch_result = service.deliver_pending_alerts()
+
+        assert batch_result.failed_count == 1
+        persisted = repo.get_inspection_alert_by_deduplication_key("k-explode-service")
+        assert persisted.status == AlertStatus.PENDING
+        assert persisted.last_error is not None
+        assert len(persisted.last_error) <= MAX_DELIVERY_ERROR_LENGTH
+
+        for forbidden in ("SECRET-ABC123", "hunter2", "secret.example", "TOP-SECRET", "Authorization"):
+            assert forbidden not in persisted.last_error
+
+        assert persisted.last_error == "Unexpected alert delivery failure."

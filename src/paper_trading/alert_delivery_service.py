@@ -46,17 +46,43 @@ lanzan directamente ahora pasa por `_truncate_delivery_error()`
 de convertirse en `AlertDeliveryResult` -- mismo límite que ya se
 aplica dentro de cada canal y de `CompositeNotificationChannel`, para
 que ningún `last_error` persistido pueda crecer sin límite.
+
+Etapa 6.16.1 (§31.x): corrige el hallazgo bloqueante de la 6.16 --
+truncar `str(exc)` acotaba la longitud, pero no sanitizaba el
+contenido. `_render_and_deliver()` (nuevo método privado, extraído de
+`deliver_pending_alerts()` para poder distinguir sus dos fuentes de
+fallo) separa explícitamente:
+
+- las dos validaciones de contrato que este propio servicio ya
+  controlaba (la plantilla no devuelve `NotificationMessage`, o
+  devuelve un `alert_id` que no corresponde a la alerta real): siguen
+  siendo mensajes estáticos y propios, nunca derivados de una
+  excepción externa -- se conservan tal cual (información operativa
+  útil, ya sanitizada por construcción);
+- cualquier excepción realmente inesperada de `template.render()` o de
+  `channel.deliver()` (que, por contrato, nunca deberían lanzar --
+  defensa en profundidad): se clasifica y sanitiza con
+  `_classify_and_sanitize()` (`notification_channels.py`) -- nunca
+  `str(exc)`/`repr(exc)`/`exc.args` directo. Solo un
+  `TelegramTransportError`/`SlackTransportError`/`EmailTransportError`/
+  `WebhookTransportError` (ya sanitizado en su propio transporte) se
+  conserva; cualquier otra excepción se reemplaza por el mensaje
+  genérico `"Unexpected alert delivery failure."`.
 """
 
 from typing import NamedTuple, Optional
 
-from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus
+from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, InspectionAlert
 from src.paper_trading.base import PaperTradingRepository
-from src.paper_trading.notification_channels import InspectionNotificationChannel, _truncate_delivery_error
+from src.paper_trading.notification_channels import (
+    InspectionNotificationChannel, _classify_and_sanitize, _truncate_delivery_error,
+)
 from src.paper_trading.notification_templates import (
     DefaultInspectionNotificationTemplate, InspectionNotificationTemplate, NotificationMessage,
 )
 from src.paper_trading.runtime import Clock, SystemClock
+
+_UNEXPECTED_DELIVERY_FAILURE_MESSAGE = "Unexpected alert delivery failure."
 
 
 class AlertDeliveryBatchResult(NamedTuple):
@@ -93,27 +119,7 @@ class AlertDeliveryService:
         failed_count = 0
 
         for alert in alerts:
-            try:
-                message = self._template.render(alert)
-                if not isinstance(message, NotificationMessage):
-                    raise TypeError(
-                        "InspectionNotificationTemplate.render() must return NotificationMessage."
-                    )
-                if message.alert_id != alert.id:
-                    raise ValueError("NotificationMessage.alert_id does not match InspectionAlert.id.")
-                result = self._channel.deliver(message)
-            except Exception as exc:
-                # Corrección Etapa 6.10.1 (§25.1), ampliada en 6.11.1 (§26.x):
-                # una excepción directa del canal, una excepción del template,
-                # un resultado de tipo incorrecto o un alert_id que no
-                # corresponde a la alerta real -- ninguno se descarta en
-                # silencio ni se propaga. Todos se tratan como cualquier otro
-                # fallo de entrega, con su propio registro y conteo de
-                # intentos; en ningún caso se llega a invocar el canal.
-                result = AlertDeliveryResult(
-                    success=False, error_message=_truncate_delivery_error(str(exc)),
-                    delivered_at=self._clock.now(), terminal=False,
-                )
+            result = self._render_and_deliver(alert)
 
             attempts = alert.delivery_attempts + 1
             try:
@@ -140,3 +146,60 @@ class AlertDeliveryService:
                 continue
 
         return AlertDeliveryBatchResult(delivered_count=delivered_count, failed_count=failed_count)
+
+    def _render_and_deliver(self, alert: InspectionAlert) -> AlertDeliveryResult:
+        """Construye el `NotificationMessage` vía la plantilla inyectada y
+        lo entrega vía el canal inyectado. Nunca propaga -- distingue
+        explícitamente (Etapa 6.16.1, §31.x) dos fuentes de fallo distintas:
+
+        - Las dos validaciones de contrato que este servicio ya controla
+          (la plantilla no devuelve `NotificationMessage`, o devuelve un
+          `alert_id` que no corresponde a `alert.id`): mensajes estáticos
+          y propios, nunca derivados de una excepción externa -- se
+          conservan tal cual, son información operativa útil y ya
+          sanitizada por construcción (nunca interpolan nada externo).
+        - Cualquier excepción real de `template.render()` o de
+          `channel.deliver()` (que, por contrato, nunca deberían lanzar --
+          esto es defensa en profundidad, no el camino esperado): se
+          clasifica y sanitiza con `_classify_and_sanitize()`
+          (`notification_channels.py`) -- nunca se usa `str(exc)`/
+          `repr(exc)`/`exc.args` directamente. Solo se conserva el
+          mensaje si `exc` es uno de los cuatro `*TransportError` ya
+          sanitizados en su propio transporte; cualquier otra excepción
+          se reemplaza por `_UNEXPECTED_DELIVERY_FAILURE_MESSAGE`.
+        """
+        try:
+            message = self._template.render(alert)
+        except Exception as exc:
+            return AlertDeliveryResult(
+                success=False,
+                error_message=_classify_and_sanitize(exc=exc, fallback_message=_UNEXPECTED_DELIVERY_FAILURE_MESSAGE),
+                delivered_at=self._clock.now(), terminal=False,
+            )
+
+        if not isinstance(message, NotificationMessage):
+            return AlertDeliveryResult(
+                success=False,
+                error_message=_truncate_delivery_error(
+                    "InspectionNotificationTemplate.render() must return NotificationMessage."
+                ),
+                delivered_at=self._clock.now(), terminal=False,
+            )
+
+        if message.alert_id != alert.id:
+            return AlertDeliveryResult(
+                success=False,
+                error_message=_truncate_delivery_error(
+                    "NotificationMessage.alert_id does not match InspectionAlert.id."
+                ),
+                delivered_at=self._clock.now(), terminal=False,
+            )
+
+        try:
+            return self._channel.deliver(message)
+        except Exception as exc:
+            return AlertDeliveryResult(
+                success=False,
+                error_message=_classify_and_sanitize(exc=exc, fallback_message=_UNEXPECTED_DELIVERY_FAILURE_MESSAGE),
+                delivered_at=self._clock.now(), terminal=False,
+            )

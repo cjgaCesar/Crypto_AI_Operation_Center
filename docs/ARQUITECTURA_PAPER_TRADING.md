@@ -4156,18 +4156,13 @@ casos se rechazan igual (`.strip()` vacío).
 ### 31.5 Sanitización
 
 `_truncate_delivery_error()`/`MAX_DELIVERY_ERROR_LENGTH = 500`
-(`notification_channels.py`, Etapa 6.16): utilidad compartida, aplicada
-en los 5 `deliver()`, en `CompositeNotificationChannel` (excepción
-directa de un canal, y el mensaje agregado final) y en
-`AlertDeliveryService` (excepción directa de template/canal) -- acota
-de forma determinista cualquier `error_message` antes de devolverlo,
-persistirlo o registrarlo en logs, con una marca de corte (`"…"`).
-**No sanitiza contenido**: eso sigue siendo responsabilidad exclusiva
-de cada `*TransportError` (mensajes estáticos por categoría, nunca
-`str(exc)` de una excepción de una capa inferior sin pasar antes por
-esa conversión). No se centralizó la categorización de errores
-específicos de cada transporte (HTTP/timeout/TLS/etc.): permanece en
-cada transporte, donde tiene más contexto y claridad.
+(`notification_channels.py`): utilidad de truncado, aplicada como
+**último paso** (nunca el primero, ver §31.5.1) sobre cualquier
+`error_message` ya clasificado y sanitizado, antes de devolverlo,
+persistirlo o registrarlo en logs, con una marca de corte (`"…"`). No
+se centralizó la categorización de errores específicos de cada
+transporte (HTTP/timeout/TLS/etc.): permanece en cada transporte, donde
+tiene más contexto y claridad.
 
 Representación segura confirmada en los cuatro canales externos:
 `bot_token`/webhook completo (Slack)/`username`/`password`/`endpoint_url`/
@@ -4184,7 +4179,77 @@ subsistema (`LoggingNotificationChannel.deliver()` y el `logger.warning()`
 de `CompositeNotificationChannel` ante un fallo por canal) solo incluye
 `message.title`/`message.body` (contenido humano, no credenciales) o
 nombre del canal/alert_id/número de intento/categoría de error ya
-sanitizada -- nunca se agregó logging nuevo.
+sanitizada -- nunca se pasa el objeto excepción ni se usa
+`logger.exception()`/`exc_info=True`.
+
+### 31.5.1 Sanitización por clasificación de excepciones (Etapa 6.16.1)
+
+La Etapa 6.16 quedó pendiente de aprobación por un hallazgo bloqueante:
+`_truncate_delivery_error(str(exc))` acotaba la LONGITUD del mensaje,
+pero nunca sanitizaba su CONTENIDO -- una excepción inesperada con
+datos sensibles (`RuntimeError("token=... password=...")`) seguía
+propagando ese contenido, solo que recortado a 500 caracteres. Truncar
+no es sanitizar.
+
+La corrección introduce una clasificación explícita, en este orden
+estricto -- **clasificar → sanitizar → truncar**, nunca al revés:
+
+- **Errores controlados de transporte** (`TelegramTransportError`/
+  `SlackTransportError`/`EmailTransportError`/`WebhookTransportError`,
+  agrupados en la tupla privada `_CONTROLLED_TRANSPORT_ERRORS`): su
+  mensaje ya fue sanitizado en la frontera externa, dentro de su propio
+  transporte (mensajes estáticos por categoría, ej. `"Telegram API
+  request failed (HTTP 500)."`) -- se conserva tal cual, solo acotado
+  por `_truncate_delivery_error()`. Es información operativa útil que
+  no debe perderse.
+- **Cualquier otra excepción** (`RuntimeError`/`ValueError`/`TypeError`/
+  `KeyError`/`Exception` genérica, o incluso una de las cuatro clases
+  anteriores si alguna vez se construyera con contenido no sanitizado
+  en un punto no anticipado) se considera **no confiable**: su
+  `str()`/`repr()`/`.args`/traceback nunca se usan -- se descartan por
+  completo y se reemplazan por un mensaje genérico, determinista y sin
+  ningún dato del origen real.
+
+Dos utilidades nuevas en `notification_channels.py`:
+
+```python
+_CONTROLLED_TRANSPORT_ERRORS = (
+    TelegramTransportError, SlackTransportError, EmailTransportError, WebhookTransportError,
+)
+
+def _classify_and_sanitize(*, exc: Exception, fallback_message: str) -> str: ...
+def _safe_channel_error_message(*, channel_name: str, exc: Exception) -> str: ...
+```
+
+`_safe_channel_error_message()` construye el mensaje genérico
+`"Unexpected failure in <ChannelClassName>."`, con `channel_name`
+proveniente siempre de `type(self).__name__`/`type(channel).__name__`
+-- nunca de configuración externa. Se aplica en los 5 `deliver()` y en
+`CompositeNotificationChannel` (cuando un canal lanza directamente, en
+vez de devolver su propio `AlertDeliveryResult` fallido -- defensa en
+profundidad, ya que ningún canal debería lanzar). `AlertDeliveryService`
+reutiliza `_classify_and_sanitize()` directamente con su propio mensaje
+genérico, `"Unexpected alert delivery failure."`, para las excepciones
+reales de `template.render()`/`channel.deliver()` (nunca para sus dos
+validaciones de contrato propias -- tipo de retorno incorrecto o
+`alert_id` no coincidente -- que siguen siendo mensajes estáticos y
+propios, ya seguros por construcción, sin pasar por esta clasificación).
+
+Deliberadamente **no se implementó redacción heurística** (buscar y
+reemplazar `token=`/`password=`/`Bearer`/`https://` dentro del mensaje
+inesperado): ninguna lista de patrones cubre todos los secretos
+posibles -- la única garantía real es descartar el contenido no
+reconocido por completo, nunca un "mejor esfuerzo" parcial.
+
+Ejemplos (sin secretos reales, solo ilustrativos):
+
+| Excepción | Resultado |
+|---|---|
+| `TelegramTransportError("Telegram API request failed (HTTP 500).")` | `"Telegram API request failed (HTTP 500)."` (conservado) |
+| `SlackTransportError("Slack webhook returned an unsuccessful response.")` | `"Slack webhook returned an unsuccessful response."` (conservado) |
+| `EmailTransportError("SMTP authentication failed.")` | `"SMTP authentication failed."` (conservado) |
+| `WebhookTransportError("Webhook request failed (HTTP 400).")` | `"Webhook request failed (HTTP 400)."` (conservado) |
+| `RuntimeError("token=... password=... url=https://...")` | `"Unexpected failure in TelegramNotificationChannel."` (descartado) |
 
 ### 31.6 Reintentos e idempotencia
 

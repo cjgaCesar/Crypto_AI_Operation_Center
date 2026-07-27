@@ -213,11 +213,16 @@ class TestCompositeChannelOneFailsOtherRuns:
         assert channel1.delivered == ["alert-1"]
         assert channel2.delivered == ["alert-1"]
         assert result.success is False
-        assert "c1 exploded" in result.error_message
+        # Etapa 6.16.1 (§31.x): una excepción directa e inesperada (no un
+        # *TransportError controlado) nunca conserva su str() -- se
+        # reemplaza por el mensaje genérico sanitizado.
+        assert "c1 exploded" not in result.error_message
+        assert "Unexpected failure in RaisingChannel." in result.error_message
         # Correción 1 (§25.1): la excepción directa se persiste por canal.
         state = repo.get_alert_channel_delivery("alert-1", "RaisingChannel")
         assert state.delivery_attempts == 1
-        assert "c1 exploded" in state.last_error
+        assert "c1 exploded" not in state.last_error
+        assert state.last_error == "Unexpected failure in RaisingChannel."
 
 
 class TestCompositeChannelThreeChannelsTwoFailOneWorks:
@@ -235,8 +240,11 @@ class TestCompositeChannelThreeChannelsTwoFailOneWorks:
         assert channel2.delivered == ["alert-1"]
         assert channel3.delivered == ["alert-1"]
         assert result.success is False
-        assert "c1 failed" in result.error_message
-        assert "c3 exploded" in result.error_message
+        assert "c1 failed" in result.error_message  # error controlado del propio AlwaysFailsChannel: se conserva
+        # c3 (RaisingChannel) lanza una excepción directa e inesperada:
+        # nunca conserva su str(), se reemplaza por el mensaje genérico.
+        assert "c3 exploded" not in result.error_message
+        assert "Unexpected failure in RaisingChannel." in result.error_message
 
 
 class TestCompositeChannelEmpty:
@@ -358,7 +366,10 @@ class TestPerChannelIdempotency:
         composite.deliver(_message())
         state = repo.get_alert_channel_delivery("alert-1", "RaisingChannel")
         assert state.delivery_attempts == 1
-        assert "boom exploded" in state.last_error
+        # Etapa 6.16.1 (§31.x): la excepción directa se persiste, pero
+        # nunca su str() -- solo el mensaje genérico sanitizado.
+        assert "boom exploded" not in state.last_error
+        assert state.last_error == "Unexpected failure in RaisingChannel."
         assert state.status == AlertStatus.PENDING
 
     def test_execution_order_follows_configured_list_for_pending_channels(self, tmp_path):

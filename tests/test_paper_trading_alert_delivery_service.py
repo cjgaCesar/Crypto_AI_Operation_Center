@@ -355,7 +355,11 @@ class TestTemplateExceptionIsControlled:
         for alert in (alert_a, alert_b):
             assert alert.delivery_attempts == 1
             assert alert.status == AlertStatus.PENDING
-            assert "template failure" in alert.last_error
+            # Etapa 6.16.1 (§31.x): una excepción inesperada de
+            # template.render() (no un *TransportError controlado) nunca
+            # conserva su str() -- solo el mensaje genérico sanitizado.
+            assert "template failure" not in alert.last_error
+            assert alert.last_error == "Unexpected alert delivery failure."
         assert spy.delivered_alerts == []  # el canal nunca se invoca
 
     def test_raising_template_reaches_failed_at_max_attempts(self, tmp_path):

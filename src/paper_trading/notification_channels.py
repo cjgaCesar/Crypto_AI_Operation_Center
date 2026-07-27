@@ -132,10 +132,10 @@ from typing import Optional, Protocol
 from src.paper_trading.alert_models import AlertDeliveryResult, AlertStatus, InspectionAlertChannelDelivery
 from src.paper_trading.base import PaperTradingRepository
 from src.paper_trading.notification_templates import NotificationMessage
-from src.paper_trading.email_transport import EmailTransport
+from src.paper_trading.email_transport import EmailTransport, EmailTransportError
 from src.paper_trading.runtime import Clock, SystemClock
-from src.paper_trading.slack_transport import SlackTransport
-from src.paper_trading.telegram_transport import TelegramTransport
+from src.paper_trading.slack_transport import SlackTransport, SlackTransportError
+from src.paper_trading.telegram_transport import TelegramTransport, TelegramTransportError
 from src.paper_trading.webhook_transport import WEBHOOK_MAX_PAYLOAD_BYTES, WebhookTransport, WebhookTransportError
 
 logger = logging.getLogger(__name__)
@@ -175,6 +175,59 @@ def _truncate_delivery_error(message: str) -> str:
     return message[:truncated_length] + _DELIVERY_ERROR_TRUNCATION_MARK
 
 
+# Etapa 6.16.1 (§31.x, corrección del hallazgo bloqueante de la 6.16):
+# los únicos tipos de excepción considerados "errores controlados de
+# transporte" -- su mensaje ya fue sanitizado en origen, en su propio
+# módulo (nunca incluye token/password/secret/URL/endpoint/headers/
+# payload/direcciones/respuesta externa), así que es seguro conservarlo
+# tal cual (solo acotado en longitud). Cualquier otra excepción --
+# RuntimeError/ValueError/TypeError/KeyError/Exception genérica, o
+# incluso una de estas mismas clases construida accidentalmente con
+# contenido no sanitizado en algún punto no anticipado -- se considera
+# NO confiable: su `str()`/`repr()`/`.args`/traceback nunca se usan.
+_CONTROLLED_TRANSPORT_ERRORS = (
+    TelegramTransportError, SlackTransportError, EmailTransportError, WebhookTransportError,
+)
+
+
+def _classify_and_sanitize(*, exc: Exception, fallback_message: str) -> str:
+    """Clasifica `exc` y sanitiza el resultado, en ese orden -- nunca al
+    revés (truncar un contenido inseguro y tratarlo como si ya fuera
+    seguro no es sanitizar).
+
+    - Si `exc` es una instancia de `_CONTROLLED_TRANSPORT_ERRORS`, es un
+      error controlado: su mensaje ya fue sanitizado por categoría en
+      su propio transporte (ej. `"Telegram API request failed (HTTP
+      500)."`) -- se conserva, solo acotado por `_truncate_delivery_error()`.
+    - Para cualquier otra excepción, se considera inesperada y
+      potencialmente sensible: su contenido se descarta POR COMPLETO
+      (nunca `str(exc)`/`repr(exc)`/`exc.args`/traceback) y se reemplaza
+      por `fallback_message` -- un texto determinista, sin ningún dato
+      del origen real, provisto por el llamador (nunca derivado de
+      configuración externa).
+
+    Deliberadamente NO implementa redacción heurística (buscar y
+    reemplazar `token=`/`password=`/`Bearer`/`https://` dentro del
+    mensaje): ninguna lista de patrones cubre todos los secretos
+    posibles -- la única garantía real es descartar el contenido no
+    reconocido por completo."""
+    if isinstance(exc, _CONTROLLED_TRANSPORT_ERRORS):
+        return _truncate_delivery_error(str(exc))
+    return _truncate_delivery_error(fallback_message)
+
+
+def _safe_channel_error_message(*, channel_name: str, exc: Exception) -> str:
+    """Envoltorio de `_classify_and_sanitize()` para los canales de este
+    módulo (y para `CompositeNotificationChannel` cuando un canal lanza
+    directamente, en vez de devolver su propio `AlertDeliveryResult`
+    fallido). `channel_name` debe provenir siempre de
+    `type(self).__name__`/`type(channel).__name__` -- nunca de
+    configuración externa -- y se usa únicamente para el mensaje
+    genérico de una excepción inesperada: `"Unexpected failure in
+    <ChannelClassName>."`."""
+    return _classify_and_sanitize(exc=exc, fallback_message=f"Unexpected failure in {channel_name}.")
+
+
 class InspectionNotificationChannel(Protocol):
     def deliver(self, message: NotificationMessage) -> AlertDeliveryResult:
         """Entrega `message`. Nunca lanza: captura sus propios errores y los
@@ -212,7 +265,9 @@ class LoggingNotificationChannel:
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
             return AlertDeliveryResult(
-                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+                success=False,
+                error_message=_safe_channel_error_message(channel_name=type(self).__name__, exc=exc),
+                delivered_at=self._clock.now(),
             )
 
 
@@ -310,7 +365,9 @@ class EmailNotificationChannel:
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
             return AlertDeliveryResult(
-                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+                success=False,
+                error_message=_safe_channel_error_message(channel_name=type(self).__name__, exc=exc),
+                delivered_at=self._clock.now(),
             )
 
 
@@ -391,7 +448,9 @@ class SlackNotificationChannel:
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
             return AlertDeliveryResult(
-                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+                success=False,
+                error_message=_safe_channel_error_message(channel_name=type(self).__name__, exc=exc),
+                delivered_at=self._clock.now(),
             )
 
 
@@ -452,7 +511,9 @@ class TelegramNotificationChannel:
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
             return AlertDeliveryResult(
-                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+                success=False,
+                error_message=_safe_channel_error_message(channel_name=type(self).__name__, exc=exc),
+                delivered_at=self._clock.now(),
             )
 
 
@@ -570,7 +631,9 @@ class WebhookNotificationChannel:
             return AlertDeliveryResult(success=True, error_message=None, delivered_at=self._clock.now())
         except Exception as exc:
             return AlertDeliveryResult(
-                success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=self._clock.now(),
+                success=False,
+                error_message=_safe_channel_error_message(channel_name=type(self).__name__, exc=exc),
+                delivered_at=self._clock.now(),
             )
 
 
@@ -666,8 +729,14 @@ class CompositeNotificationChannel:
             try:
                 result = channel.deliver(message)
             except Exception as exc:
+                # Defensa en profundidad (§31.x): los canales de este módulo
+                # ya garantizan estructuralmente que deliver() nunca lanza,
+                # pero un canal futuro/defectuoso podría hacerlo -- esta rama
+                # nunca usa str(exc)/repr(exc)/exc.args directamente.
                 result = AlertDeliveryResult(
-                    success=False, error_message=_truncate_delivery_error(str(exc)), delivered_at=now,
+                    success=False,
+                    error_message=_safe_channel_error_message(channel_name=channel_name, exc=exc),
+                    delivered_at=now,
                 )
 
             if result.success:
