@@ -516,8 +516,15 @@ de esta etapa), sin habilitar WAL (sin evidencia que lo justificara),
 con pruebas reales de escritores/lectores concurrentes, atomicidad bajo
 contención, reinicio e integridad. Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §32](docs/ARQUITECTURA_PAPER_TRADING.md).
+**Etapa 6.18**: CLI operativa `python -m src.paper_trading.portfolio_cli`
+(`summary`/`balances`/`positions`/`orders`/`executions`/`trades`/
+`snapshots`/`inspections`/`alerts`/`deliveries`/`reconciliation-audits`,
+formatos `table`/`json`) -- **estrictamente de solo lectura**: abre
+SQLite en modo real `mode=ro`, nunca crea la base ni escribe nada. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §33](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para
 Paper Trading (`postgres_repository.py` sigue siendo un stub
-preparado, sin implementar).
+preparado, sin implementar). El proyecto sigue en desarrollo activo --
+no se considera terminado.

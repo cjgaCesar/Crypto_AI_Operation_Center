@@ -4560,3 +4560,155 @@ horizontal ni múltiples nodos -- esta etapa no afirma ni implica
 soporte general de alta concurrencia. La paridad con PostgreSQL sigue
 sin implementarse (`postgres_repository.py` continúa siendo un stub,
 ver auditoría previa a la Etapa 6.17); esta etapa no la aborda.
+
+## 33. CLI operativa de consulta — Etapa 6.18
+
+### 33.1 Objetivo y decisión arquitectónica
+
+CLI operativa y **estrictamente de solo lectura** para consultar el
+estado de Paper Trading desde terminal (`summary`/`balances`/
+`positions`/`orders`/`executions`/`trades`/`snapshots`/`inspections`/
+`alerts`/`deliveries`/`reconciliation-audits`). No crea/acepta/llena/
+cancela órdenes, no repara inconsistencias, no reintenta notificaciones,
+no genera inspecciones, no ejecuta reconciliaciones, no inicia el
+scheduler, no escribe en SQLite.
+
+Decisión clave: ni `SQLitePaperTradingRepository` ni el adaptador de
+solo lectura del Dashboard (`RepositoryPaperTradingDashboardRepository`,
+Etapa 6.6) abren TODAS sus conexiones en modo real de solo lectura
+(`file:...?mode=ro`) -- ambos solo se disciplinan a no LLAMAR ningún
+método de escritura, delegando en una conexión SQLite normal (lectura-
+escritura a nivel del motor). Esa garantía es más débil que la exigida
+por esta etapa ("no basta con no llamar métodos save"). Por eso
+`portfolio_cli.py` implementa su **propia capa mínima de consultas SQL
+crudas**, sobre una conexión abierta siempre con `mode=ro` -- nunca
+reutiliza `SQLitePaperTradingRepository` ni el adaptador del Dashboard
+para leer datos (sí reutiliza, por ser puras y sin ninguna dependencia
+de sqlite3, las funciones de conversión de `serialization.py`:
+`text_to_decimal`/`text_to_datetime`/`optional_text_to_decimal`/
+`optional_text_to_datetime`). No se modificó ningún archivo del
+Dashboard: no hizo falta ningún contrato nuevo ahí.
+
+### 33.2 Aislamiento de capa
+
+`portfolio_cli.py` nunca importa `RiskEngine`/`FillEngine`/
+`PositionEngine`/`ReservationEngine`/`PnLEngine`/`PaperTradingService`/
+`PaperTradingApplication`/`AlertDeliveryService`/`InspectionJob`/
+`InspectionScheduler`/`ReconciliationService`/
+`CompositeNotificationChannel`/ningún `*_transport.py` -- verificado
+con un análisis `ast` de sus imports (no búsqueda textual, que fallaría
+con los propios docstrings del módulo, que sí *mencionan* esos nombres
+al explicar qué NO se usa). Solo importa: biblioteca estándar
+(`argparse`/`json`/`sqlite3`/`sys`/`decimal`/`datetime`/`enum`/
+`pathlib`/`typing`), enums de solo lectura (`enums.py`/
+`alert_models.py`'s `AlertStatus`/`AlertType`/`reconciliation_models.py`'s
+`IssueSeverity`), las funciones puras de `serialization.py`, y
+`load_settings()` (`src/utils/config.py`) -- únicamente para resolver
+`paper_trading.database_path` cuando `--database-path` se omite, nunca
+para construir el Composition Root ni para validar credenciales.
+
+### 33.3 Punto de entrada
+
+```
+python -m src.paper_trading.portfolio_cli
+```
+
+`build_parser() -> argparse.ArgumentParser` / `main(argv: Sequence[str]
+| None = None) -> int` / `if __name__ == "__main__": raise
+SystemExit(main())`. `main()` siempre retorna un código de salida; solo
+`argparse` mismo puede terminar el proceso directamente (`SystemExit(2)`
+ante un argumento inválido -- comportamiento nativo de la biblioteca
+estándar, coherente con el código 2 ya definido). Sin `input()`
+interactivo, sin menús, sin color ANSI obligatorio.
+
+### 33.4 Subcomandos
+
+`summary`, `balances`, `positions`, `orders`, `executions`, `trades`,
+`snapshots` (`--type portfolio|pnl`, obligatorio), `inspections`,
+`alerts`, `deliveries`, `reconciliation-audits`.
+
+### 33.5 Filtros
+
+- `positions`: `--exchange`/`--symbol`/`--status {open,flat,all}`.
+- `orders`: `--exchange`/`--symbol`/`--status`(`OrderStatus`)/
+  `--source`(`OrderSource`) -- validados contra los enums reales,
+  rechazo con código 2 si el valor no pertenece al enum.
+- `executions`: `--order-id`/`--exchange`/`--symbol`.
+- `trades`: `--exchange`/`--symbol`.
+- `snapshots`: `--type` (obligatorio).
+- `inspections`: `--status {success,failed}` (derivado de la columna
+  `success`, ya que `ScheduledInspectionRun` no tiene un campo
+  "status" propio).
+- `alerts`: `--status`(`AlertStatus`)/`--type`(`AlertType`)/
+  `--severity`(`IssueSeverity`).
+- `deliveries`: `--alert-id`/`--status`(`AlertStatus`)/`--channel`
+  (texto libre, nombre de clase del canal).
+- `reconciliation-audits`: `--run-id` (filtra por `id`, ya que
+  `ReconciliationAuditRecord` no tiene un `run_id` propio distinto de
+  su propio `id`)/`--status {success,failure}` (derivado de la columna
+  `success`).
+- Todos los comandos de colección aceptan `--limit` (default 50, máximo
+  1000; rechaza 0/negativo/no entero con código 2).
+
+Adaptaciones explícitas frente al modelo real (ninguna columna
+inventada): `InspectionAlert` no tiene `updated_at` -- se omite, no se
+inventa. `InspectionAlertChannelDelivery.delivery_attempts` se muestra
+con ese nombre real (no "attempt_count").
+
+### 33.6 Formatos
+
+`--format table` (default) / `--format json`. Tabla: encabezados,
+columnas alineadas, `None` -> `-`, `Decimal` con su representación
+exacta (`str(value)`, nunca redondeado), `datetime` en ISO 8601, texto
+largo truncado de forma determinista a 80 caracteres con `"..."`
+(los IDs reales, de longitud muy inferior, nunca se ven afectados),
+`"No records found."` con cero filas. JSON: `Decimal` -> string,
+`datetime` -> ISO 8601, `Enum` -> `.value`, `None` -> `null`, orden de
+lista determinista (mismo `ORDER BY` en cada llamada), stdout es JSON
+puro (sin logs mezclados).
+
+### 33.7 Códigos de salida
+
+| Código | Significado |
+|---|---|
+| 0 | Éxito |
+| 2 | Error de argumentos (argparse) |
+| 3 | Configuración inválida (no se pudo resolver `--database-path` desde `load_settings()`) |
+| 4 | Base inexistente, inaccesible, o sin el schema de Paper Trading esperado |
+| 5 | Error de consulta controlado (excepción SQLite inesperada) |
+
+Errores inesperados: nunca muestran traceback, SQL, rutas completas
+sensibles ni credenciales -- mensaje genérico y operativo en `stderr`.
+
+### 33.8 Base inexistente/sin schema
+
+Ruta inexistente: código 4, no crea el archivo ni el directorio,
+`stdout` vacío, `stderr` explica el motivo. Ruta que es un directorio:
+código 4. Archivo SQLite válido pero sin las tablas `paper_trading_*`
+esperadas: código 4 (mismo código que "no existe": para esta CLI, "sin
+schema utilizable" y "no existe" son la misma categoría operativa).
+Base inicializada pero sin datos: código 0, resultados vacíos (`"No
+records found."` / `[]`). La CLI **nunca** llama `init()`: si el
+schema no existe, no se crea.
+
+### 33.9 Garantía de no escritura
+
+Conexión abierta siempre como `sqlite3.connect(f"file:{path}?mode=ro",
+uri=True)`: cualquier intento de escritura falla a nivel del propio
+motor SQLite (`sqlite3.OperationalError: attempt to write a readonly
+database`), no solo por disciplina de código. Verificado con una
+prueba integral (`TestNoWriteGuarantee`): se sembra una base real con
+datos en las 11 tablas, se registra su schema/contenido/tamaño/listado
+de archivos, se ejecutan los 11 subcomandos (en ambos formatos), y se
+confirma que schema/contenido/tamaño/listado de archivos son
+exactamente iguales -- sin filas nuevas, sin tablas nuevas, sin
+archivos `-wal`/`-shm`.
+
+### 33.10 Limitaciones
+
+No implementa CSV (solo `table`/`json`, por diseño de esta etapa). No
+soporta PostgreSQL (sigue sin implementarse, ver Etapa 6.17). No
+expone ninguna acción administrativa -- para reconciliar/reparar/
+inspeccionar/entregar alertas, seguir usando
+`reconciliation_cli.py`/`inspection_cli.py` (Etapas 6.8/6.9), que esta
+etapa no modifica.
