@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,7 @@ from src.paper_trading.sqlite_backup import (
     DatabaseBusyError,
     RestoreError,
     SQLitePaperTradingBackupService,
+    VerificationResult,
 )
 from src.paper_trading.sqlite_repository import SQLitePaperTradingRepository
 
@@ -95,6 +97,37 @@ def _corrupt_header(path) -> None:
     with open(path, "r+b") as f:
         f.seek(0)
         f.write(b"\x00" * 16)
+
+
+def _make_schema_incomplete_db(path) -> None:
+    """Base SQLite físicamente válida, pero con solo una tabla ajena --
+    integrity_ok=true, schema_ok=false."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE some_other_table (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+
+def _inject_final_check_failure(monkeypatch, *, database_path, integrity_ok: bool, schema_ok: bool) -> None:
+    """Etapa 6.20.1 (§13-14 del ticket): hace fallar únicamente la
+    verificación FINAL de `restore_backup()` -- la que corre sobre
+    `self._database_path` (el destino ya publicado por `os.replace()`),
+    identificada por ruta (nunca por conteo de llamadas, que varía según
+    si hay backup previo). Todas las demás llamadas a `_check()`
+    (backup original, pre-restore interno, temporal de restauración)
+    usan la implementación real sin modificar."""
+    real_check = SQLitePaperTradingBackupService._check
+    target = Path(database_path).expanduser().resolve()
+
+    def fake_check(self, path, *, full):
+        if not full and Path(path).resolve() == target:
+            return VerificationResult(
+                valid=False, integrity_ok=integrity_ok, schema_ok=schema_ok,
+                missing_tables=(), check_type="quick_check", database_name=Path(path).name,
+            )
+        return real_check(self, path, full=full)
+
+    monkeypatch.setattr(SQLitePaperTradingBackupService, "_check", fake_check)
 
 
 # ==========================================================================
@@ -664,3 +697,216 @@ class TestConstructorValidation:
     def test_rejects_bool_timeout(self, tmp_path):
         with pytest.raises(ValueError):
             SQLitePaperTradingBackupService(str(tmp_path / "db.db"), timeout_seconds=True)
+
+
+# ==========================================================================
+# Etapa 6.20.1 -- H1: create_backup() no debe publicar con schema inválido
+# ==========================================================================
+
+class TestBackupPublicationRequiresValidSchema:
+    def test_backup_with_invalid_schema_source_raises_and_does_not_publish(self, tmp_path):
+        source = tmp_path / "invalid_schema_source.db"
+        _make_schema_incomplete_db(source)
+        destination = tmp_path / "backup_out.db"
+
+        service = SQLitePaperTradingBackupService(str(source))
+        with pytest.raises(BackupSchemaError):
+            service.create_backup(str(destination))
+
+        assert not destination.exists()
+
+    def test_backup_with_invalid_integrity_source_raises_distinct_error(self, tmp_path):
+        """§21 del ticket: create_backup() debe diferenciar integridad
+        inválida (BackupIntegrityError) de schema inválido
+        (BackupSchemaError)."""
+        source = tmp_path / "corrupt_source.db"
+        _seed_full_repository(str(source))
+        _corrupt_header(source)
+        destination = tmp_path / "backup_out.db"
+
+        service = SQLitePaperTradingBackupService(str(source))
+        with pytest.raises(BackupIntegrityError):
+            service.create_backup(str(destination))
+
+        assert not destination.exists()
+
+    def test_overwrite_with_invalid_schema_source_leaves_existing_destination_intact(self, tmp_path):
+        """§7 del ticket: destino existente + overwrite=True + source con
+        schema inválido -> BackupSchemaError, destino anterior byte-
+        idéntico, sin os.replace(), sin temporal huérfano."""
+        source = tmp_path / "invalid_schema_source.db"
+        _make_schema_incomplete_db(source)
+        destination = tmp_path / "backup_out.db"
+        destination.write_bytes(b"pre-existing valid-looking backup")
+        before = destination.read_bytes()
+
+        service = SQLitePaperTradingBackupService(str(source))
+        with pytest.raises(BackupSchemaError):
+            service.create_backup(str(destination), overwrite=True)
+
+        assert destination.read_bytes() == before
+        assert list(tmp_path.glob(".paper_trading_backup_*")) == []
+
+    def test_no_orphan_temp_file_after_schema_rejection(self, tmp_path):
+        """§8 del ticket."""
+        source = tmp_path / "invalid_schema_source.db"
+        _make_schema_incomplete_db(source)
+        destination = tmp_path / "backup_out.db"
+
+        service = SQLitePaperTradingBackupService(str(source))
+        with pytest.raises(BackupSchemaError):
+            service.create_backup(str(destination))
+
+        assert list(tmp_path.glob(".paper_trading_backup_*")) == []
+        assert not destination.exists()
+
+    def test_valid_backup_still_publishes_normally(self, tmp_path):
+        """Confirma que el endurecimiento no afecta el camino feliz ya
+        cubierto por TestCreateBackupBasic."""
+        source = tmp_path / "source.db"
+        _seed_full_repository(str(source))
+        destination = tmp_path / "backup.db"
+
+        service = SQLitePaperTradingBackupService(str(source))
+        result = service.create_backup(str(destination))
+
+        assert destination.exists()
+        assert result.integrity_ok is True
+        assert result.schema_ok is True
+
+
+class TestPreRestoreBackupRequiresValidSchema:
+    def test_pre_restore_backup_with_incomplete_destination_schema_aborts_restore(self, tmp_path):
+        """§9 del ticket: destino físicamente válido pero con schema
+        incompleto -> el backup previo (que usa _create_backup_internal)
+        hereda la validación -> BackupSchemaError, destino original
+        intacto, sin pre_restore publicado, sin temporal huérfano, sin
+        os.replace() sobre el destino principal."""
+        destination = tmp_path / "paper_trading.db"
+        _make_schema_incomplete_db(destination)
+        before = destination.read_bytes()
+
+        valid_source = tmp_path / "valid_source.db"
+        _seed_full_repository(str(valid_source))
+        backup_path = tmp_path / "backup.db"
+        SQLitePaperTradingBackupService(str(valid_source)).create_backup(str(backup_path))
+
+        service = SQLitePaperTradingBackupService(str(destination))
+        with pytest.raises(BackupSchemaError):
+            service.restore_backup(str(backup_path))
+
+        assert destination.read_bytes() == before
+        assert list(tmp_path.glob("paper_trading.pre_restore.*.db")) == []
+        assert list(tmp_path.glob(".paper_trading_backup_*")) == []
+        assert list(tmp_path.glob(".paper_trading_restore_*")) == []
+
+
+# ==========================================================================
+# Etapa 6.20.1 -- H2: restore_backup() debe validar la verificación final
+# ==========================================================================
+
+class TestRestoreFinalVerification:
+    def _prepare(self, tmp_path):
+        original = tmp_path / "paper_trading.db"
+        repo = _seed_full_repository(str(original))
+        backup_path = tmp_path / "backup.db"
+        SQLitePaperTradingBackupService(str(original)).create_backup(str(backup_path))
+        return original, repo, backup_path
+
+    def test_final_integrity_failure_raises_restore_error_with_pre_restore_backup(self, tmp_path, monkeypatch):
+        original, _repo, backup_path = self._prepare(tmp_path)
+        _inject_final_check_failure(monkeypatch, database_path=str(original), integrity_ok=False, schema_ok=True)
+
+        service = SQLitePaperTradingBackupService(str(original))
+        with pytest.raises(RestoreError) as excinfo:
+            service.restore_backup(str(backup_path))
+
+        assert "pre-restore backup is available" in str(excinfo.value).lower()
+        pre_restore_files = list(tmp_path.glob("paper_trading.pre_restore.*.db"))
+        assert len(pre_restore_files) == 1
+
+    def test_final_schema_failure_raises_restore_error(self, tmp_path, monkeypatch):
+        """§16 del ticket: integrity_ok=true, schema_ok=false en la
+        verificación final -- nunca confundir con BackupSchemaError de
+        preflight (aquí el reemplazo ya ocurrió)."""
+        original, _repo, backup_path = self._prepare(tmp_path)
+        _inject_final_check_failure(monkeypatch, database_path=str(original), integrity_ok=True, schema_ok=False)
+
+        service = SQLitePaperTradingBackupService(str(original))
+        with pytest.raises(RestoreError):
+            service.restore_backup(str(backup_path))
+
+    def test_no_restore_result_is_returned_on_final_failure(self, tmp_path, monkeypatch):
+        original, _repo, backup_path = self._prepare(tmp_path)
+        _inject_final_check_failure(monkeypatch, database_path=str(original), integrity_ok=False, schema_ok=True)
+
+        service = SQLitePaperTradingBackupService(str(original))
+        try:
+            service.restore_backup(str(backup_path))
+            assert False, "expected RestoreError"
+        except RestoreError:
+            pass  # nunca se construyó ni devolvió un RestoreResult
+
+    def test_final_failure_without_pre_restore_backup_message_says_none_created(self, tmp_path, monkeypatch):
+        """§17 del ticket."""
+        original, _repo, backup_path = self._prepare(tmp_path)
+        _inject_final_check_failure(monkeypatch, database_path=str(original), integrity_ok=False, schema_ok=True)
+
+        service = SQLitePaperTradingBackupService(str(original))
+        with pytest.raises(RestoreError) as excinfo:
+            service.restore_backup(str(backup_path), create_pre_restore_backup=False)
+
+        message = str(excinfo.value).lower()
+        assert "no pre-restore backup was created" in message
+        assert str(tmp_path) not in str(excinfo.value)
+        assert list(tmp_path.glob("paper_trading.pre_restore.*.db")) == []
+
+    def test_final_failure_with_pre_restore_backup_is_valid_and_available(self, tmp_path, monkeypatch):
+        """§18 del ticket: el backup previo existe y pasa su propia
+        verificación -- disponible para recuperación manual."""
+        original, _repo, backup_path = self._prepare(tmp_path)
+        _inject_final_check_failure(monkeypatch, database_path=str(original), integrity_ok=False, schema_ok=True)
+
+        service = SQLitePaperTradingBackupService(str(original))
+        with pytest.raises(RestoreError) as excinfo:
+            service.restore_backup(str(backup_path))
+
+        assert str(tmp_path) not in str(excinfo.value)
+
+        pre_restore_files = list(tmp_path.glob("paper_trading.pre_restore.*.db"))
+        assert len(pre_restore_files) == 1
+        # El backup previo mismo pasa verificación completa (fue creado
+        # ANTES de que el fake _check empezara a interceptar llamadas
+        # sobre `original`; su propio archivo nunca fue tocado por el
+        # monkeypatch, que solo intercepta llamadas sobre `original`).
+        verify_service = SQLitePaperTradingBackupService(str(pre_restore_files[0]))
+        verification = verify_service.verify_database(str(pre_restore_files[0]), full=True)
+        assert verification.valid is True
+
+    def test_final_failure_message_has_no_absolute_path_or_sql(self, tmp_path, monkeypatch):
+        original, _repo, backup_path = self._prepare(tmp_path)
+        _inject_final_check_failure(monkeypatch, database_path=str(original), integrity_ok=False, schema_ok=True)
+
+        service = SQLitePaperTradingBackupService(str(original))
+        with pytest.raises(RestoreError) as excinfo:
+            service.restore_backup(str(backup_path))
+
+        message = str(excinfo.value)
+        assert str(tmp_path) not in message
+        assert "SELECT" not in message.upper()
+        assert "PRAGMA" not in message.upper()
+
+    def test_successful_restore_still_works_after_hardening(self, tmp_path):
+        """Confirma que el endurecimiento no afecta el camino feliz ya
+        cubierto por TestRestoreSuccess."""
+        original, repo, backup_path = self._prepare(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("1"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+
+        service = SQLitePaperTradingBackupService(str(original))
+        result = service.restore_backup(str(backup_path))
+
+        assert result.restored is True
+        assert result.integrity_ok is True
+        assert result.schema_ok is True

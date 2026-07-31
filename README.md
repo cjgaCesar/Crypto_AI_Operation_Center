@@ -560,6 +560,10 @@ defecto). No sustituye un backup externo real, no incluye cifrado ni
 subida a la nube, no programa backups automáticos, y no está diseñado
 para múltiples escritores distribuidos. Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §35](docs/ARQUITECTURA_PAPER_TRADING.md).
+**Etapa 6.20.1**: los backups se publican únicamente si integridad y
+schema son válidos, y `restore` reporta error si la base final no
+supera la verificación posterior al reemplazo (`os.replace()`). Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §35.14](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para

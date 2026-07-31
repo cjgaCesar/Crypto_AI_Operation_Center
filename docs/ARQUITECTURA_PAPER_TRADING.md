@@ -5153,3 +5153,67 @@ disco/proveedor sigue siendo responsabilidad del operador). No está
 diseñado para múltiples escritores distribuidos ni para coordinar el
 apagado de otros procesos -- el operador debe detenerlos manualmente
 antes de restaurar (§35.9).
+
+### 35.14 Endurecimiento de publicación y verificación final — Etapa 6.20.1
+
+> **Defectos corregidos**: la auditoría posterior a la Etapa 6.20
+> detectó dos defectos bloqueantes. **H1**: `_create_backup_internal()`
+> solo rechazaba el temporal por `integrity_ok=false`, nunca por
+> `schema_ok=false` -- un backup de una base físicamente válida pero sin
+> el schema de Paper Trading se publicaba igual (`BackupResult` con
+> `schema_ok=false`, sin excepción). **H2**: `restore_backup()` calculaba
+> `final_check` después de `os.replace()` pero nunca lo validaba --
+> podía devolver `RestoreResult(restored=True, ...)` con
+> `integrity_ok=false`/`schema_ok=false`, y la CLI habría reportado
+> código 0 sobre una restauración realmente fallida. Ambos reproducidos
+> con pruebas controladas antes de corregir (nunca contra la base real).
+
+**Backup solo se publica con integridad y schema válidos.**
+`_create_backup_internal()` ahora exige, en este orden, sobre el
+temporal ya copiado: `integrity_ok=true` (`BackupIntegrityError` si no)
+y luego `schema_ok=true` (`BackupSchemaError` si no) -- ambas
+comprobaciones ocurren **antes** de `os.replace()`. Si cualquiera falla,
+el temporal se elimina en el `finally` ya existente y el destino
+anterior (si existía) permanece byte-idéntico: nunca se llega a
+`os.replace()`.
+
+**El backup previo hereda la misma garantía.** El backup previo de
+`restore_backup()` reutiliza literalmente `_create_backup_internal()`
+(sin duplicar lógica), así que el endurecimiento anterior se aplica
+automáticamente: si la base configurada tiene un schema incompleto (un
+caso real -- una base "ajena" o inicializada solo parcialmente),
+`restore_backup()` aborta con `BackupSchemaError` antes de tocar el
+destino, sin publicar un `pre_restore` inválido y sin ejecutar el
+`os.replace()` principal.
+
+**Verificación final obligatoria después de `os.replace()`.**
+`restore_backup()` sigue calculando `final_check = self._check(destination,
+full=False)` tras publicar, pero ahora lo valida explícitamente: si
+`integrity_ok` o `schema_ok` son `false`, se lanza `RestoreError` **en
+vez de** construir un `RestoreResult`. Nunca existe un `RestoreResult`
+con `restored=True` e indicadores falsos -- el resultado exitoso solo
+se construye cuando ambos son `true`.
+
+**Fallo posterior al reemplazo: crítico, no silencioso.** En este punto
+el reemplazo ya ocurrió (no hay nada que "deshacer" sin otro reemplazo
+destructivo). El mensaje de `RestoreError` es sanitizado (sin ruta
+absoluta, sin SQL, sin `str(exc)` interno) e indica explícitamente si
+el backup previo está disponible: `"Restored database failed final
+verification. A pre-restore backup is available."` cuando existe, o
+`"Restored database failed final verification and no pre-restore
+backup was created."` cuando `--no-pre-restore-backup` estaba activo o
+el destino no existía antes de restaurar.
+
+**Sin rollback automático.** Deliberadamente no se restaura
+automáticamente desde el backup previo tras un fallo final: el fallo ya
+ocurre después de un reemplazo, y un rollback automático sería *otro*
+reemplazo destructivo que podría agravar un problema real de disco o
+filesystem. La etapa se limita a reportar el error crítico, conservar
+el backup previo (si se creó) y dejar la recuperación manual al
+operador -- no se agregó ningún subcomando nuevo.
+
+**Mapeo de códigos de salida sin cambios**: `backup_cli.py` no se
+modificó en esta etapa -- su mapeo ya existente (`BackupSchemaError` ->
+8, `RestoreError` -> 10) era suficiente para ambos defectos una vez que
+`sqlite_backup.py` empezó a lanzar la excepción correcta en el momento
+correcto.

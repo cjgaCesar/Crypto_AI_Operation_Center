@@ -443,6 +443,68 @@ class TestRestoreOutcomes:
 
 
 # ==========================================================================
+# Etapa 6.20.1, §13 -- endurecimiento de publicación/verificación final
+# ==========================================================================
+
+class TestBackupSchemaHardening:
+    def test_backup_with_invalid_schema_source_exits_8(self, tmp_path, monkeypatch, capsys):
+        import sqlite3
+        db = tmp_path / "not_pt.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        _patch_settings(monkeypatch, db)
+
+        output = tmp_path / "out.db"
+        exit_code = backup_cli.main(["backup", "--output", str(output)])
+
+        assert exit_code == 8
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() != ""
+        assert str(tmp_path) not in captured.err
+        assert not output.exists()
+
+
+class TestRestoreFinalVerificationHardening:
+    def test_restore_final_verification_failure_exits_10_not_0(self, tmp_path, monkeypatch, capsys):
+        from types import SimpleNamespace as _SimpleNamespace
+        from src.paper_trading.sqlite_backup import SQLitePaperTradingBackupService, VerificationResult
+        from pathlib import Path
+
+        db = tmp_path / "pt.db"
+        _seed_db(db)
+        _patch_settings(monkeypatch, db)
+
+        backup_path = tmp_path / "backup.db"
+        backup_cli.main(["backup", "--output", str(backup_path)])
+        capsys.readouterr()
+
+        real_check = SQLitePaperTradingBackupService._check
+        target = Path(str(db)).expanduser().resolve()
+
+        def fake_check(self, path, *, full):
+            if not full and Path(path).resolve() == target:
+                return VerificationResult(
+                    valid=False, integrity_ok=False, schema_ok=True,
+                    missing_tables=(), check_type="quick_check", database_name=Path(path).name,
+                )
+            return real_check(self, path, full=full)
+
+        monkeypatch.setattr(SQLitePaperTradingBackupService, "_check", fake_check)
+
+        exit_code = backup_cli.main(["restore", "--backup-path", str(backup_path), "--confirm"])
+
+        assert exit_code == 10
+        assert exit_code != 0
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() != ""
+        assert str(tmp_path) not in captured.err
+
+
+# ==========================================================================
 # §41 -- Subprocess
 # ==========================================================================
 

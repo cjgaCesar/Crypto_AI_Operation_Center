@@ -209,6 +209,8 @@ class SQLitePaperTradingBackupService:
             verification = self._check(tmp_path, full=False)
             if not verification.integrity_ok:
                 raise BackupIntegrityError("Backup failed integrity verification before publishing.")
+            if not verification.schema_ok:
+                raise BackupSchemaError("Backup failed Paper Trading schema verification before publishing.")
 
             os.replace(str(tmp_path), str(destination))
             published = tmp_path
@@ -389,6 +391,20 @@ class SQLitePaperTradingBackupService:
                 tmp_path.unlink(missing_ok=True)
 
         final_check = self._check(destination, full=False)
+        if not final_check.integrity_ok or not final_check.schema_ok:
+            # El reemplazo ya ocurrió (os.replace() de arriba): esto es un
+            # fallo crítico posterior a la publicación, nunca un
+            # RestoreResult exitoso con valores falsos (§10-12 del
+            # ticket). No se intenta ninguna reparación ni rollback
+            # automático (§19/§21.3): el backup previo, si existe, queda
+            # disponible para recuperación manual.
+            if pre_restore_display is not None:
+                raise RestoreError(
+                    "Restored database failed final verification. A pre-restore backup is available."
+                )
+            raise RestoreError(
+                "Restored database failed final verification and no pre-restore backup was created."
+            )
 
         return RestoreResult(
             restored=True,
