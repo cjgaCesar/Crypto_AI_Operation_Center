@@ -564,6 +564,13 @@ para múltiples escritores distribuidos. Ver
 schema son válidos, y `restore` reporta error si la base final no
 supera la verificación posterior al reemplazo (`os.replace()`). Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §35.14](docs/ARQUITECTURA_PAPER_TRADING.md).
+**Etapa 6.21**: `portfolio_cli summary` ya no hardcodea `"USDT"` --
+usa `settings.paper_trading.currency` cuando no se indica
+`--database-path`, y admite `--currency` explícito:
+`python -m src.paper_trading.portfolio_cli summary --currency EUR`.
+Cuando se usa `--database-path` para una base cuya moneda no es USDT,
+también debe indicarse `--currency`. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §33.11](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para

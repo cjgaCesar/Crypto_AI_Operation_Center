@@ -4738,6 +4738,58 @@ inspeccionar/entregar alertas, seguir usando
 `reconciliation_cli.py`/`inspection_cli.py` (Etapas 6.8/6.9), que esta
 etapa no modifica.
 
+### 33.11 Resolución de moneda en `summary` — Etapa 6.21
+
+> **Defecto corregido**: la auditoría posterior a la Etapa 6.20.1
+> detectó que `summary` llamaba `_fetch_summary(conn, currency="USDT")`
+> con el literal hardcodeado, ignorando por completo
+> `settings.paper_trading.currency`. Con una base cuyo único balance
+> era en otra moneda (ej. EUR), la CLI devolvía silenciosamente
+> `total_balance`/`reserved_balance`/`available_balance` en `null`, con
+> código de salida 0 -- sin ningún indicio de error para el operador.
+> Reproducido con una base temporal antes de corregir.
+
+**Contrato de resolución**, exclusivo de `summary` (nunca afecta a
+`balances` ni a ningún otro subcomando):
+
+| `--database-path` | `--currency` | Fuente de la moneda |
+|---|---|---|
+| No | No | `settings.paper_trading.currency` |
+| No | Sí | `--currency` |
+| Sí | No | `"USDT"` (compatibilidad histórica) |
+| Sí | Sí | `--currency` |
+
+`--currency` es un argumento global más (mismo parser padre +
+`argument_default=argparse.SUPPRESS` de la Etapa 6.18.1: funciona antes
+o después del subcomando, y ante duplicados gana el último valor). Se
+normaliza (`strip()` + mayúsculas) y se valida como 2-12 letras ASCII
+`A-Z` -- sin catálogo fijo de monedas permitidas: cualquier código con
+ese formato se acepta, exista o no un balance real para él (una moneda
+válida sin fila de balance sigue devolviendo los campos en `null` con
+código 0 -- "no existe balance para esa moneda", no un fallo de
+infraestructura).
+
+**Carga única de configuración**: `load_settings()` se llama a lo sumo
+una vez por ejecución (`_load_settings_once()`), y únicamente cuando
+`--database-path` no es explícito -- ese es el único caso en el que
+hace falta configuración, tanto para resolver `database_path` como
+(cuando tampoco hay `--currency`) `currency`; el mismo objeto
+`Settings` ya cargado se reutiliza para ambas resoluciones, nunca una
+segunda llamada. Con `--database-path` explícito, `load_settings()`
+nunca se invoca, sin importar si `--currency` también está presente --
+la garantía ya aprobada en la Etapa 6.18.1 permanece intacta.
+
+**Sin inferencia ni conversión**: la moneda nunca se adivina leyendo
+filas de `paper_trading_cash_balances` ni se toma la primera
+encontrada; tampoco existe ninguna conversión entre monedas -- el valor
+resuelto se usa tal cual como filtro exacto de la consulta SQL ya
+existente (`_fetch_summary(conn, currency=...)`, sin cambios en su
+propia lógica interna).
+
+Recomendación operativa: al usar `--database-path` para consultar una
+base cuya moneda configurada no es USDT, debe indicarse también
+`--currency` explícitamente.
+
 ## 34. CLI administrativa de órdenes manuales — Etapa 6.19
 
 ### 34.1 Objetivo y decisión arquitectónica

@@ -9,6 +9,20 @@ Uso:
     python -m src.paper_trading.portfolio_cli alerts --status PENDING
     python -m src.paper_trading.portfolio_cli deliveries --alert-id <ID>
     python -m src.paper_trading.portfolio_cli summary --format json
+    python -m src.paper_trading.portfolio_cli summary --currency EUR
+
+`summary` (Etapa 6.21): la moneda mostrada ya no está hardcodeada a
+"USDT" -- se resuelve así, en orden de precedencia: (1) `--currency`
+explícito; (2) sin `--currency` y sin `--database-path`,
+`settings.paper_trading.currency` de la configuración; (3) sin
+`--currency` pero con `--database-path` explícito, se mantiene "USDT"
+por compatibilidad histórica (no se infiere la moneda leyendo filas de
+la base). Si se usa `--database-path` para una base cuya moneda no es
+USDT, debe indicarse también `--currency`. `--currency` es un
+argumento global (funciona antes o después del subcomando, mismo
+patrón de la Etapa 6.18.1) pero solo afecta a `summary`: el resto de
+los subcomandos lo ignoran (ej. `balances` sigue listando todas las
+monedas presentes, sin filtrar).
 
 Decisión arquitectónica (ver docs/ARQUITECTURA_PAPER_TRADING.md §33.1):
 ni `SQLitePaperTradingRepository` ni el adaptador de solo lectura del
@@ -110,24 +124,54 @@ class ConfigurationError(Exception):
 # Resolución de configuración y apertura read-only
 # --------------------------------------------------------------------------
 
-def _resolve_database_path(explicit_path: Optional[str]) -> str:
-    """Si `--database-path` se recibió explícitamente, se usa tal cual
-    (nunca se llama a load_settings()). Si se omitió, se reutiliza
-    `paper_trading.database_path` de la configuración existente -- la
-    misma que usa el resto del proyecto, sin un sistema de
-    configuración alternativo."""
-    if explicit_path is not None:
-        return explicit_path
-
+def _load_settings_once():
+    """Única llamada a `load_settings()` de todo `main()` (Etapa 6.21,
+    §10): se invoca a lo sumo una vez, y su resultado se reutiliza para
+    resolver tanto `database_path` como (cuando corresponda)
+    `currency` -- nunca una segunda carga."""
     from src.utils.config import load_settings  # import perezoso: evita cargarlo si no hace falta
 
     try:
-        settings = load_settings()
+        return load_settings()
     except Exception:
         raise ConfigurationError(
             "Could not load configuration to resolve the database path; pass --database-path explicitly."
         ) from None
+
+
+def _resolve_database_path(explicit_path: Optional[str], settings) -> str:
+    """Si `--database-path` se recibió explícitamente, se usa tal cual
+    (`settings` nunca se lee en ese caso -- puede incluso ser `None`).
+    Si se omitió, se reutiliza `paper_trading.database_path` del
+    `settings` ya cargado por el llamador (`_load_settings_once()`,
+    una sola vez para toda la ejecución)."""
+    if explicit_path is not None:
+        return explicit_path
     return settings.paper_trading.database_path
+
+
+def _resolve_summary_currency(*, explicit_currency: Optional[str], explicit_database_path: Optional[str], settings) -> str:
+    """Contrato de precedencia de la Etapa 6.21 (§2 del ticket), solo
+    para el subcomando `summary`:
+
+    1. `--currency` explícito -> se usa tal cual, sin importar si
+       `--database-path` también está presente.
+    2. Sin `--currency` y sin `--database-path` -> `settings` ya fue
+       cargado por el llamador para resolver `database_path`; se
+       reutiliza para leer `settings.paper_trading.currency`.
+    3. Sin `--currency`, pero con `--database-path` explícito -> se
+       mantiene `"USDT"` por compatibilidad histórica -- nunca se
+       infiere la moneda leyendo filas de la base, nunca se toma la
+       primera moneda encontrada.
+
+    Nunca dispara una carga adicional de configuración: cuando
+    `explicit_database_path` no es `None`, `settings` puede ser `None`
+    y jamás se lee en esta función."""
+    if explicit_currency is not None:
+        return explicit_currency
+    if explicit_database_path is None:
+        return settings.paper_trading.currency
+    return "USDT"
 
 
 def _open_readonly_connection(database_path: str) -> sqlite3.Connection:
@@ -626,6 +670,21 @@ def _enum_choice_type(enum_cls: type, flag_name: str) -> Callable[[str], str]:
     return _validate
 
 
+def _currency_type(value: str) -> str:
+    """Etapa 6.21: normaliza (espacios exteriores + mayúsculas) y valida
+    `--currency` -- solo letras ASCII A-Z, longitud 2-12. Sin catálogo
+    fijo de monedas permitidas (§8 del ticket): cualquier código que
+    cumpla ese formato se acepta tal cual, sin verificar que exista un
+    balance real para él (eso lo decide `_fetch_summary()`, no este
+    validador)."""
+    normalized = value.strip().upper()
+    if not (2 <= len(normalized) <= 12) or not normalized.isascii() or not normalized.isalpha():
+        raise argparse.ArgumentTypeError(
+            "--currency must be 2-12 ASCII letters (A-Z), e.g. USD, USDT, EUR."
+        )
+    return normalized
+
+
 def _add_limit_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=_limit_type, default=DEFAULT_LIMIT, help=f"Default {DEFAULT_LIMIT}, max {MAX_LIMIT}.")
 
@@ -635,10 +694,10 @@ def _add_limit_argument(parser: argparse.ArgumentParser) -> None:
 # --------------------------------------------------------------------------
 
 def _build_common_parser() -> argparse.ArgumentParser:
-    """Argumentos globales (`--database-path`/`--format`), compartidos
-    entre el parser raíz y cada uno de los once subparsers (Etapa
-    6.18.1, §5/§6): permite que ambos se acepten tanto antes como
-    después del subcomando.
+    """Argumentos globales (`--database-path`/`--format`/`--currency`),
+    compartidos entre el parser raíz y cada uno de los once subparsers
+    (Etapa 6.18.1, §5/§6): permite que todos se acepten tanto antes
+    como después del subcomando.
 
     `argument_default=argparse.SUPPRESS`: ningún atributo se agrega al
     Namespace si el usuario no proporcionó el argumento -- ni aquí ni
@@ -646,6 +705,11 @@ def _build_common_parser() -> argparse.ArgumentParser:
     sobrescriba silenciosamente un valor ya reconocido por el parser
     raíz (§7); los defaults reales (`table`/`None`) se aplican una
     sola vez, después de `parse_args()`, con `getattr(args, ..., default)`.
+
+    `--currency` (Etapa 6.21): solo afecta a `summary` -- el resto de
+    los subcomandos lo aceptan (es global) pero lo ignoran por
+    completo, nunca filtran ni fallan por su presencia (§20 del
+    ticket, ej. `balances` sigue listando todas las monedas).
     """
     parser = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
     parser.add_argument(
@@ -655,6 +719,14 @@ def _build_common_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format", dest="format", choices=["table", "json"],
         help="Formato de salida (default: table).",
+    )
+    parser.add_argument(
+        "--currency", dest="currency", type=_currency_type,
+        help=(
+            "Moneda utilizada por el subcomando summary (default: paper_trading.currency de la "
+            "configuración; USDT si se usa --database-path sin --currency). Ignorado por el resto "
+            "de los subcomandos."
+        ),
     )
     return parser
 
@@ -777,9 +849,9 @@ _COLLECTION_COLUMNS: dict[str, list[str]] = {
 }
 
 
-def _run_command(conn: sqlite3.Connection, args: argparse.Namespace) -> Any:
+def _run_command(conn: sqlite3.Connection, args: argparse.Namespace, *, summary_currency: str = "USDT") -> Any:
     if args.command == "summary":
-        return _fetch_summary(conn, currency="USDT")
+        return _fetch_summary(conn, currency=summary_currency)
     if args.command == "balances":
         return _fetch_cash_balances(conn, limit=args.limit)
     if args.command == "positions":
@@ -826,21 +898,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Etapa 6.18.1 (§7): --database-path/--format usan argument_default=SUPPRESS
-    # en el parser compartido (ver _build_common_parser()) para que el
-    # default del subparser nunca sobrescriba un valor ya reconocido por
-    # el parser raíz (o viceversa) -- el atributo puede estar
-    # directamente ausente del Namespace si el usuario nunca lo dio, ni
-    # antes ni después del subcomando. Los defaults reales se aplican
-    # aquí, una sola vez, después de parse_args().
+    # Etapa 6.18.1 (§7): --database-path/--format/--currency usan
+    # argument_default=SUPPRESS en el parser compartido (ver
+    # _build_common_parser()) para que el default del subparser nunca
+    # sobrescriba un valor ya reconocido por el parser raíz (o
+    # viceversa) -- el atributo puede estar directamente ausente del
+    # Namespace si el usuario nunca lo dio, ni antes ni después del
+    # subcomando. Los defaults reales se aplican aquí, una sola vez,
+    # después de parse_args().
     explicit_database_path = getattr(args, "database_path", None)
+    explicit_currency = getattr(args, "currency", None)
     output_format = getattr(args, "format", "table")
 
-    try:
-        database_path = _resolve_database_path(explicit_database_path)
-    except ConfigurationError as exc:
-        print(str(exc), file=sys.stderr)
-        return EXIT_CONFIG_ERROR
+    # Etapa 6.21 (§10): load_settings() se llama a lo sumo una vez, y
+    # solo cuando --database-path no es explícito (única condición que
+    # exige configuración, tanto para database_path como para
+    # currency -- ver _resolve_summary_currency()). Con --database-path
+    # explícito, `settings` permanece None y nunca se lee.
+    settings = None
+    if explicit_database_path is None:
+        try:
+            settings = _load_settings_once()
+        except ConfigurationError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+
+    database_path = _resolve_database_path(explicit_database_path, settings)
+    summary_currency = _resolve_summary_currency(
+        explicit_currency=explicit_currency, explicit_database_path=explicit_database_path, settings=settings,
+    )
 
     try:
         conn = _open_readonly_connection(database_path)
@@ -850,7 +936,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         try:
-            result = _run_command(conn, args)
+            result = _run_command(conn, args, summary_currency=summary_currency)
         except PortfolioCliError as exc:
             print(str(exc), file=sys.stderr)
             return EXIT_QUERY_ERROR

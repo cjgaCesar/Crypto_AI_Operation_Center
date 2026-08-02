@@ -10,6 +10,7 @@ escritura normal) SOLO para sembrar datos de prueba; la CLI bajo
 prueba siempre abre su propia conexión `mode=ro` independiente.
 """
 
+import argparse
 import ast
 import json
 import sqlite3
@@ -17,6 +18,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,6 +76,17 @@ class TestHelp:
         )
         assert result.returncode == 0
         assert "summary" in result.stdout
+
+    def test_main_help_mentions_currency(self, capsys):
+        """Etapa 6.21, §25: --currency debe aparecer en la ayuda principal."""
+        with pytest.raises(SystemExit):
+            portfolio_cli.main(["--help"])
+        assert "--currency" in capsys.readouterr().out
+
+    def test_summary_help_mentions_currency(self, capsys):
+        with pytest.raises(SystemExit):
+            portfolio_cli.main(["summary", "--help"])
+        assert "--currency" in capsys.readouterr().out
 
 
 class TestEntryPoint:
@@ -225,6 +238,261 @@ class TestSummaryCommand:
         _run(repo.db_path, ["summary"])
         after = repo.fetch_cash_balances()
         assert before == after
+
+
+def _fake_settings(database_path: str, currency: str = "USDT"):
+    """Etapa 6.21: doble mínimo de `Settings` -- solo expone los dos
+    campos que `portfolio_cli.py` realmente lee de `settings.paper_trading`
+    (`database_path`/`currency`), nunca un `PaperTradingConfig` completo."""
+    return SimpleNamespace(paper_trading=SimpleNamespace(database_path=database_path, currency=currency))
+
+
+class TestCurrencyTypeValidator:
+    """§8 del ticket: validación y normalización de --currency, probada
+    directamente sobre el validador (sin pasar por argparse) y a través
+    de main() (código de salida 2)."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("USD", "USD"), ("usd", "USD"), ("  eur  ", "EUR"), ("USDT", "USDT"), ("clp", "CLP"), ("btc", "BTC"),
+    ])
+    def test_valid_values_are_normalized(self, raw, expected):
+        assert portfolio_cli._currency_type(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["", "   ", "EU R", "EUR;", "../EUR", "123", "A", "TOOLONGCURRENCY"])
+    def test_invalid_values_are_rejected(self, raw):
+        with pytest.raises(argparse.ArgumentTypeError):
+            portfolio_cli._currency_type(raw)
+
+    def test_invalid_currency_via_main_exits_2_without_opening_database(self, tmp_path, monkeypatch):
+        def _fail():
+            raise AssertionError("load_settings() must not be called for an argparse error.")
+
+        monkeypatch.setattr("src.utils.config.load_settings", _fail)
+        with pytest.raises(SystemExit) as exc_info:
+            portfolio_cli.main(["summary", "--currency", "EU R"])
+        assert exc_info.value.code == 2
+
+
+class TestSummaryCurrencyResolution:
+    """Etapa 6.21: contrato de resolución de moneda de `summary` (§2 del
+    ticket) -- cuatro combinaciones de --database-path/--currency, carga
+    única de configuración, aislamiento de --database-path, precedencia,
+    posición de los argumentos globales y duplicados."""
+
+    def _seed_eur_balance(self, tmp_path):
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="EUR", total_balance=Decimal("5000"), reserved_balance=Decimal("100"), updated_at=_now(),
+        ))
+        return repo
+
+    # --- Fila 1: sin --database-path, sin --currency -> settings.paper_trading.currency
+
+    def test_no_database_path_no_currency_uses_configured_currency(self, tmp_path, monkeypatch, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        load_settings_calls = []
+
+        def _fake_load_settings():
+            load_settings_calls.append(1)
+            return _fake_settings(repo.db_path, currency="EUR")
+
+        monkeypatch.setattr("src.utils.config.load_settings", _fake_load_settings)
+        exit_code = portfolio_cli.main(["summary", "--format", "json"])
+
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "EUR"
+        assert payload["total_balance"] == "5000"
+        assert payload["reserved_balance"] == "100"
+        assert payload["available_balance"] == "4900"
+        assert len(load_settings_calls) == 1
+
+    def test_no_database_path_no_currency_stderr_empty_on_success(self, tmp_path, monkeypatch, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        monkeypatch.setattr(
+            "src.utils.config.load_settings", lambda: _fake_settings(repo.db_path, currency="EUR"),
+        )
+        portfolio_cli.main(["summary", "--format", "json"])
+        assert capsys.readouterr().err == ""
+
+    def test_configured_usdt_matches_previous_behavior(self, tmp_path, monkeypatch, capsys):
+        """§14 del ticket: no regresión -- moneda configurada USDT se
+        comporta exactamente como antes de esta etapa."""
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("10000.5"), reserved_balance=Decimal("500.25"), updated_at=_now(),
+        ))
+        monkeypatch.setattr(
+            "src.utils.config.load_settings", lambda: _fake_settings(repo.db_path, currency="USDT"),
+        )
+        exit_code = portfolio_cli.main(["summary", "--format", "json"])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "USDT"
+        assert payload["total_balance"] == "10000.5"
+        assert payload["reserved_balance"] == "500.25"
+        assert payload["available_balance"] == "9500.25"
+
+    # --- Fila 2: sin --database-path, con --currency -> --currency
+
+    def test_no_database_path_with_currency_uses_explicit_currency(self, tmp_path, monkeypatch, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        monkeypatch.setattr(
+            "src.utils.config.load_settings", lambda: _fake_settings(repo.db_path, currency="USDT"),
+        )
+        exit_code = portfolio_cli.main(["summary", "--currency", "EUR", "--format", "json"])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "EUR"
+        assert payload["total_balance"] == "5000"
+
+    def test_explicit_currency_wins_over_configured_currency(self, tmp_path, monkeypatch, capsys):
+        """§18 del ticket: precedencia explícita -- settings dice USDT,
+        --currency dice EUR -> gana EUR, sin tocar la configuración."""
+        repo = self._seed_eur_balance(tmp_path)
+        monkeypatch.setattr(
+            "src.utils.config.load_settings", lambda: _fake_settings(repo.db_path, currency="USDT"),
+        )
+        exit_code = portfolio_cli.main(["--currency", "EUR", "summary", "--format", "json"])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "EUR"
+
+    # --- Fila 3: con --database-path, sin --currency -> "USDT" (compatibilidad)
+
+    def test_database_path_without_currency_keeps_usdt_compatibility(self, tmp_path, monkeypatch):
+        """§16/§17 del ticket: compatibilidad histórica -- con
+        --database-path explícito y sin --currency, se mantiene USDT
+        (aunque la base solo tenga EUR), y load_settings() nunca se llama."""
+        repo = self._seed_eur_balance(tmp_path)
+
+        def _fail():
+            raise AssertionError("load_settings() must not be called with --database-path explicit.")
+
+        monkeypatch.setattr("src.utils.config.load_settings", _fail)
+        exit_code = _run(repo.db_path, ["summary"], format_="json")
+        assert exit_code == 0
+
+    def test_database_path_without_currency_shows_null_balance_for_eur_only_db(self, tmp_path, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code = _run(repo.db_path, ["summary"], format_="json")
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "USDT"
+        assert payload["total_balance"] is None
+        assert payload["reserved_balance"] is None
+        assert payload["available_balance"] is None
+
+    def test_database_path_with_usdt_data_and_no_currency_still_works(self, tmp_path, capsys):
+        """§16 del ticket: base USDT + --database-path sin --currency ->
+        resultados históricos correctos (nunca null)."""
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("10000"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+        exit_code = _run(repo.db_path, ["summary"], format_="json")
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "USDT"
+        assert payload["total_balance"] == "10000"
+
+    # --- Fila 4: con --database-path, con --currency -> --currency
+
+    def test_database_path_with_currency_resolves_correct_balance(self, tmp_path, monkeypatch):
+        """§15 del ticket: --database-path + --currency EUR -> datos EUR
+        correctos, load_settings() nunca llamado."""
+        repo = self._seed_eur_balance(tmp_path)
+
+        def _fail():
+            raise AssertionError("load_settings() must not be called with --database-path explicit.")
+
+        monkeypatch.setattr("src.utils.config.load_settings", _fail)
+        exit_code = portfolio_cli.main([
+            "summary", "--database-path", repo.db_path, "--currency", "EUR", "--format", "json",
+        ])
+        assert exit_code == 0
+
+    def test_database_path_with_currency_json_values(self, tmp_path, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code = portfolio_cli.main([
+            "summary", "--database-path", repo.db_path, "--currency", "EUR", "--format", "json",
+        ])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "EUR"
+        assert payload["total_balance"] == "5000"
+        assert payload["reserved_balance"] == "100"
+        assert payload["available_balance"] == "4900"
+
+    # --- §19: posición antes/después del subcomando ------------------------
+
+    def test_currency_before_and_after_subcommand_are_equivalent(self, tmp_path):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code_after = portfolio_cli.main([
+            "summary", "--database-path", repo.db_path, "--currency", "EUR", "--format", "json",
+        ])
+        exit_code_before = portfolio_cli.main([
+            "--currency", "EUR", "--database-path", repo.db_path, "summary", "--format", "json",
+        ])
+        assert exit_code_after == exit_code_before == 0
+
+    def test_database_path_before_currency_after_subcommand(self, tmp_path, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code = portfolio_cli.main([
+            "--database-path", repo.db_path, "summary", "--currency", "EUR", "--format", "json",
+        ])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "EUR"
+
+    # --- §19: duplicados -- último valor gana -------------------------------
+
+    def test_duplicated_currency_last_value_wins(self, tmp_path, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code = portfolio_cli.main([
+            "--currency", "USDT", "summary", "--database-path", repo.db_path,
+            "--currency", "EUR", "--format", "json",
+        ])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["currency"] == "EUR"
+
+    # --- §20: otros subcomandos ignoran --currency --------------------------
+
+    def test_balances_ignores_currency_and_lists_all_currencies(self, tmp_path, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="USDT", total_balance=Decimal("100"), reserved_balance=Decimal("0"), updated_at=_now(),
+        ))
+        exit_code = portfolio_cli.main([
+            "balances", "--database-path", repo.db_path, "--currency", "EUR", "--format", "json",
+        ])
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        currencies = {row["currency"] for row in payload}
+        assert currencies == {"EUR", "USDT"}
+
+    def test_balances_with_currency_does_not_error(self, tmp_path):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code = portfolio_cli.main(["balances", "--database-path", repo.db_path, "--currency", "USDT"])
+        assert exit_code == 0
+
+    def test_positions_ignores_currency(self, tmp_path):
+        repo = _repo(tmp_path)
+        exit_code = portfolio_cli.main(["positions", "--database-path", repo.db_path, "--currency", "EUR"])
+        assert exit_code == 0
+
+    # --- Formato table sigue funcionando con la moneda resuelta -------------
+
+    def test_table_format_shows_resolved_currency(self, tmp_path, capsys):
+        repo = self._seed_eur_balance(tmp_path)
+        exit_code = portfolio_cli.main([
+            "summary", "--database-path", repo.db_path, "--currency", "EUR",
+        ])
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "currency: EUR" in out
+        assert "total_balance: 5000" in out
 
 
 class TestBalancesCommand:
@@ -1101,6 +1369,29 @@ class TestGlobalArgumentPosition:
         assert result.stderr == ""
         payload = json.loads(result.stdout)
         assert payload["currency"] == "USDT"
+
+    def test_subprocess_summary_with_explicit_currency(self, tmp_path):
+        """Etapa 6.21, §25: consulta real vía subprocess, únicamente con
+        --database-path (nunca la configuración real), confirmando datos
+        EUR con --currency."""
+        repo = _repo(tmp_path)
+        repo.save_cash_balance(CashBalance(
+            currency="EUR", total_balance=Decimal("5000"), reserved_balance=Decimal("100"), updated_at=_now(),
+        ))
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "src.paper_trading.portfolio_cli",
+                "summary", "--database-path", repo.db_path, "--currency", "EUR", "--format", "json",
+            ],
+            capture_output=True, text=True, cwd=".",
+        )
+        assert result.returncode == 0
+        assert result.stderr == ""
+        payload = json.loads(result.stdout)
+        assert payload["currency"] == "EUR"
+        assert payload["total_balance"] == "5000"
+        assert payload["reserved_balance"] == "100"
+        assert payload["available_balance"] == "4900"
 
     def test_subprocess_orders_globals_after_subcommand_with_own_options(self, tmp_path):
         repo = _repo(tmp_path)
