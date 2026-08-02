@@ -2166,6 +2166,69 @@ mezclan con rechazos de riesgo normales.
   alertar, o exponerla en el Dashboard de alguna forma read-only) queda
   pendiente para una etapa futura (6.9+).
 
+### 22.14 Etapa 6.22 — Contrato seguro de errores de CLIs administrativas
+
+Antes de esta etapa, `reconciliation_cli.py` (y, de forma equivalente,
+`inspection_cli.py`, ver §23.20) no tenían ningún manejo de excepciones
+en `main()`: cualquier fallo no anticipado (configuración inválida,
+Paper Trading deshabilitado, error de SQLite, un `issue_code` de
+reparación no soportado, o cualquier excepción inesperada) escapaba
+como un traceback completo de Python en stderr, exponiendo rutas
+absolutas del sistema de archivos, el nombre de módulos internos
+(`reconciliation_service.py`, `application.py`) y, en el caso de
+`ReconciliationAuditError`, el mensaje crudo de la excepción original
+que causó el fallo. La Etapa 6.22 endurece exclusivamente el manejo de
+errores de ambas CLIs administrativas, sin tocar la lógica de negocio
+de reconciliación/inspección/persistencia/alertas.
+
+**Códigos de salida** (constantes explícitas en ambos módulos):
+
+| Código | Significado |
+|---|---|
+| `0` | Operación completada (incluye el resultado de negocio exitoso ya aprobado desde las Etapas 6.8/6.9) |
+| `1` | Resultado de negocio no totalmente exitoso -- **no es un error de la CLI**: `inspect`/`repair` (Etapa 6.8) y `run`/`alerts` (Etapa 6.9) ya devolvían `1` cuando encontraban issues/una entrega parcial, igual que `grep` devuelve `1` cuando no hay coincidencias. Este código se conserva sin cambios y nunca se reutiliza como código de error genérico |
+| `2` | Argumentos inválidos -- gestionado íntegramente por `argparse` (`SystemExit(2)`), sin cambios |
+| `3` | Configuración inválida (`load_settings()` lanzó una excepción) |
+| `4` | Paper Trading deshabilitado (`PaperTradingDisabledError`) -- defensa en profundidad; hoy es inalcanzable en la práctica porque las operaciones de mantenimiento de ambas CLIs deliberadamente no gatean con `_require_enabled()` (§22.11/§23.13) |
+| `5` | Base de datos no disponible o error SQLite controlado (`sqlite3.Error`) |
+| `6` | Operación de negocio rechazada o no soportada (`UnsupportedRepairError`/`ReconciliationConflictError` en `reconciliation_cli.py`; reservado sin uso actual en `inspection_cli.py`, que hoy no tiene ningún rechazo de negocio alcanzable) |
+| `7` | Error operativo controlado del proceso (`ReconciliationError`/`InspectionError` no cubiertos arriba -- incluye `ReconciliationAuditError`/`InspectionPersistenceError` -- y `ValueError` de argumentos de negocio, p. ej. un `issue_code`/`--limit` inválido) |
+| `8` | Error inesperado sanitizado: cualquier otra `Exception` |
+
+**Clasificación de excepciones conocidas.** No todas las excepciones
+"conocidas" son seguras de imprimir tal cual: `UnsupportedRepairError`
+y `ReconciliationConflictError` tienen mensajes diseñados para el
+operador (sin SQL, rutas ni datos sensibles) y se imprimen directamente
+con `print(str(exc), file=sys.stderr)`. En cambio, `ReconciliationAuditError`
+e `InspectionPersistenceError` embeben el texto (`str()`) de la
+excepción original que causó el fallo de persistencia/auditoría --
+potencialmente insegura -- por lo que **nunca** se imprimen
+directamente: se traducen a un mensaje fijo genérico
+(`_OPERATIONAL_ERROR_MESSAGE`).
+
+**Errores inesperados.** Cualquier excepción no clasificada
+explícitamente cae en un `except Exception` final que imprime
+únicamente un mensaje fijo (`_UNEXPECTED_MESSAGE`, distinto por CLI) y
+devuelve `EXIT_UNEXPECTED_ERROR` (8) -- nunca `str(exc)`/`repr(exc)`,
+nunca `traceback.print_exc()`/`logger.exception(..., exc_info=True)`.
+
+**stdout/stderr.** En caso de éxito, el resultado se imprime
+exclusivamente en stdout y stderr queda vacío; en caso de error, stdout
+queda vacío y el mensaje sanitizado se imprime exclusivamente en
+stderr. Ninguna cabecera parcial se imprime antes de que la operación
+que podría fallar termine.
+
+**`KeyboardInterrupt`/`SystemExit` no se capturan.** El único `try` de
+`main()` termina en `except Exception`, que por herencia de Python
+nunca captura `KeyboardInterrupt` ni `SystemExit` (no heredan de
+`Exception`) -- ninguna de las dos CLIs usa `except BaseException`.
+`argparse` sigue generando `SystemExit(2)` ante argumentos inválidos, y
+Ctrl+C conserva su comportamiento normal de intérprete.
+
+Ninguna ruta absoluta, sentencia SQL, ni dato interno (variables de
+entorno, credenciales, contenido completo de `Settings`) se imprime
+nunca ante un error, en ninguna de las dos CLIs.
+
 ## 23. Automatización controlada de inspecciones (Etapa 6.9 — diseño previo a implementar)
 
 ### 23.1 Objetivo y alcance
@@ -2498,6 +2561,22 @@ con `deduplication_key` distintas, no requirió ningún cambio de código
 en `alert_builder.py` ni en `InspectionService.run_inspection()` (que ya
 calculaba el total de IDs necesarias sumando el tamaño de cada
 subcategoría, sin asumir exclusión).
+
+### 23.20 Etapa 6.22 — Contrato seguro de errores de CLIs administrativas
+
+`inspection_cli.py` adopta exactamente el mismo contrato de códigos de
+salida, sanitización de excepciones y separación stdout/stderr descrito
+en §22.14 para `reconciliation_cli.py` -- ver esa sección para el
+detalle completo (tabla de códigos, clasificación de excepciones
+conocidas vs. inseguras, `KeyboardInterrupt`/`SystemExit`). La única
+diferencia relevante es la excepción "insegura" equivalente a
+`ReconciliationAuditError`: aquí es `InspectionPersistenceError` (embebe
+el texto de la excepción original que causó el fallo de persistencia de
+una corrida/alerta), que tampoco se imprime nunca directamente. El
+código `6` (rechazo de negocio) queda reservado por consistencia con
+`reconciliation_cli.py` pero sin ningún uso alcanzable hoy, ya que
+`inspection_cli.py` no tiene ningún caso de rechazo de negocio análogo
+a `UnsupportedRepairError`.
 
 ## 24. Canales de entrega de alertas (Etapa 6.10 — diseño previo a implementar)
 

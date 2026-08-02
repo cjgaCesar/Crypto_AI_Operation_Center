@@ -571,6 +571,10 @@ usa `settings.paper_trading.currency` cuando no se indica
 Cuando se usa `--database-path` para una base cuya moneda no es USDT,
 también debe indicarse `--currency`. Ver
 [docs/ARQUITECTURA_PAPER_TRADING.md §33.11](docs/ARQUITECTURA_PAPER_TRADING.md).
+**Etapa 6.22**: Las CLIs de reconciliación e inspección retornan
+códigos explícitos y no muestran tracebacks ni detalles internos ante
+errores. Ver
+[docs/ARQUITECTURA_PAPER_TRADING.md §22.14](docs/ARQUITECTURA_PAPER_TRADING.md).
 
 Pendiente: aprobación formal de la Etapa 4 (todavía en revisión) antes
 de conectar un proveedor de IA real; migración a PostgreSQL real para
